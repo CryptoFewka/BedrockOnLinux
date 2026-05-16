@@ -22,7 +22,7 @@ from pathlib import Path
 
 APP = "bedrock-on-linux"
 PRETTY = "BedrockOnLinux"
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 HOME = Path.home()
 DATA = Path(os.environ.get("BOL_HOME", HOME / ".local/share" / APP))
@@ -510,7 +510,7 @@ log-packets: false
 log-to: file
 enable-ui: false
 follow-transfers: true
-download-packs: true
+download-packs: false
 invert-ignored-list: false
 ignored-packets:
   - "NetworkStackLatencyPacket"
