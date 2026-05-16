@@ -22,7 +22,7 @@ from pathlib import Path
 
 APP = "bedrock-on-linux"
 PRETTY = "BedrockOnLinux"
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 
 HOME = Path.home()
 DATA = Path(os.environ.get("BOL_HOME", HOME / ".local/share" / APP))
@@ -742,13 +742,23 @@ _DIAG_RULES = [
      "ProxyPass (ou laisse « auto »)."),
     (r"Authentication failed|invalid_grant|login.*failed",
      "Échec de connexion Microsoft : reclique « Se connecter »."),
+    (r"RtlpWaitForCriticalSection.*MSVCRT_file_cs.*timed out|"
+     r"wait timed out in thread.*blocked by",
+     "Le jeu s'est FIGÉ (deadlock Wine sur le verrou fichier), pas un vrai "
+     "crash. Déclenché en général par une jonction serveur qui échoue : "
+     "aligne les versions — Minecraft 1.26.20.4 + ProxyPass pre/1.26.20-1, "
+     "ou ProxyPass master-65."),
+    (r"device_notify_proc failed to get event, error 1726|"
+     r"RPC_S_SERVER_UNAVAILABLE",
+     "Service GameInput indisponible (instable sous Wine) — souvent lié au "
+     "gel ci-dessus ; l'alignement de versions le contourne en pratique."),
 ]
 
 
 def diagnose():
     """Scan the game + ProxyPass logs and surface a human cause, if any."""
     blobs = []
-    for name in ("proton.log", "minecraft.log", "proxypass.log"):
+    for name in ("proton.log", "steam-0.log", "minecraft.log", "proxypass.log"):
         p = LOGS / name
         if p.exists():
             try:
