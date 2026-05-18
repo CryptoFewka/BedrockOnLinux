@@ -1043,6 +1043,11 @@ _DIAG_RULES = [
     (r"nodrv_CreateWindow|no driver could be loaded|"
      r"explorer process failed to start",
      "Wine prefix broken — click 'Repair' then relaunch."),
+    (r"0x80004001|E_NOTIMPL|XUserAddAsync|xgameruntime.*(?:unimpl|stub)|"
+     r"QueryApiImpl.*unimpl",
+     "In-game login: this GDK-Proton has no WineGDK XUser, so native "
+     "Microsoft sign-in cannot work yet (upstream WIP). Use ProxyPass: "
+     "'bedrock-on-linux config --native-login off'."),
 ]
 
 
@@ -1060,16 +1065,24 @@ def diagnose():
                 pass
     text = "\n".join(blobs)
     hits = [msg for pat, msg in _DIAG_RULES if re.search(pat, text, re.I)]
-    relay_up = re.search(r"(?:Bedrock|NetherNet) server started on", text)
-    joined = re.search(r"Dispatching New Connection|Initializing proxy "
-                       r"session|LoginPacket|Player .*connect|"
-                       r"received .* from /", text, re.I)
-    if relay_up and not joined:
-        hits.append("Relay OK but no client connected — in game: "
-                    "Play ▸ Worlds ▸ 'ProxyPass'.")
-    elif not relay_up:
-        hits.append("The relay did not start — see 'ProxyPass logs' "
-                    "(often: reconnect the Microsoft account).")
+    if load_settings().get("native_login"):
+        # No relay in native mode — relay checks would only mislead.
+        hits.append("In-game login is ON. It needs a GDK-Proton built with "
+                    "WineGDK XUser (upstream PR #33, not released yet); with "
+                    "the stock build the game shows 'Authentication failed' "
+                    "(0x80004001). Working path today: "
+                    "'bedrock-on-linux config --native-login off' (ProxyPass).")
+    else:
+        relay_up = re.search(r"(?:Bedrock|NetherNet) server started on", text)
+        joined = re.search(r"Dispatching New Connection|Initializing proxy "
+                           r"session|LoginPacket|Player .*connect|"
+                           r"received .* from /", text, re.I)
+        if relay_up and not joined:
+            hits.append("Relay OK but no client connected — in game: "
+                        "Play ▸ Worlds ▸ 'ProxyPass'.")
+        elif not relay_up:
+            hits.append("The relay did not start — see 'ProxyPass logs' "
+                        "(often: reconnect the Microsoft account).")
     if hits:
         warn("Likely cause:")
         for h in dict.fromkeys(hits):
