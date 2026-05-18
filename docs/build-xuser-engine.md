@@ -29,15 +29,22 @@ and redistribute the `xgameruntime` parts.
 
 ## Already assembled: `Wyze3306/WineGDK` branch `xuser-login`
 
-Done in this project: `Wyze3306/WineGDK` branch **`xuser-login`** =
-`olivi-r/master` (XUser, PR #33 — the actual Microsoft sign-in) **+**
-XLauncher (PR #37) integrated on top (matches PR #37's commit, adapted to
-the XUser layout). Cloned locally at `~/Bureau/WineGDK`.
+Done in this project, on `Wyze3306/WineGDK` **`master`** (cloned at
+`~/Bureau/WineGDK`):
 
-It still has the **signature gap** below (upstream `signature = NULL`,
-RPS auth with no proof key). Core sign-in and server join use the
-`XBL3.0` token and should work; signed Xbox endpoints (some
-profile/marketplace) need step 3.
+- `olivi-r/master` (XUser, PR #33 — the Microsoft sign-in)
+- XLauncher (PR #37) integrated on top
+- **Request signing implemented** (was the gap below): a per-user ECDSA
+  P-256 proof key (bcrypt), its public key sent as `ProofKey` in
+  user/authenticate, a `Signature` header on every Xbox token request,
+  and a real per-request signature returned by
+  `XUserGetTokenAndSignature`. Best-effort: the token is still returned
+  if crypto fails.
+
+Caveat: the crypto helpers compile clean with mingw (`-Wall`) but the
+full fork is **not built/tested here**. The signing scheme is the
+standard proof-bound user-token flow; if Xbox rejects it a device/SISU
+token may be needed (iterate from the build/run loop).
 
 ### Build & use it
 
