@@ -1088,6 +1088,9 @@ def launch(_pp=None):
     cmd, env = proton_umu_cmd(exe)
     env["PROTON_LOG"] = "1"
     env["PROTON_LOG_DIR"] = str(LOGS)
+    # Trace the WineGDK XUser channel (gdkc) so sign-in / token / signature
+    # behaviour shows up in proton.log for diagnosis.
+    env.setdefault("WINEDEBUG", "+gdkc")
     disp = os.environ.get("DISPLAY")
     if disp:
         env["DISPLAY"] = disp
@@ -1116,9 +1119,14 @@ def launch(_pp=None):
                             stderr=subprocess.STDOUT).returncode
     finally:
         patch_options()
-        src = LOGS / "steam-0.log"             # PROTON_LOG output
-        if src.exists():
-            src.replace(LOGS / "proton.log")
+        # PROTON_LOG writes steam-<id>.log — keep the newest as proton.log
+        # (the fixed name made us read stale logs after a crash).
+        logs = sorted(LOGS.glob("steam-*.log"),
+                      key=lambda p: p.stat().st_mtime if p.exists() else 0)
+        if logs:
+            logs[-1].replace(LOGS / "proton.log")
+            for old in logs[:-1]:
+                old.unlink(missing_ok=True)
         ok(f"Game closed (exit {rc}).")
         diagnose()
 
