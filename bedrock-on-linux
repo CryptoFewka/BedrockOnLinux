@@ -878,59 +878,6 @@ def install_gdk_xbox_dlls(game_dir: Path):
             shutil.copy2(dst, bak)
         shutil.copy2(cached, dst)
     ok("Xbox-Live OSS DLLs installed")
-    _patch_winappruntime_bootstrap(game_dir)
-
-
-def _patch_winappruntime_bootstrap(game_dir: Path):
-    """Suppress the WindowsAppRuntime 'Required components are missing —
-    Install?' dialog at its source.  The check inside
-    Microsoft.WindowsAppRuntime.Bootstrap.dll only consults
-    MICROSOFT_WINDOWSAPPRUNTIME_BOOTSTRAP_INITIALIZE_SHOWUI / _FAILFAST
-    when the *caller* did NOT pass the matching flag, and Minecraft
-    always passes ShowUI=on + FailFast=on — so the env-var route can't
-    win.  Patch the two `test r12b, 0x8` / `test r12b, 0x4` bytes
-    inside MddBootstrapInitialize to `test r12b, 0x0` so the flags are
-    seen as cleared and the env-var gate runs unconditionally.  With
-    HKCU\\Environment SHOWUI=0 + FAILFAST=0 already set in the prefix,
-    the dialog never fires and the bootstrap-failure return code just
-    propagates back to the game.  Backup at <dll>.bol-orig.  Skips
-    cleanly if the DLL is missing or the byte patterns don't match
-    (e.g. a future Minecraft update changes the bootstrap version)."""
-    dll = game_dir / "Microsoft.WindowsAppRuntime.Bootstrap.dll"
-    if not dll.exists():
-        return
-    try:
-        data = bytearray(dll.read_bytes())
-    except OSError as e:
-        warn(f"WinAppRuntime patch skipped: {e}")
-        return
-    # Two near-identical sites: `41 f6 c4 08` (SHOWUI bit 3) and
-    # `41 f6 c4 04` (FAILFAST bit 2). Find each pattern globally; the
-    # exact file offset moves with each rebuild of the dll, but the
-    # pattern is unique enough — only one match for each.
-    patched = 0
-    for old, new, name in (
-        (b"\x41\xf6\xc4\x08", b"\x41\xf6\xc4\x00", "SHOWUI"),
-        (b"\x41\xf6\xc4\x04", b"\x41\xf6\xc4\x00", "FAILFAST"),
-    ):
-        i = data.find(old)
-        if i < 0:
-            continue
-        # Refuse to patch if the pattern appears more than once — too
-        # ambiguous, leave the DLL alone and warn.
-        if data.find(old, i + 1) >= 0:
-            warn(f"WinAppRuntime {name} pattern ambiguous — skipped.")
-            continue
-        data[i:i + len(new)] = new
-        patched += 1
-    if not patched:
-        # Already patched (or unrecognised build) — no-op.
-        return
-    bak = Path(str(dll) + ".bol-orig")
-    if not bak.exists():
-        shutil.copy2(dll, bak)
-    dll.write_bytes(bytes(data))
-    ok(f"WinAppRuntime bootstrap UI gate patched ({patched}/2 sites)")
 
 
 def kill_wine():
@@ -1302,12 +1249,20 @@ def launch(_pp=None):
     # behaviour shows up in proton.log for diagnosis (force unless the user
     # set WINEDEBUG in the real environment).
     env["WINEDEBUG"] = os.environ.get("WINEDEBUG") or "+gdkc,fixme+all"
-    # xuser-olivi prereq: GameInputRedist.dll indirectly hits ntdll's
-    # unimplemented NtQueryWnfStateData. 'b' = built-in only -> Wine has
-    # no builtin, the load fails cleanly and the game continues without it.
-    override = "GameInputRedist=b"
+    # GameInputRedist.dll: the previous "GameInputRedist=b" override
+    # (forcing built-in only) was meant to dodge the NtQueryWnfStateData
+    # abort, but Wine has no builtin and the load fails → Minecraft pops
+    # the localised "gameinput_load.error.message" dialog ("Il manque un
+    # composant nécessaire au jeu… Installer") which dead-ends in
+    # msiexec.  patch_proton already neutralises the ntdll unimplemented-
+    # stub funnel (NtQueryWnfStateData now returns STATUS_NOT_IMPL
+    # cleanly), and the prefix has the native GameInputRedist.dll in
+    # both Program Files\\Microsoft GameInput and system32 from the
+    # bundled MSI — let Wine load that one.  Keep an extra
+    # WINEDLLOVERRIDES from the host env if the user explicitly set it.
     cur = os.environ.get("WINEDLLOVERRIDES", "")
-    env["WINEDLLOVERRIDES"] = cur + ";" + override if cur else override
+    if cur:
+        env["WINEDLLOVERRIDES"] = cur
     # Suppress the WindowsAppRuntime "Required components of the Windows
     # App Runtime are missing — Install?" dialog.  The text lives in BOTH
     # Microsoft.WindowsAppRuntime.Bootstrap.dll (MddBootstrapInitialize)
