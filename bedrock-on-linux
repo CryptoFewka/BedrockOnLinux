@@ -915,25 +915,41 @@ def install_gdk_xbox_dlls(game_dir: Path):
             shutil.copy2(dst, bak)
         shutil.copy2(cached, dst)
     ok("Xbox-Live OSS DLLs installed")
+    _patch_hbui_signin_gate(game_dir)
 
 
-def install_gdk_xbox_dlls(game_dir: Path):
-    """Drop ChristopherHX's OSS GDK Xbox-Live DLLs into the game folder
-    (libHttpClient.GDK.dll, XCurl.dll), backing up originals. The XCurl
-    backup also makes fix_curl_ssl skip its libcurl swap so this one
-    stays. Idempotent."""
-    for nm in GDK_DEPS_DLLS:
-        dst = game_dir / nm
-        bak = Path(str(dst) + ".bol-orig")
-        if bak.exists():
+def _patch_hbui_signin_gate(game_dir: Path):
+    """Bypass HBUI's 'You need a Microsoft account to play on a server'
+    banner that blocks the Servers tab even when our SISU/PlayFab auth
+    is working underneath.  The banner is rendered by a React component
+    fed by a derived facet (function `wB()` in the minified JS bundle)
+    that returns "not-signed-in" whenever C++ reports the user as
+    'isLoggedInWithMicrosoftAccount=false' — which it does on Wine
+    because XSAPI's social manager never completes init.  Patch wB to
+    return "" early; all switches consuming the reason fall through to
+    `default: return null`, suppressing the banner AND the gating that
+    blocks Servers / Realms / Marketplace.  Idempotent: skips when the
+    early return is already there, or when the bundle doesn't match
+    (Minecraft update with rebundled JS — pattern will need to be
+    re-found)."""
+    import glob
+    for js in glob.glob(str(game_dir / "data/gui/dist/hbui/index-*.js")):
+        try:
+            data = Path(js).read_text()
+        except OSError:
             continue
-        cached = CACHE / ("gdkdeps-" + nm)
-        if not cached.exists():
-            download(f"{GDK_DEPS_URL}/{nm}", cached, nm)
-        if dst.exists():
-            shutil.copy2(dst, bak)
-        shutil.copy2(cached, dst)
-    ok("Xbox-Live OSS DLLs installed")
+        needle = 'function wB(){return(0,l.useFacetMap)'
+        already = 'function wB(){return"";return'
+        if already in data:
+            continue
+        if needle not in data:
+            continue
+        bak = js + ".bol-orig"
+        if not Path(bak).exists():
+            shutil.copy2(js, bak)
+        Path(js).write_text(data.replace(needle, 'function wB(){return"";return', 1))
+        ok(f"HBUI sign-in gate bypassed in {Path(js).name}")
+        return
 
 
 def kill_wine():
