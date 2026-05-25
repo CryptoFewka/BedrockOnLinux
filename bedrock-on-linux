@@ -1368,6 +1368,21 @@ def launch(_pp=None):
     env["MICROSOFT_WINDOWSAPPRUNTIME_BOOTSTRAP_INITIALIZE_SHOWUI"] = "0"
     env["MICROSOFT_WINDOWSAPPRUNTIME_BOOTSTRAP_INITIALIZE_FAILFAST"] = "0"
     env["MICROSOFT_WINDOWSAPPRUNTIME_DEPLOYMENT_INITIALIZE_ONERRORSHOWUI"] = "0"
+    # MC's libHttpClient.GDK.dll calls WinHttpSetOption(SECURE_PROTOCOLS),
+    # overriding our HKLM DefaultSecureProtocols. Wine 11.1's GnuTLS then
+    # negotiates a TLS 1.3 handshake with Azure PlayFab that the server
+    # rejects with a 7-byte fatal Alert → SEC_E_INTERNAL_ERROR 0x80090304
+    # → MC's POST /Client/LoginWithXbox never ships its JSON body and the
+    # sign-in loops. Forcing GnuTLS itself to drop TLS 1.3 via a system
+    # priority file sidesteps the libhttpclient option — GnuTLS will only
+    # offer TLS 1.0-1.2 in the ClientHello regardless of what schannel
+    # asks for. %COMPAT loosens cipher matching for the older Azure stack.
+    prio = DATA / "etc" / "gnutls-no-tls13.cfg"
+    if not prio.exists():
+        prio.parent.mkdir(parents=True, exist_ok=True)
+        prio.write_text("[priorities]\nSYSTEM = NORMAL:-VERS-TLS1.3:%COMPAT\n")
+    env["GNUTLS_SYSTEM_PRIORITY_FILE"] = str(prio)
+    env["GNUTLS_SYSTEM_PRIORITY_FAIL_ON_INVALID"] = "0"
     # Tune the PlayFab XSTS relying party WITHOUT rebuilding WineGDK
     # (resolver honours WINEGDK_XSTS_RP_<HOST>). Iterate via
     # `config --xsts-rp <value>`.
