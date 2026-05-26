@@ -745,24 +745,25 @@ class NativeAuth:
 
 
 def xbl_preauth(msa_access_token):
-    """Pre-fetch the Xbox Live device token from device.auth.xboxlive.com
-    using the host Python's OpenSSL stack and persist it where xgameruntime.dll
-    will pick it up.
+    """Do EVERY Xbox Live auth call from the host's OpenSSL stack and persist
+    the results where xgameruntime.dll picks them up — device token + user
+    token + SISU AuthorizationToken (for PlayFab) + uhs.
 
     Why: Wine 11.1's secur32 GnuTLS sends a ClientHello fingerprinted by
-    Microsoft Azure as a non-Schannel client — the *.auth.xboxlive.com edge
-    TCP-RSTs the connection immediately after we PUT the HTTP body across,
-    which surfaces as DeviceAuth_Initialize returning 0x80072746 and the
-    "Llama 0x80072746" sign-in dialog. The same request from Linux curl
-    (OpenSSL) returns a normal 400/200. Bypass Wine entirely for this one
-    call and ship the device token + signing key into the prefix so the
-    in-game GDK shim can sign every subsequent xboxlive call without re-
-    contacting the edge.
+    Microsoft Azure as a non-Schannel client. EVERY *.auth.xboxlive.com and
+    sisu.xboxlive.com call TCP-RSTs after the body lands. The same requests
+    from Linux curl (OpenSSL) return 200. Bypassing only /device/authenticate
+    still leaves /user/authenticate, /xsts/authorize and sisu/authorize on
+    the Wine side and they all RST too, so MC's XUserAddAsync still ends
+    with 0x80072746. Pre-fetch the whole chain here and hand it to the
+    C side via $WINEGDK_PREAUTH_DEVICE; DeviceAuth_Initialize +
+    XUserGetTokenAndSignatureProvider then short-circuit every xboxlive HTTP
+    call.
 
     Persisted as a single JSON in $WINEGDK_PREAUTH_DIR/device.json so the
     C side can mmap it without round-tripping through the registry.
-    Returns True on success, False on failure (caller falls back to the
-    Wine-side path)."""
+    Returns True if at least the device token landed, False otherwise
+    (caller falls back to the Wine-side path)."""
     import base64, uuid as _uuid
     try:
         from cryptography.hazmat.primitives.asymmetric import ec
@@ -799,52 +800,51 @@ def xbl_preauth(msa_access_token):
     y_b64 = base64.b64encode(pub_numbers.y.to_bytes(32, "big")).decode()
     proof_key = {"alg": "ES256", "crv": "P-256", "kty": "EC",
                  "use": "sig", "x": x_b64, "y": y_b64}
-    body = {
-        "RelyingParty": "http://auth.xboxlive.com",
-        "TokenType": "JWT",
-        "Properties": {
-            "AuthMethod": "ProofOfPossession",
-            "Id": device_id,
-            "DeviceType": "Win32",
-            "Version": "10.0.22631",
-            "ProofKey": proof_key,
-        },
-    }
-    body_json = json.dumps(body, separators=(",", ":")).encode()
     # Build the Xbox Live signature blob — wire format is ver(4) + ts(8) +
     # raw ECDSA-P-256 r||s (64), 76 bytes total. The bytes SIGNED are a
     # hash input that puts 0x00 separators between every field:
     #   ver(4) || \0 || ts(8) || \0 || method || \0 || path || \0 || auth || \0 || body || \0
     # SHA-256 of this is what gets signed (matches Wine-side
-    # DeviceAuth_SignRequest in dlls/xgameruntime/.../DeviceAuth.c). Missing
-    # the trailing separators returns HTTP 403 instead of 200.
+    # DeviceAuth_SignRequest in dlls/xgameruntime/.../DeviceAuth.c).
     import struct, time as _time
-    now_ft = int((_time.time() + 11644473600) * 1e7)  # epoch → WindowsFileTime
-    ver = (1).to_bytes(4, "big")
-    ts = now_ft.to_bytes(8, "big")
-    hash_input = (ver + b"\0" + ts + b"\0"
-                  + b"POST" + b"\0"
-                  + b"/device/authenticate" + b"\0"
-                  + b"" + b"\0"
-                  + body_json + b"\0")
-    sig_der = priv.sign(hash_input, ec.ECDSA(hashes.SHA256()))
-    # DER → raw r||s
     from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
-    r, s = decode_dss_signature(sig_der)
-    sig_raw = r.to_bytes(32, "big") + s.to_bytes(32, "big")
-    sig_header = base64.b64encode(ver + ts + sig_raw).decode()
+    def _sign_header(method, path, body_bytes):
+        now_ft = int((_time.time() + 11644473600) * 1e7)
+        ver = (1).to_bytes(4, "big")
+        ts = now_ft.to_bytes(8, "big")
+        hash_input = (ver + b"\0" + ts + b"\0"
+                      + method.encode() + b"\0"
+                      + path.encode() + b"\0"
+                      + b"" + b"\0"
+                      + body_bytes + b"\0")
+        sig_der = priv.sign(hash_input, ec.ECDSA(hashes.SHA256()))
+        r2, s2 = decode_dss_signature(sig_der)
+        sig_raw = r2.to_bytes(32, "big") + s2.to_bytes(32, "big")
+        return base64.b64encode(ver + ts + sig_raw).decode()
+    def _xbl_post(url, body_dict):
+        body_bytes = json.dumps(body_dict, separators=(",", ":")).encode()
+        from urllib.parse import urlparse
+        path = urlparse(url).path
+        return requests.post(url, data=body_bytes, headers={
+            "User-Agent": "XAL Xbox Live Game (Windows; SDK; 1.0.0.0)",
+            "Content-Type": "application/json",
+            "x-xbl-contract-version": "1",
+            "Signature": _sign_header("POST", path, body_bytes),
+        }, timeout=15)
+
+    # ---- 1. /device/authenticate ----
     try:
-        r = requests.post(
-            "https://device.auth.xboxlive.com/device/authenticate",
-            data=body_json,
-            headers={
-                "User-Agent": "XAL Xbox Live Game (Windows; SDK; 1.0.0.0)",
-                "Content-Type": "application/json",
-                "x-xbl-contract-version": "1",
-                "Signature": sig_header,
+        r = _xbl_post("https://device.auth.xboxlive.com/device/authenticate", {
+            "RelyingParty": "http://auth.xboxlive.com",
+            "TokenType": "JWT",
+            "Properties": {
+                "AuthMethod": "ProofOfPossession",
+                "Id": device_id,
+                "DeviceType": "Win32",
+                "Version": "10.0.22631",
+                "ProofKey": proof_key,
             },
-            timeout=15,
-        )
+        })
     except Exception as e:
         warn(f"xbl_preauth: device.auth POST failed: {e}")
         return False
@@ -852,6 +852,84 @@ def xbl_preauth(msa_access_token):
         warn(f"xbl_preauth: device.auth HTTP {r.status_code} — {r.text[:200]}")
         return False
     j = r.json()
+    device_token = j["Token"]
+
+    # ---- 2. /user/authenticate ----
+    # Needs the MSA access token (caller passes it). Format follows
+    # Token.c RequestUserToken — sit on user.auth.xboxlive.com with
+    # AuthMethod=RPS and RpsTicket="t=<access_token>".
+    user_token = None
+    user_token_expiry = None
+    if msa_access_token:
+        try:
+            ru = _xbl_post("https://user.auth.xboxlive.com/user/authenticate", {
+                "RelyingParty": "http://auth.xboxlive.com",
+                "TokenType": "JWT",
+                "Properties": {
+                    "AuthMethod": "RPS",
+                    "SiteName": "user.auth.xboxlive.com",
+                    "RpsTicket": "t=" + msa_access_token,
+                },
+            })
+            if ru.status_code == 200:
+                uj = ru.json()
+                user_token = uj["Token"]
+                user_token_expiry = uj.get("NotAfter", "")
+            else:
+                warn(f"xbl_preauth: user.auth HTTP {ru.status_code} — {ru.text[:200]}")
+        except Exception as e:
+            warn(f"xbl_preauth: user.auth POST failed: {e}")
+
+    # ---- 3a. sisu /authorize for http://xboxlive.com ----
+    # This RP gives back the full DisplayClaims (xid, gtg, agg, ...) MC needs
+    # to populate the XUser handle. The xgameruntime.dll LoadDefaultUser path
+    # normally extracts these from a second xsts.auth.xboxlive.com call — but
+    # xsts.auth RSTs Wine the same way device.auth and user.auth do, so we
+    # land them here instead.
+    def _sisu(rp):
+        if not msa_access_token: return None
+        try:
+            r = _xbl_post("https://sisu.xboxlive.com/authorize", {
+                "AccessToken": "t=" + msa_access_token,
+                "AppId": "0000000048183522",
+                "deviceToken": device_token,
+                "Sandbox": "RETAIL",
+                "UseModernGamertag": True,
+                "SiteName": "user.auth.xboxlive.com",
+                "RelyingParty": rp,
+                "OfferTermsAcceptance": True,
+                "AcceptOffers": True,
+                "ProofKey": proof_key,
+            })
+            if r.status_code != 200:
+                warn(f"xbl_preauth: sisu({rp}) HTTP {r.status_code} — {r.text[:200]}")
+                return None
+            return r.json()
+        except Exception as e:
+            warn(f"xbl_preauth: sisu({rp}) failed: {e}")
+            return None
+
+    xbl_sisu = _sisu("http://xboxlive.com") or {}
+    xbl_auth = xbl_sisu.get("AuthorizationToken", {}) if xbl_sisu else {}
+    xbl_token = xbl_auth.get("Token")
+    xbl_expiry = xbl_auth.get("NotAfter", "") if xbl_auth else ""
+    xbl_claims = {}
+    try:
+        xbl_claims = xbl_auth["DisplayClaims"]["xui"][0]
+    except (KeyError, IndexError, TypeError):
+        pass
+
+    # ---- 3b. sisu /authorize for the PlayFab RP MC pins ----
+    pf_sisu = _sisu("https://b980a380.minecraft.playfabapi.com/") or {}
+    pf_auth = pf_sisu.get("AuthorizationToken", {}) if pf_sisu else {}
+    sisu_rp = "https://b980a380.minecraft.playfabapi.com/" if pf_auth.get("Token") else None
+    sisu_token = pf_auth.get("Token")
+    sisu_expiry = pf_auth.get("NotAfter", "")
+    sisu_uhs = None
+    try:
+        sisu_uhs = pf_auth["DisplayClaims"]["xui"][0].get("uhs")
+    except (KeyError, IndexError, TypeError):
+        pass
     # Export the EC P-256 key as BCRYPT_ECCPRIVATE_BLOB so xgameruntime.dll
     # can BCryptImportKeyPair() it byte-for-byte. Layout (104 bytes):
     #   dwMagic (LE u32 = BCRYPT_ECDSA_PRIVATE_P256_MAGIC 0x32534345)
@@ -869,12 +947,32 @@ def xbl_preauth(msa_access_token):
     out = {
         "device_id": device_id,
         "ecc_private_blob_b64": base64.b64encode(ecc_blob).decode(),
-        "device_token": j["Token"],
+        "device_token": device_token,
         "device_token_expiry": j.get("NotAfter", ""),
+        "user_token": user_token,
+        "user_token_expiry": user_token_expiry,
+        # SISU for http://xboxlive.com — used as the bootstrap XSTS token MC
+        # extracts xuid/gamertag/agegroup from in LoadDefaultUser.
+        "xbl_token": xbl_token,
+        "xbl_token_expiry": xbl_expiry,
+        "xbl_xuid": xbl_claims.get("xid"),
+        "xbl_gamertag": xbl_claims.get("gtg"),
+        "xbl_age_group": xbl_claims.get("agg"),
+        "xbl_uhs": xbl_claims.get("uhs"),
+        # SISU for the PlayFab RP — cached and used by
+        # XUserGetTokenAndSignatureProvider so it never re-hits sisu.xboxlive.
+        "sisu_rp": sisu_rp,
+        "sisu_token": sisu_token,
+        "sisu_uhs": sisu_uhs,
+        "sisu_expiry": sisu_expiry,
         "obtained": int(_time.time()),
     }
     out_path.write_text(json.dumps(out, indent=2))
-    ok(f"Xbox Live device token pre-fetched (expires {out.get('device_token_expiry','?')[:19]})")
+    bits = ["device"]
+    if user_token: bits.append("user")
+    if xbl_token: bits.append(f"XBL(xuid={xbl_claims.get('xid')},gtg={xbl_claims.get('gtg')})")
+    if sisu_token: bits.append(f"SISU(uhs={sisu_uhs})")
+    ok(f"Xbox Live pre-auth: {', '.join(bits)}")
     return True
 
 
