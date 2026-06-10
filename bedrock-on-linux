@@ -24,7 +24,7 @@ from pathlib import Path
 
 APP = "bedrock-on-linux"
 PRETTY = "BedrockOnLinux"
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 
 HOME = Path.home()
 DATA = Path(os.environ.get("BOL_HOME", HOME / ".local/share" / APP))
@@ -75,7 +75,12 @@ GDK_DEPS_DLLS = ("libHttpClient.GDK.dll", "XCurl.dll")
 # RtlGenRandom stub) shipped here is renamed XCurl.dll in the game dir so
 # Minecraft's PlayFab traffic goes over OpenSSL TLS, bypassing Wine secur32 and
 # the Azure Front Door FIN wall that breaks native (no-ProxyPass) sign-in.
+# The set is NOT bundled (20 MB); ensure_openssl_xcurl_set() downloads it once
+# from the app's own releases (asset openssl-xcurl-set-<rev>.tar.gz) — without
+# it, end users keep the Schannel XCurl.dll and online/PlayFab login fails.
+# Republish with scripts/package-openssl-xcurl.sh and update OPENSSL_XCURL_REV.
 OPENSSL_XCURL_SET = DATA / "xodus-xcurl" / "openssl-set"
+OPENSSL_XCURL_REV = "56a296acc12a"
 WINEGDK_SRC = DATA / "winegdk-src"
 WINEGDK_OUT = PROTON_DIR / "GDK-Proton-xuser"
 # Prebuilt engine source. End users download a ready-built GDK-Proton-xuser
@@ -1239,6 +1244,66 @@ def _patch_hbui_signin_gate(game_dir: Path):
         return
 
 
+def ensure_openssl_xcurl_set():
+    """Fetch + unpack the OpenSSL XCurl set into OPENSSL_XCURL_SET on first use.
+
+    The 20 MB DLL stack (OpenSSL libcurl + CA-injecting shim + cryptbase stub)
+    is too big to bundle, so it lives as a release asset
+    openssl-xcurl-set-<rev>.tar.gz on the app's own GitHub releases — the same
+    pattern as the prebuilt engine. Idempotent: skips when the installed set
+    already matches OPENSSL_XCURL_REV (a .rev marker). Any network/IO failure
+    degrades quietly — _install_openssl_xcurl() then keeps the Schannel XCurl
+    and warns, exactly as before this set existed."""
+    marker = OPENSSL_XCURL_SET / ".rev"
+    have = (OPENSSL_XCURL_SET / "libcurl-4.dll").exists() and \
+           (OPENSSL_XCURL_SET / "xcurl-cashim.dll").exists()
+    if have and marker.exists() and \
+            marker.read_text().strip() == OPENSSL_XCURL_REV:
+        return True
+    asset = f"openssl-xcurl-set-{OPENSSL_XCURL_REV}.tar.gz"
+    try:
+        rels = gh_releases(WINEGDK_PREBUILT_REPO, 30)
+    except Exception as e:
+        warn(f"OpenSSL XCurl set lookup failed ({e}).")
+        return have
+    url = None
+    for rel in rels or []:
+        url, _name, _ = asset_url(rel, lambda n: n == asset)
+        if url:
+            break
+    if not url:
+        warn(f"OpenSSL XCurl set asset '{asset}' not published yet.")
+        return have
+    tar = CACHE / asset
+    if not tar.exists():
+        info("Downloading the online-login components (one-time) …")
+        try:
+            download(url, tar, "Online-login components")
+        except BolError:
+            return have
+    tmp = OPENSSL_XCURL_SET.parent / ".set-dl"
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True, exist_ok=True)
+    try:
+        with tarfile.open(tar) as t:
+            t.extractall(tmp)
+    except Exception as e:
+        warn(f"OpenSSL XCurl set archive unreadable ({e}).")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tar.unlink(missing_ok=True)
+        return have
+    # Merge into the set dir (don't blow away a maintainer's working tree),
+    # then stamp the rev so we skip next time.
+    OPENSSL_XCURL_SET.mkdir(parents=True, exist_ok=True)
+    for f in tmp.iterdir():
+        if f.is_file():
+            shutil.copy2(f, OPENSSL_XCURL_SET / f.name)
+    shutil.rmtree(tmp, ignore_errors=True)
+    marker.write_text(OPENSSL_XCURL_REV)
+    ok("Online-login components ready.")
+    return True
+
+
 def _install_openssl_xcurl(game_dir: Path):
     """Make Minecraft's PlayFab HTTP go over OpenSSL instead of Wine secur32.
 
@@ -1261,6 +1326,7 @@ def _install_openssl_xcurl(game_dir: Path):
     into the prefix system32 by _install_cryptbase_in_prefix(); launch() adds
     WINEDLLOVERRIDES=cryptbase=n,b (native stub, else GDK-Proton builtin).
     Idempotent."""
+    ensure_openssl_xcurl_set()                 # fetch the 20 MB set on first use
     s = OPENSSL_XCURL_SET
     libcurl = s / "libcurl-4.dll"
     shim = s / "xcurl-cashim.dll"
