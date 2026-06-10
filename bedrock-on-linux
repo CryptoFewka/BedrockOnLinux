@@ -24,7 +24,7 @@ from pathlib import Path
 
 APP = "bedrock-on-linux"
 PRETTY = "BedrockOnLinux"
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 
 HOME = Path.home()
 DATA = Path(os.environ.get("BOL_HOME", HOME / ".local/share" / APP))
@@ -114,15 +114,35 @@ WINE_BUILD_PKGS = (
 IS_TTY = sys.stdout.isatty()
 _LOG_SINK = None       # GUI hook: callable(str)
 
+# How the four log levels are *shown*. The internal "::/OK/!!/xx" tag stays the
+# protocol between _emit and the GUI sink; only the rendering changes: a clear
+# word + colour in the terminal (ANSI, TTY only) and in the GUI log box.
+#   tag: (label, ansi-label, ansi-msg, gui-label-colour, gui-msg-colour)
+_LEVELS = {
+    "::": ("info ", "\033[38;5;111m", "",               "#6ea8fe", "#aeb4bf"),
+    "OK": ("ok   ", "\033[38;5;78m",  "",               "#5bc46a", "#aeb4bf"),
+    "!!": ("warn ", "\033[38;5;179m", "\033[38;5;179m", "#e0b341", "#e6cd86"),
+    "xx": ("error", "\033[38;5;167m", "\033[38;5;167m", "#e06c5b", "#f0a39a"),
+}
+_ANSI_RESET = "\033[0m"
+
 
 def _emit(tag, m):
-    line = f"{tag} {m}"
     if _LOG_SINK:
         try:
-            _LOG_SINK(line)
+            _LOG_SINK(f"{tag} {m}")        # GUI parses the tag, renders it nicely
         except Exception:
             pass
-    print(line, flush=True)
+    lvl = _LEVELS.get(tag)
+    if not lvl:
+        print(f"{tag} {m}", flush=True)
+        return
+    label, alab, amsg, _, _ = lvl
+    if IS_TTY:
+        tail = f"{amsg}{m}{_ANSI_RESET}" if amsg else m
+        print(f"{alab}{label}{_ANSI_RESET}  {tail}", flush=True)
+    else:
+        print(f"{label}  {m}", flush=True)
 
 
 def info(m): _emit("::", m)
@@ -1811,7 +1831,7 @@ _DIAG_RULES = [
      "(open the link, enter the code)."),
     (r"nodrv_CreateWindow|no driver could be loaded|"
      r"explorer process failed to start",
-     "Wine prefix broken — click 'Repair' then relaunch."),
+     "Wine prefix broken (Wine couldn't open a window)."),
     (r"0x80004001|E_NOTIMPL|XUserAddAsync|xgameruntime.*(?:unimpl|stub)|"
      r"QueryApiImpl.*unimpl",
      "The GDK-Proton in use has no WineGDK XUser — rebuild from your "
@@ -1843,7 +1863,7 @@ def diagnose():
     return hits
 
 
-def launch(_pp=None):
+def launch(_pp=None, _repaired=False):
     s = load_settings()
     gd = s.get("game_dir")
     if not gd or not Path(gd, "Minecraft.Windows.exe").exists():
@@ -1972,10 +1992,12 @@ def launch(_pp=None):
          "join your server from the Servers tab.")
     glog = open(LOGS / "minecraft.log", "w")
     rc = None
+    hits = []
     try:
         rc = subprocess.run(cmd, env=env, cwd=str(CONTENT), stdout=glog,
                             stderr=subprocess.STDOUT).returncode
     finally:
+        glog.close()
         patch_options()
         # PROTON_LOG writes steam-<id>.log — keep the newest as proton.log
         # (the fixed name made us read stale logs after a crash).
@@ -1986,7 +2008,28 @@ def launch(_pp=None):
             for old in logs[:-1]:
                 old.unlink(missing_ok=True)
         ok(f"Game closed (exit {rc}).")
-        diagnose()
+        hits = diagnose()
+    # Self-repair: a genuinely broken Wine prefix is fixable without bothering
+    # the user — reset it, re-bootstrap and relaunch ONCE. Guarded against
+    # loops (_repaired); skipped when the display is unavailable (a reset can't
+    # fix that). It only runs after a failed launch and retries at most once,
+    # so the worst case is simply today's behaviour. The login survives — the
+    # token lives in DATA/msa, not the prefix.
+    broken = any("prefix broken" in h.lower() for h in hits)
+    no_display = any("display unavailable" in h.lower() for h in hits)
+    if broken and not no_display:
+        if not _repaired:
+            warn("Broken Wine prefix — repairing and relaunching once…")
+            reset_prefix()
+            try:
+                install_gameinput(active_prefix(),
+                                  Path(load_settings()["game_dir"]))
+            except Exception as e:
+                warn(f"Re-bootstrap after repair failed ({e}).")
+            return launch(_pp, _repaired=True)
+        warn("Still failing after an automatic repair — likely a GPU/display "
+             "issue, not the prefix.")
+    return rc
 
 
 def doctor():
@@ -2168,6 +2211,11 @@ def gui():
                      font=("monospace", 9), highlightthickness=0,
                      padx=10, pady=8)
     logbox.pack(fill="both", expand=True, padx=24, pady=(0, 4))
+    for _tg, (_lbl, _a1, _a2, _lc, _mc) in _LEVELS.items():
+        _nm = _lbl.strip()
+        logbox.tag_configure("L_" + _nm, foreground=_lc,
+                             font=("monospace", 9, "bold"))
+        logbox.tag_configure("M_" + _nm, foreground=_mc)
 
     def toggle_details():
         ui["details"] = not ui["details"]
@@ -2234,7 +2282,14 @@ def gui():
         return None
 
     def glog(line):
-        logbox.insert("end", line + "\n")
+        lvl = _LEVELS.get(line[:2])
+        if lvl:
+            label = lvl[0]
+            nm = label.strip()
+            logbox.insert("end", label + "  ", "L_" + nm)
+            logbox.insert("end", line[2:].strip() + "\n", "M_" + nm)
+        else:
+            logbox.insert("end", line + "\n")
         logbox.see("end")
         if not ui["busy"]:
             return
