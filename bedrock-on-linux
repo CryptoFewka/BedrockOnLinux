@@ -1313,6 +1313,13 @@ def _patch_hbui_signin_gate(game_dir: Path):
                  "!e.isSignInInProgress&&(t||n))return")
     si_done = ("if(!1&&!e.isLoggedInWithMicrosoftAccount&&"
                "!e.isSignInInProgress&&(t||n))return")
+    # (3) Viewing another player's profile: the Profile-View state machine
+    # returns NotLoggedInWithMSA / NotAllowedToViewProfiles* (a 'sign in' error)
+    # because the oreUI isLoggedInWithMicrosoftAccount facet is false under our
+    # external login, even though the People Hub data loads fine. Skip the whole
+    # error block so the loaded profile actually renders (state -> None).
+    pf_needle = "if(!t){if(e.isLoggedInWithMicrosoftAccount&&r)return"
+    pf_done = "if(!1){if(e.isLoggedInWithMicrosoftAccount&&r)return"
     for js in glob.glob(str(game_dir / "data/gui/dist/hbui/index-*.js")):
         try:
             data = Path(js).read_text()
@@ -1323,6 +1330,8 @@ def _patch_hbui_signin_gate(game_dir: Path):
             data = data.replace(wb_needle, wb_done, 1)
         if si_done not in data and si_needle in data:
             data = data.replace(si_needle, si_done, 1)
+        if pf_done not in data and data.count(pf_needle) == 1:
+            data = data.replace(pf_needle, pf_done, 1)
         if data == orig:
             continue
         bak = js + ".bol-orig"
@@ -2375,6 +2384,11 @@ def launch(_pp=None, _repaired=False, _force_x11=False, _no_gamescope=False):
     # LoginWithXbox flow runs over WinHTTP inside Minecraft — without this,
     # sign-in loops are opaque to debug).
     env["WINEDEBUG"] = os.environ.get("WINEDEBUG") or "+gdkc,+winhttp,fixme+all"
+    # Diagnostic (safe): the OpenSSL XCurl shim logs "DONE rc=.. http=.. url=.."
+    # per request to <game>/xcurl.log when XCURL_LOG=1 (it tolerates fopen
+    # failure). Friends/profiles/realms ride XCurl, invisible to WinHTTP traces.
+    if os.environ.get("BOL_XCURL_LOG"):
+        env["XCURL_LOG"] = "1"
     # cryptbase=n,b: prefer our cryptbase.dll RNG stub (installed in system32
     # by _install_cryptbase_in_prefix) so OpenSSL XCurl's RtlGenRandom forward
     # resolves, but FALL BACK to the GDK-Proton builtin when the stub is
