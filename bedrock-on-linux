@@ -1081,7 +1081,24 @@ def xbl_preauth(msa_access_token):
         "lic_expiry": lic_expiry,
         "obtained": int(_time.time()),
     }
-    out_path.write_text(json.dumps(out, indent=2))
+    # Atomic write: two launches (or a launch racing a stale one) both ran
+    # xbl_preauth and a plain write_text let their output interleave, leaving a
+    # corrupted xbl_xuid in device.json — which the game then loads and faults
+    # on. Write to a temp file in the same dir and rename, so a reader only ever
+    # sees a complete file and the last writer wins cleanly.
+    import tempfile
+    fd, tmp = tempfile.mkstemp(dir=str(out_path.parent), prefix=".device-",
+                               suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(out, indent=2))
+        os.replace(tmp, out_path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     bits = ["device"]
     if user_token: bits.append("user")
     if xbl_token: bits.append(f"XBL(xuid={xbl_claims.get('xid')},gtg={xbl_claims.get('gtg')})")
