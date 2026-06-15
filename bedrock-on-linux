@@ -2811,6 +2811,12 @@ def gui():
                        highlightthickness=0, anchor="w").pack(fill="x", pady=2)
         tk.Frame(d, bg=PANEL2, height=1).pack(fill="x", pady=12)
         for label, fn in (
+            ("Open Minecraft folder", lambda: subprocess.Popen(
+              ["xdg-open", str(PFX 
+                  / "pfx/drive_c/users" 
+                  / os.environ.get("USER", "Public") 
+                  / "AppData/Roaming/Minecraft Bedrock/Users/Shared/games/com.mojang/")
+              ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)),
             ("Open logs folder", lambda: subprocess.Popen(
                 ["xdg-open", str(LOGS)], stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL)),
