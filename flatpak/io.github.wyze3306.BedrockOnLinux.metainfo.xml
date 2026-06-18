@@ -69,6 +69,15 @@
   </content_rating>
 
   <releases>
+    <release version="1.2.1" date="2026-06-18">
+      <description>
+        <p>Fixes a false "reinstall the game engine" warning that could appear
+           after closing the game even when everything had worked: the
+           post-game check was matching an unrelated, harmless system message.
+           It now trusts the engine's own sign-in markers, so it no longer
+           cries wolf on a perfectly good session.</p>
+      </description>
+    </release>
     <release version="1.2.0" date="2026-06-18">
       <description>
         <p>A refreshed, modern interface and a fix for launch crashes on some

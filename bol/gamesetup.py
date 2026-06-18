@@ -75,8 +75,14 @@ _DIAG_RULES = [
     (r"nodrv_CreateWindow|no driver could be loaded|"
      r"explorer process failed to start",
      "Wine prefix broken (Wine couldn't open a window)."),
-    (r"0x80004001|E_NOTIMPL|XUserAddAsync|xgameruntime.*(?:unimpl|stub)|"
-     r"QueryApiImpl.*unimpl",
+    # Old GDK-Proton without the WineGDK XUser fork → xgameruntime stubs the
+    # XUser calls. Require the xgameruntime/XUser context: a bare 0x80004001 /
+    # E_NOTIMPL also appears in benign WindowsAppRuntime bootstrapper messages
+    # ("Bootstrapper initialization failed looking for version 1.8"), and the
+    # diagnose() guard below also drops this hit when the engine's own XUser
+    # patches are in the log.
+    (r"XUserAddAsync|QueryApiImpl.*unimpl|"
+     r"xgameruntime:.*(?:unimpl|stub|not implemented|E_NOTIMPL|0x80004001)",
      "The GDK-Proton in use has no WineGDK XUser — reinstall the engine: "
      "'bedrock-on-linux setup --force'."),
 ]
@@ -94,6 +100,12 @@ def diagnose():
                 pass
     text = "\n".join(blobs)
     hits = [msg for pat, msg in _DIAG_RULES if re.search(pat, text, re.I)]
+    # Positive evidence wins: if the engine logged its XUser patches or a
+    # successful pre-auth, WineGDK XUser IS present — drop any "no XUser" hit so
+    # a benign HRESULT elsewhere can't tell the user to reinstall a working
+    # engine.
+    if re.search(r"InitializeApiImplEx2 patched|preauth: loaded user/XSTS", text):
+        hits = [h for h in hits if "no WineGDK XUser" not in h]
     if not msa_signed_in():
         hits.append("No Microsoft account linked — click 'Sign in' "
                     "before PLAY.")
