@@ -109,8 +109,13 @@ def launch(_pp=None, _repaired=False, _force_x11=False, _no_gamescope=False):
     # runs flat. (openxr_loader is left alone — the EXE may import it; we only
     # drop the runtime behind it.) Empty value == disabled in WINEDLLOVERRIDES;
     # host WINEDLLOVERRIDES are kept if the user set any.
+    # amd_ags_x64: the game loads it unconditionally (even on Intel/NVIDIA), and
+    # Wine's builtin recurses in get_ags_version_from_resource (agsInit → 100s of
+    # nested calls, err 1812) until the stack overflows and the launch crashes a
+    # few seconds in. AGS is optional AMD-GPU services the game runs fine without,
+    # so disable it so the load fails cleanly instead.
     overrides = ["cryptbase=n,b", "vrclient=", "vrclient_x64=", "openvr_api=",
-                 "wineopenxr="]
+                 "wineopenxr=", "amd_ags_x64="]
     cur = os.environ.get("WINEDLLOVERRIDES", "")
     if cur:
         overrides.append(cur)

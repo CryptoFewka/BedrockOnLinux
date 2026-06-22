@@ -12,6 +12,7 @@ from .config import LOGS, PRETTY, VERSION
 from .content import _mojang_dir, import_content
 from .games import list_mc_versions
 from .gamesetup import do_setup
+from .inject import run_injector
 from .launch import launch
 from . import log
 from .log import BolError, _LEVELS, warn
@@ -525,8 +526,44 @@ def gui():
                                     messagebox.showinfo("Import", msg, parent=d)))
             threading.Thread(target=work, daemon=True).start()
 
+        def do_inject():
+            from tkinter import filedialog, messagebox
+            if not _mc_running():
+                messagebox.showwarning(
+                    "DLL injector",
+                    "Start Minecraft first and wait for the main menu, then run "
+                    "your injector.", parent=d)
+                return
+            last = load_settings().get("injector_exe") or ""
+            exe = filedialog.askopenfilename(
+                parent=d, title="Choose a Windows DLL injector (.exe)",
+                initialdir=(str(Path(last).parent) if last else None),
+                initialfile=(Path(last).name if last else None),
+                filetypes=[("Windows injector", "*.exe"), ("All files", "*.*")])
+            if not exe:
+                return
+            imp_status.set("Launching injector…")
+
+            def work():
+                try:
+                    name = run_injector(exe)
+                    s2 = load_settings()
+                    s2["injector_exe"] = exe
+                    save_settings(s2)
+                    msg = (f"Launched {name} in the game's Wine prefix.\n\n"
+                           "Pick your client .dll in the injector window and "
+                           "inject. Works on the native / AppImage build — not "
+                           "inside the Flatpak sandbox.")
+                except Exception as e:                # noqa: BLE001
+                    msg = f"Couldn't run the injector:\n{e}"
+                d.after(0, lambda: (imp_status.set(""),
+                                    messagebox.showinfo("DLL injector", msg,
+                                                        parent=d)))
+            threading.Thread(target=work, daemon=True).start()
+
         for label, fn in (
             ("Import content (.mcpack / .mcworld / .mcaddon)…", do_import),
+            ("Inject a DLL (run a Windows injector)…", do_inject),
             ("Open Minecraft folder", lambda: subprocess.Popen(
                 ["xdg-open", str(_mojang_dir())], stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL)),
