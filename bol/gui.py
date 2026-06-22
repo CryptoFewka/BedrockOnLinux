@@ -531,31 +531,30 @@ def gui():
             if not _mc_running():
                 messagebox.showwarning(
                     "DLL injector",
-                    "Start Minecraft first and wait for the main menu, then run "
-                    "your injector.", parent=d)
+                    "Start Minecraft first and wait for the main menu, then "
+                    "inject.", parent=d)
                 return
-            last = load_settings().get("injector_exe") or ""
-            exe = filedialog.askopenfilename(
-                parent=d, title="Choose a Windows DLL injector (.exe)",
+            last = load_settings().get("injector_dll") or ""
+            dll = filedialog.askopenfilename(
+                parent=d, title="Choose a client .dll to inject",
                 initialdir=(str(Path(last).parent) if last else None),
                 initialfile=(Path(last).name if last else None),
-                filetypes=[("Windows injector", "*.exe"), ("All files", "*.*")])
-            if not exe:
+                filetypes=[("Client DLL", "*.dll"), ("All files", "*.*")])
+            if not dll:
                 return
-            imp_status.set("Launching injector…")
+            imp_status.set("Injecting…")
 
             def work():
                 try:
-                    name = run_injector(exe)
+                    name = run_injector(dll)
                     s2 = load_settings()
-                    s2["injector_exe"] = exe
+                    s2["injector_dll"] = dll
                     save_settings(s2)
-                    msg = (f"Launched {name} in the game's Wine prefix.\n\n"
-                           "Pick your client .dll in the injector window and "
-                           "inject. Works on the native / AppImage build — not "
-                           "inside the Flatpak sandbox.")
+                    msg = (f"Injected {name} into Minecraft. ✓\n\n"
+                           "(Native / AppImage only — not inside the Flatpak "
+                           "sandbox.)")
                 except Exception as e:                # noqa: BLE001
-                    msg = f"Couldn't run the injector:\n{e}"
+                    msg = f"Couldn't inject:\n{e}"
                 d.after(0, lambda: (imp_status.set(""),
                                     messagebox.showinfo("DLL injector", msg,
                                                         parent=d)))
@@ -563,7 +562,7 @@ def gui():
 
         for label, fn in (
             ("Import content (.mcpack / .mcworld / .mcaddon)…", do_import),
-            ("Inject a DLL (run a Windows injector)…", do_inject),
+            ("Inject a client DLL…", do_inject),
             ("Open Minecraft folder", lambda: subprocess.Popen(
                 ["xdg-open", str(_mojang_dir())], stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL)),
