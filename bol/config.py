@@ -6,7 +6,7 @@ from pathlib import Path
 
 APP = "bedrock-on-linux"
 PRETTY = "BedrockOnLinux"
-VERSION = "1.2.4"
+VERSION = "1.2.5"
 
 HOME = Path.home()
 DATA = Path(os.environ.get("BOL_HOME", HOME / ".local/share" / APP))
@@ -59,7 +59,7 @@ WINEGDK_OUT = PROTON_DIR / "GDK-Proton-xuser"
 # Republish: scripts/package-engine.sh.
 WINEGDK_PREBUILT_REPO = "Wyze3306/BedrockOnLinux"
 # Bump when the build/packaging method changes → forces a clean rebuild.
-WINEGDK_BUILD_REV = "wow64-archs-r6"
+WINEGDK_BUILD_REV = "wow64-archs-r7"
 
 # Build deps for the from-source fallback — a direct list, because
 # `apt build-dep wine` needs deb-src entries Mint/LMDE don't ship.
