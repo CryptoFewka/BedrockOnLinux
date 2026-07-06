@@ -69,6 +69,22 @@
   </content_rating>
 
   <releases>
+    <release version="1.2.6" date="2026-07-06">
+      <description>
+        <p>Fixes online sign-in and two crashes:</p>
+        <ul>
+          <li>the game no longer freezes on the "Get Started" screen with the
+              music still playing — the online-login component it needs is now
+              published, so signing in completes instead of hanging;</li>
+          <li>fixes the crash when opening or closing Settings or pausing the
+              game (seen mainly on the Steam Deck) by giving the game more
+              stack room;</li>
+          <li>adds an optional setting to keep the mouse cursor inside the
+              window, so it no longer slips outside the game in windowed
+              mode.</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.2.1" date="2026-06-18">
       <description>
         <p>Fixes a false "reinstall the game engine" warning that could appear

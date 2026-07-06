@@ -491,6 +491,18 @@ def gui():
                       "game freezes / crashes on launch)", variable=msa_v,
                       command=save_msa, progress_color=GREEN,
                       font=font(13)).pack(anchor="w", pady=7)
+
+        confine_v = tk.BooleanVar(
+            value=load_settings().get("confine_cursor", False))
+
+        def save_confine():
+            s2 = load_settings()
+            s2["confine_cursor"] = confine_v.get()
+            save_settings(s2)
+        ctk.CTkSwitch(wrap, text="Keep the mouse inside the window (fixes the "
+                      "cursor escaping in windowed mode)", variable=confine_v,
+                      command=save_confine, progress_color=GREEN,
+                      font=font(13)).pack(anchor="w", pady=7)
         ctk.CTkFrame(wrap, fg_color=CARD2, height=1).pack(fill="x", pady=14)
 
         imp_status = tk.StringVar(value="")

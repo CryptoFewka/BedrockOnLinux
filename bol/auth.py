@@ -483,6 +483,14 @@ def wine_apply_winegdk_prereqs():
                            stderr=subprocess.STDOUT, timeout=120)
         except Exception as e:
             warn(f"reg add {args[0]} failed: {e}")
+    def _regdel(key, value):
+        cmd, env = proton_umu_cmd("reg")
+        cmd += ["delete", key, "/v", value, "/f"]
+        try:
+            subprocess.run(cmd, env=env, stdout=log,
+                           stderr=subprocess.STDOUT, timeout=120)
+        except Exception as e:
+            warn(f"reg delete {key} failed: {e}")
     _regadd(r"HKLM\Software\Microsoft\Windows NT\CurrentVersion\OEM",
             "/v", "ConsoleMode", "/t", "REG_DWORD", "/d", "8")
     # Force the in-game "signed in with Microsoft" facet (unlocks the Servers
@@ -508,4 +516,38 @@ def wine_apply_winegdk_prereqs():
          "0"),
     ):
         _regadd(r"HKCU\Environment", "/v", name, "/t", "REG_SZ", "/d", val)
+    # Issue #26: in windowed mode the mouse cursor escapes the game window when
+    # the player looks around. Minecraft confines the cursor with ClipCursor
+    # during mouse-look, but under Wine that grab is unreliable for an
+    # individually-managed top-level window (the compositor/focus handshake can
+    # drop it), so the OS pointer drifts out — only visible when the game isn't
+    # fullscreen. Running inside a Wine virtual desktop gives Wine a single
+    # owning X window it fully controls, which makes ClipCursor confine to the
+    # game window reliably. Opt-in (setting `confine_cursor` / env
+    # BOL_CONFINE_CURSOR=1) because it changes windowing for the whole prefix.
+    # A persisted marker keeps the common (off) path from paying two extra
+    # `wine reg` calls every launch, while still reverting cleanly on toggle-off.
+    from .util import _screen_wh, save_settings
+    confine = (os.environ.get("BOL_CONFINE_CURSOR", "").lower()
+               in ("1", "yes", "on", "true")
+               or load_settings().get("confine_cursor", False))
+    applied = load_settings().get("_confine_applied", False)
+    if confine:
+        # Re-ensure every launch (not just on the enable edge) so the keys
+        # survive a prefix reset, which recreates the prefix and would wipe
+        # them. Only opt-in users reach this path, so the extra reg calls are
+        # never paid by the default-off majority.
+        wh = _screen_wh() or ("1920", "1080")
+        _regadd(r"HKCU\Software\Wine\Explorer", "/v", "Desktop",
+                "/t", "REG_SZ", "/d", "Default")
+        _regadd(r"HKCU\Software\Wine\Explorer\Desktops", "/v", "Default",
+                "/t", "REG_SZ", "/d", f"{wh[0]}x{wh[1]}")
+        if not applied:
+            s2 = load_settings(); s2["_confine_applied"] = True; save_settings(s2)
+        ok(f"Cursor confinement ON (virtual desktop {wh[0]}x{wh[1]}).")
+    elif applied:
+        _regdel(r"HKCU\Software\Wine\Explorer", "Desktop")
+        _regdel(r"HKCU\Software\Wine\Explorer\Desktops", "Default")
+        s2 = load_settings(); s2["_confine_applied"] = False; save_settings(s2)
+        ok("Cursor confinement OFF (virtual desktop removed).")
     ok("WineGDK prereqs applied (ConsoleMode=8, TLS 1.2 forced, UI muted)")

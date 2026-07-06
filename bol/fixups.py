@@ -3,6 +3,7 @@
 
 import re
 import shutil
+import struct
 import tarfile
 from pathlib import Path
 
@@ -299,6 +300,47 @@ def _patch_lhc_xcurl_gate(game_dir: Path):
         return
     apply_patch(dll, ja_off, expect, b"\x90" * 6,
                 "libHttpClient → force XCurl provider", strict=False)
+
+
+def bump_stack_reserve(exe: Path, target=0x1000000):
+    """Enlarge Minecraft.Windows.exe's PE stack reserve so the game stops
+    crashing on the settings/pause screens (issue #27).
+
+    The crash is a stack overflow: proton.log ends with
+        seh:call_seh_handlers invalid frame 00007FFFFE0FF3D0 (…FE102000-…FE200000)
+        seh:NtRaiseException Exception frame is not in stack limits
+    i.e. the establisher frame sits *below* the thread's stack limit. The exe
+    ships SizeOfStackReserve = 0x100000 (1 MB) and the faulting frame overran
+    that by only ~11 KB — a marginal overflow reached by a deep-but-bounded
+    call chain the settings/pause UI walks (OreUI teardown / GDK cleanup). The
+    Wine loader sizes the initial thread's stack (and every worker thread that
+    passes dwStackSize=0) from this header field, so raising it to 16 MB gives
+    the chain the headroom it needs. Address space is the only cost on x64, so
+    this can't regress a working setup.
+
+    In-place 8-byte header edit (no 292 MB rewrite), idempotent, and re-applied
+    every launch so it survives a game reinstall/update or a version switch."""
+    try:
+        with open(exe, "r+b") as f:
+            head = f.read(0x400)
+            if head[:2] != b"MZ":
+                return
+            e = struct.unpack_from("<I", head, 0x3C)[0]
+            if head[e:e + 4] != b"PE\0\0":
+                return
+            opt = e + 4 + 20                       # PE sig + COFF file header
+            if struct.unpack_from("<H", head, opt)[0] != 0x20B:
+                return                             # not PE32+ — leave it alone
+            field = opt + 72                       # SizeOfStackReserve (PE32+)
+            cur = struct.unpack_from("<Q", head, field)[0]
+            if cur >= target:
+                return                             # already roomy (idempotent)
+            f.seek(field)
+            f.write(struct.pack("<Q", target))
+        ok(f"Stack reserve raised {cur // 1024} KB → {target // 1024} KB "
+           "(settings/pause crash fix)")
+    except OSError as e:                           # never block a launch over this
+        warn(f"Could not raise the stack reserve: {e}")
 
 
 def hide_signin_button(game_dir):

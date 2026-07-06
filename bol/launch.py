@@ -18,7 +18,7 @@ from .auth import (
 )
 from .config import CONTENT, DATA, HOME, LOGS
 from .deps import ensure_login_deps
-from .fixups import _install_cryptbase_in_prefix
+from .fixups import _install_cryptbase_in_prefix, bump_stack_reserve
 from .gameinput import install_gameinput
 from .gamesetup import diagnose
 from .log import die, info, ok, warn
@@ -75,6 +75,7 @@ def launch(_pp=None, _repaired=False, _force_x11=False, _no_gamescope=False):
     xbl_preauth(access or "")
     kill_wine()
     exe = str(CONTENT / "Minecraft.Windows.exe")
+    bump_stack_reserve(Path(exe))    # issue #27: settings/pause stack overflow
     cmd, env = proton_umu_cmd(exe)
     env["PROTON_LOG"] = "1"          # always: proton.log feeds diagnose()
     env["PROTON_LOG_DIR"] = str(LOGS)
