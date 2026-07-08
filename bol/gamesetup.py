@@ -106,6 +106,19 @@ def diagnose():
     # engine.
     if re.search(r"InitializeApiImplEx2 patched|preauth: loaded user/XSTS", text):
         hits = [h for h in hits if "no WineGDK XUser" not in h]
+    # Software-rendering fallback: if DXVK/vkd3d only found llvmpipe (Mesa's CPU
+    # rasteriser) and no real GPU Vulkan device, the GPU driver isn't active in
+    # the container. The game then runs on the CPU — slow, and the OreUI Play
+    # screen renders as black panels (the simple main menu still shows, so it
+    # looks baffling rather than obviously GPU-related). Usual cause: a GPU
+    # driver left in a bad state (fixed by a reboot / driver reinstall) or a
+    # missing Vulkan ICD. Only flag when EVERY device found is llvmpipe.
+    devices = re.findall(r"Found device:\s*(.+)", text)
+    if devices and all("llvmpipe" in d.lower() for d in devices):
+        hits.append("Running on software rendering (llvmpipe) — your GPU's "
+                    "Vulkan driver isn't active, so the game runs on the CPU "
+                    "(slow, and the Play screen may render black). Reboot, or "
+                    "(re)install/enable your GPU's Vulkan drivers.")
     if not msa_signed_in():
         hits.append("No Microsoft account linked — click 'Sign in' "
                     "before PLAY.")

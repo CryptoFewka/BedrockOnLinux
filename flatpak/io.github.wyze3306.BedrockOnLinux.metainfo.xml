@@ -69,6 +69,21 @@
   </content_rating>
 
   <releases>
+    <release version="1.2.7" date="2026-07-08">
+      <description>
+        <p>Fixes the game breaking when Advanced Diagnostics is on, and adds a
+           clearer warning when your GPU isn't being used:</p>
+        <ul>
+          <li>with "Advanced diagnostics" enabled the game could hang or crash
+              with broken menus — the verbose logging was flooding and starving
+              the game; it now stays fast and playable with diagnostics on;</li>
+          <li>if the game falls back to software rendering (your GPU's Vulkan
+              driver isn't active), the launcher now tells you — that is what
+              makes the Play screen render black; a reboot or driver
+              reinstall fixes it.</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.2.6" date="2026-07-06">
       <description>
         <p>Fixes online sign-in and two crashes:</p>

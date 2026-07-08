@@ -87,8 +87,19 @@ def launch(_pp=None, _repaired=False, _force_x11=False, _no_gamescope=False):
     # +gdkc,+winhttp surface PlayFab/SISU HTTP statuses in proton.log (the
     # in-game LoginWithXbox flow runs over WinHTTP). fixme+all is verbose, so
     # keep it for diagnostics; otherwise keep errors but drop the fixme spam.
+    #
+    # CRUCIAL: `trace-gdkc` (disable *trace* on the gdkc channel; err/warn/fixme
+    # stay). Plain `+gdkc` also turns on trace, and the game polls
+    # XGameRuntimeIsFeatureAvailable in a tight init loop — each poll emits 4
+    # gdkc TRACE lines. That floods the log (500k+ lines in a minute) and
+    # bottlenecks the game on synchronous debug I/O so init never completes: no
+    # window renders and menus crash. Diagnostics-on then looks like a totally
+    # broken game (esp. on 1.26.32.x), while diagnostics-off is fine — which is
+    # why only people who enabled Advanced Diagnostics hit it. The useful gdkc
+    # signal (preauth/token/RP routing) is all at err level, so we lose nothing.
     env["WINEDEBUG"] = (os.environ.get("WINEDEBUG")
-                        or ("+gdkc,+winhttp,fixme+all" if diag else "fixme-all"))
+                        or ("+gdkc,trace-gdkc,+winhttp,fixme+all" if diag
+                            else "fixme-all"))
     # The OpenSSL XCurl shim writes "DONE rc=.. http=.. url=.." per request to
     # <game>/xcurl.log when XCURL_LOG=1 (friends/profiles/realms ride XCurl,
     # invisible to WinHTTP traces). BOL_XCURL_LOG=1/0 overrides the toggle.
