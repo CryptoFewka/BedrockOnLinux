@@ -67,11 +67,16 @@ WINEGDK_OUT = PROTON_DIR / "GDK-Proton-xuser"
 # app's releases instead of compiling Wine.  Managed engines are fail-closed:
 # the launcher only accepts the exact archive hash compiled into this version.
 # Build locally with scripts/package-engine.sh, then pin its printed SHA-256.
-WINEGDK_PREBUILT_REPO = "Wyze3306/BedrockOnLinux"
+# This fork consumes its own reproducibly CI-built engine (see
+# .github/workflows/build-engine.yml), which reproduces the exact bytes below.
+WINEGDK_PREBUILT_REPO = "CryptoFewka/BedrockOnLinux"
 # Bump when the build/packaging method changes → forces a clean rebuild.
 WINEGDK_BUILD_REV = "wow64-archs-native5"
 # SHA-256 of the reviewed, deterministic engine archive. An invalid value makes
 # the installer fail closed rather than accepting a differently packed engine.
 WINEGDK_ARCHIVE_SHA256 = "35a2ead372f51bd3fc330a2da91e2a0846aa03a80bb0c175f049bef719398fcf"
 
-SELF_REPO = WINEGDK_PREBUILT_REPO
+# Decoupled from the engine repo: the launcher checks upstream for its own
+# update notifications so this follow-upstream fork still learns about new
+# upstream releases, while the engine above comes from our own CI build.
+SELF_REPO = "Wyze3306/BedrockOnLinux"
