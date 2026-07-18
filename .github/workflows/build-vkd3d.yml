@@ -1,0 +1,125 @@
+# Tier 1: build the universal vkd3d-proton DGC payload and publish it as an
+# independently verifiable, attested artifact for the engine build to reuse.
+#
+# Source: HansKristian-Work/vkd3d-proton, built with the exact Debian 13
+# (Trixie) mingw toolchain pinned in third_party/vkd3d-proton-universal/
+# provenance.env. build-vkd3d-universal.sh verifies its four output DLLs against
+# OUTPUT-SHA256SUMS, which is the byte-reproducibility gate.
+#
+# The compile runs inside a debian:trixie container via `docker run` while the
+# JS actions (checkout, upload, attest) run on the host, avoiding the need for
+# Node.js inside the minimal container.
+
+name: Build vkd3d-proton
+
+on:
+  workflow_call:
+    inputs:
+      publish:
+        description: "Publish + attest the payload as a release"
+        type: boolean
+        default: false
+    outputs:
+      artifact:
+        description: "Name of the uploaded vkd3d artifact"
+        value: vkd3d-universal
+      sha256:
+        description: "SHA-256 of the packed vkd3d payload"
+        value: ${{ jobs.build.outputs.sha256 }}
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish + attest the payload as a release on this fork"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    outputs:
+      sha256: ${{ steps.pack.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Build universal vkd3d-proton in a pinned Trixie container
+        run: |
+          mkdir -p "$RUNNER_TEMP/vkout"
+          # Toolchain versions are pinned in provenance.env; if apt has moved
+          # past them and the output hashes fail, pin these installs to a
+          # snapshot.debian.org date that serves the recorded versions rather
+          # than loosening the script's checks.
+          docker run --rm \
+            -v "$PWD:/src:ro" \
+            -v "$RUNNER_TEMP/vkout:/out" \
+            debian:trixie \
+            bash -euo pipefail -c '
+              export DEBIAN_FRONTEND=noninteractive LC_ALL=C LANG=C
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                ca-certificates git python3 python3-pip \
+                meson glslang-tools spirv-tools \
+                gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 \
+                g++-mingw-w64-x86-64 g++-mingw-w64-i686 \
+                binutils-mingw-w64 mingw-w64-tools
+              pip3 install --break-system-packages "ninja==1.13.0"
+              # provenance.env records the win32 gcc variant; select it.
+              for t in gcc g++; do for a in x86_64 i686; do
+                update-alternatives --set "${a}-w64-mingw32-${t}" \
+                  "/usr/bin/${a}-w64-mingw32-${t}-win32" || true
+              done; done
+              /src/scripts/build-vkd3d-universal.sh /out
+            '
+          # docker writes as root; hand the tree back to the runner user.
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/vkout"
+
+      - name: Pack the vkd3d output deterministically
+        id: pack
+        run: |
+          out="vkd3d-universal-3.0.1-nv-dgc.tar.gz"
+          tar --sort=name --format=gnu --hard-dereference \
+            --mtime=@1784308597 --owner=0 --group=0 --numeric-owner \
+            -C "$RUNNER_TEMP/vkout/vkd3d-build-output" -cf - vkd3d-proton-3.0.1-nv-dgc \
+            | gzip -n -6 > "$out"
+          sha="$(sha256sum "$out" | cut -d' ' -f1)"
+          echo "$sha  $out" > "$out.sha256"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          echo "TARBALL=$out" >> "$GITHUB_ENV"
+          echo "built vkd3d payload: $out  sha256=$sha"
+
+      - name: Upload vkd3d artifact (reuse within a run)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: vkd3d-universal
+          path: |
+            ${{ env.TARBALL }}
+            ${{ env.TARBALL }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Attest build provenance
+        if: ${{ inputs.publish }}
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: ${{ env.TARBALL }}
+
+      - name: Publish the vkd3d payload release
+        if: ${{ inputs.publish }}
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: vkd3d-3.0.1-nv-dgc
+          name: vkd3d-proton universal DGC 3.0.1
+          body: >
+            Reproducible universal vkd3d-proton (EXT + restored NV DGC) build.
+            SHA-256 ${{ steps.pack.outputs.sha256 }}.
+            Verify provenance with: gh attestation verify <file> --repo ${{ github.repository }}
+          files: |
+            ${{ env.TARBALL }}
+            ${{ env.TARBALL }}.sha256
+          fail_on_unmatched_files: true
