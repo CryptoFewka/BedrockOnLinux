@@ -75,11 +75,18 @@ jobs:
           sudo mkdir -p /mnt/engine
           sudo chown "$(id -un):$(id -gn)" /mnt/engine
 
-      - name: Clone the WineGDK source
+      - name: Fetch the pinned WineGDK source commit
         run: |
-          # A full clone so the pinned target commit or its public base is
-          # present; build-winegdk-bullseye.sh selects whichever it finds.
-          git clone https://github.com/Weather-OS/WineGDK /mnt/engine/WineGDK
+          # The reviewed target commit is not on any branch, so a plain clone
+          # misses it (and its public base). The server allows fetching it by
+          # SHA, and build-winegdk-bullseye.sh only needs that commit's tree (it
+          # git-archives it), so a shallow fetch is enough and far smaller than
+          # the ~1 GB full history.
+          commit="$(grep -m1 '^WINEGDK_SOURCE_COMMIT = ' bol/config.py | cut -d'"' -f2)"
+          git init -q /mnt/engine/WineGDK
+          git -C /mnt/engine/WineGDK remote add origin https://github.com/Weather-OS/WineGDK
+          git -C /mnt/engine/WineGDK fetch --depth 1 origin "$commit"
+          git -C /mnt/engine/WineGDK branch bol-target FETCH_HEAD
 
       - name: Build WineGDK (Bullseye chroot, glibc-2.31 ceiling)
         run: |
