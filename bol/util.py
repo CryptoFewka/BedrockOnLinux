@@ -5,8 +5,6 @@ import http.client
 import fcntl
 import json
 import os
-import re
-import shutil
 import socket
 import subprocess
 import tempfile
@@ -195,14 +193,8 @@ def asset_url(release, predicate):
     return None, None, 0
 
 
-def _screen_wh():
-    """Primary screen WxH from xrandr (for gamescope sizing), or None."""
-    if not shutil.which("xrandr"):
-        return None
-    try:
-        out = subprocess.run(["xrandr"], capture_output=True, text=True,
-                             timeout=5).stdout
-    except Exception:
-        return None
-    m = re.search(r"current\s+(\d+)\s+x\s+(\d+)", out)
-    return (m.group(1), m.group(2)) if m else None
+def _screen_wh(runner=None):
+    """Primary screen WxH (for gamescope/Wine desktop sizing), or None. See
+    bol.x11.primary_output_size for how the primary monitor is found."""
+    from .x11 import primary_output_size
+    return primary_output_size(runner)

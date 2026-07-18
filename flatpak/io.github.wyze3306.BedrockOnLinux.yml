@@ -150,6 +150,23 @@ modules:
         url: https://files.pythonhosted.org/packages/df/b2/87e62e8c3e2f4b32e5fe99e0b86d576da1312593b39f47d8ceef365e95ed/packaging-26.2-py3-none-any.whl
         sha256: 5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e
 
+  # python-xlib (+ its six dep): lets bol.x11 read the primary monitor's size
+  # straight from the X server's RandR extension instead of parsing `xrandr`
+  # CLI text. Optional (bol.x11 falls back to the xrandr CLI without it),
+  # but vendored the same way since the runtime has no pip.
+  - name: python3-xlib
+    buildsystem: simple
+    build-commands:
+      - for w in *.whl; do python3 -m zipfile -e "$w" /app/lib/python3.12/site-packages/; done
+      - /app/bin/python3 -c "import Xlib; print('python-xlib', Xlib.__version_string__)"
+    sources:
+      - type: file
+        url: https://files.pythonhosted.org/packages/fc/b8/ff33610932e0ee81ae7f1269c890f697d56ff74b9f5b2ee5d9b7fa2c5355/python_xlib-0.33-py2.py3-none-any.whl
+        sha256: c3534038d42e0df2f1392a1b30a15a4ff5fdc2b86cfa94f072bf11b10a164398
+      - type: file
+        url: https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl
+        sha256: 4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274
+
   # zstd CLI for the one .pkg.tar.zst (libcurl) the launcher extracts;
   # Python's tarfile can't read zstd and the runtime ships no unzstd.
   - name: zstd

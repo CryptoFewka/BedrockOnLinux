@@ -133,12 +133,13 @@ for library in "$PYLIB/libtcl8.6.so" "$PYLIB/libtk8.6.so"; do
   }
 done
 
-echo "== installing portable cryptography + certifi + customtkinter into the bundle"
+echo "== installing portable cryptography + certifi + customtkinter + python-xlib into the bundle"
 "$PYBIN" -m pip install --no-cache-dir --no-compile \
     --no-deps \
     'cryptography==43.0.3' 'certifi==2026.6.17' \
     'cffi==2.0.0' 'pycparser==3.0' \
     'customtkinter==5.2.2' 'darkdetect==0.8.0' 'packaging==26.2' \
+    'python-xlib==0.33' 'six==1.17.0' \
     >/dev/null
 
 PY3="$PYLIB/python3.12"
@@ -290,6 +291,7 @@ import urllib.request
 import _tkinter
 import cryptography
 import customtkinter
+import Xlib
 from importlib.metadata import version
 assert _tkinter.TK_VERSION == "8.6", _tkinter.TK_VERSION   # Xft build, not PBS Tk9
 expected = {
@@ -300,6 +302,8 @@ expected = {
     "customtkinter": "5.2.2",
     "darkdetect": "0.8.0",
     "packaging": "26.2",
+    "python-xlib": "0.33",
+    "six": "1.17.0",
 }
 actual = {package: version(package) for package in expected}
 assert actual == expected, (actual, expected)

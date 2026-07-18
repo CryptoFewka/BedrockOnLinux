@@ -29,15 +29,20 @@ cp -r "$SRC/bol"                       "$PKG/usr/lib/bedrock-on-linux/bol"
 # Bundle the GUI toolkit (customtkinter + darkdetect + packaging — pure Python,
 # not packaged by Debian) next to bol/ so it's on sys.path; a real dir means
 # customtkinter's theme/font assets load fine. cryptography/tk stay apt deps.
+# python-xlib (+ six) is bundled the same way for bol.x11's primary-monitor
+# lookup; it's optional (bol.x11 falls back to the xrandr CLI without it).
 python3 -m pip install --quiet --no-cache-dir --no-compile --no-deps --target \
   "$PKG/usr/lib/bedrock-on-linux" \
-  'customtkinter==5.2.2' 'darkdetect==0.8.0' 'packaging==26.2'
+  'customtkinter==5.2.2' 'darkdetect==0.8.0' 'packaging==26.2' \
+  'python-xlib==0.33' 'six==1.17.0'
 rm -rf "$PKG/usr/lib/bedrock-on-linux"/bin 2>/dev/null || true
 find "$PKG/usr/lib/bedrock-on-linux" -name __pycache__ -type d -exec rm -rf {} +
 for metadata in \
   "$PKG/usr/lib/bedrock-on-linux/customtkinter-5.2.2.dist-info" \
   "$PKG/usr/lib/bedrock-on-linux/darkdetect-0.8.0.dist-info" \
-  "$PKG/usr/lib/bedrock-on-linux/packaging-26.2.dist-info"; do
+  "$PKG/usr/lib/bedrock-on-linux/packaging-26.2.dist-info" \
+  "$PKG/usr/lib/bedrock-on-linux/python_xlib-0.33.dist-info" \
+  "$PKG/usr/lib/bedrock-on-linux/six-1.17.0.dist-info"; do
   [[ -d "$metadata" ]] || {
     echo "missing pinned dependency metadata: $metadata" >&2
     exit 1

@@ -120,3 +120,14 @@ def ensure_gui_deps(install=True):
              f"('pip install --user {' '.join(GUI_INSTALL_REQUIREMENTS)}'). "
              "The AppImage and Flatpak already bundle this Python toolkit.")
     return missing
+
+
+# python-xlib (+ its six dependency): lets bol.x11 query the primary monitor
+# through RandR directly instead of parsing `xrandr` CLI text. Bundled in the
+# AppImage/Flatpak/.deb like the GUI toolkit, but optional: bol.x11 falls
+# back to the xrandr CLI when it's missing, so nothing here is pip-installed
+# on demand.
+X11_DEPS = {
+    "Xlib": "python-xlib==0.33",
+    "six": "six==1.17.0",
+}
