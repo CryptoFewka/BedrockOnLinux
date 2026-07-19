@@ -1,0 +1,171 @@
+# Tier 2 (orchestrator): assemble the managed engine (GDK-Proton-xuser) from the
+# WineGDK prefix + universal vkd3d payload + GDK-Proton base, assert it
+# reproduces the SHA-256 pinned in bol/config.py, and publish + attest it.
+#
+# By default it REUSES the published, attested WineGDK and vkd3d releases (built
+# by build-winegdk.yml / build-vkd3d.yml), verifying each one's provenance
+# attestation and SHA-256 before use. Set rebuild_from_source to compile both
+# from source in the same run instead, for a fully-from-source traceable build.
+#
+# Bootstrap: on a fresh fork, first run "Build WineGDK" and "Build vkd3d-proton"
+# (publish: true) once to create their attested releases, or run this workflow
+# with rebuild_from_source: true.
+#
+# Public verification of any published artifact:
+#   gh attestation verify <file> --repo <owner>/BedrockOnLinux
+
+name: Build managed engine
+
+on:
+  workflow_dispatch:
+    inputs:
+      rebuild_from_source:
+        description: "Rebuild WineGDK + vkd3d from source instead of reusing published releases"
+        type: boolean
+        default: false
+      publish:
+        description: "Publish + attest the built engine as a release on this fork"
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "engine-*"
+
+permissions:
+  contents: read
+
+jobs:
+  # Optional from-source rebuilds. Skipped unless rebuild_from_source is set;
+  # they publish nothing (publish: false) and only hand their artifacts to the
+  # package job within this run. They inherit the top-level contents: read.
+  winegdk:
+    if: ${{ inputs.rebuild_from_source }}
+    uses: ./.github/workflows/build-winegdk.yml
+    with:
+      publish: false
+
+  vkd3d:
+    if: ${{ inputs.rebuild_from_source }}
+    uses: ./.github/workflows/build-vkd3d.yml
+    with:
+      publish: false
+
+  package:
+    needs: [winegdk, vkd3d]
+    # Run whether or not the rebuild jobs were skipped, but not if they failed.
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends binutils python3
+
+      # ---- WineGDK prefix: rebuilt artifact, or verified released one ----
+      - name: Download rebuilt WineGDK artifact
+        if: ${{ inputs.rebuild_from_source }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: winegdk-prefix
+          path: ${{ runner.temp }}/wg-dl
+
+      - name: Download + verify released WineGDK
+        if: ${{ !inputs.rebuild_from_source }}
+        run: |
+          commit="$(grep -m1 '^WINEGDK_SOURCE_COMMIT = ' bol/config.py | cut -d'"' -f2)"
+          short="${commit:0:12}"
+          mkdir -p "${{ runner.temp }}/wg-dl"
+          gh release download "winegdk-${short}" -R "${{ github.repository }}" \
+            -p 'winegdk-prefix-*.tar.gz*' -D "${{ runner.temp }}/wg-dl"
+          gh attestation verify "${{ runner.temp }}/wg-dl/winegdk-prefix-${short}.tar.gz" \
+            -R "${{ github.repository }}"
+          (cd "${{ runner.temp }}/wg-dl" && sha256sum -c "winegdk-prefix-${short}.tar.gz.sha256")
+
+      - name: Unpack WineGDK prefix
+        run: |
+          mkdir -p "${{ runner.temp }}/wg"
+          tar -C "${{ runner.temp }}/wg" -xzf "${{ runner.temp }}"/wg-dl/winegdk-prefix-*.tar.gz
+
+      # ---- vkd3d payload: rebuilt artifact, or verified released one ----
+      - name: Download rebuilt vkd3d artifact
+        if: ${{ inputs.rebuild_from_source }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: vkd3d-universal
+          path: ${{ runner.temp }}/vk-dl
+
+      - name: Download + verify released vkd3d
+        if: ${{ !inputs.rebuild_from_source }}
+        run: |
+          mkdir -p "${{ runner.temp }}/vk-dl"
+          gh release download vkd3d-3.0.1-nv-dgc -R "${{ github.repository }}" \
+            -p 'vkd3d-universal-*.tar.gz*' -D "${{ runner.temp }}/vk-dl"
+          gh attestation verify "${{ runner.temp }}/vk-dl/vkd3d-universal-3.0.1-nv-dgc.tar.gz" \
+            -R "${{ github.repository }}"
+          (cd "${{ runner.temp }}/vk-dl" && sha256sum -c "vkd3d-universal-3.0.1-nv-dgc.tar.gz.sha256")
+
+      - name: Unpack vkd3d
+        run: |
+          mkdir -p "${{ runner.temp }}/vk"
+          tar -C "${{ runner.temp }}/vk" -xzf "${{ runner.temp }}"/vk-dl/vkd3d-universal-*.tar.gz
+
+      # ---- GDK-Proton base (extracted tree = ENGINE_DIR) ----
+      - name: Fetch + extract the GDK-Proton base
+        run: |
+          mkdir -p "${{ runner.temp }}/base" "${{ runner.temp }}/engine"
+          gh release download release10-32 -R Weather-OS/GDK-Proton \
+            -p GDK-Proton10-32.tar.gz -D "${{ runner.temp }}/base"
+          tar -C "${{ runner.temp }}/engine" -xzf "${{ runner.temp }}/base/GDK-Proton10-32.tar.gz"
+
+      - name: Package the engine
+        run: |
+          commit="$(grep -m1 '^WINEGDK_SOURCE_COMMIT = ' bol/config.py | cut -d'"' -f2)"
+          scripts/package-engine.sh \
+            "${{ runner.temp }}/engine/GDK-Proton10-32" \
+            "${{ runner.temp }}/vk/vkd3d-proton-3.0.1-nv-dgc" \
+            "$commit" \
+            "${{ runner.temp }}/base/GDK-Proton10-32.tar.gz" \
+            "${{ runner.temp }}/wg/prefix"
+
+      - name: Assert the archive reproduces the pinned SHA-256
+        run: |
+          rev="$(grep -m1 '^WINEGDK_BUILD_REV = ' bol/config.py | cut -d'"' -f2)"
+          pin="$(grep -m1 '^WINEGDK_ARCHIVE_SHA256 = ' bol/config.py | cut -d'"' -f2)"
+          built="$(cut -d' ' -f1 "dist/GDK-Proton-xuser-${rev}.tar.gz.sha256")"
+          echo "pinned : $pin"
+          echo "built  : $built"
+          if [ "$built" != "$pin" ]; then
+            echo "::error::built engine SHA-256 does not match the config pin;" \
+                 "the build did not reproduce the reviewed bytes." >&2
+            exit 1
+          fi
+          echo "REV=$rev" >> "$GITHUB_ENV"
+
+      - name: Attest engine provenance
+        if: ${{ github.event_name == 'push' || inputs.publish }}
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: dist/GDK-Proton-xuser-${{ env.REV }}.tar.gz
+
+      - name: Publish the engine to a release on this fork
+        if: ${{ github.event_name == 'push' || inputs.publish }}
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: engine-${{ env.REV }}
+          name: Managed engine ${{ env.REV }}
+          body: >
+            Reproducible engine build of GDK-Proton-xuser (${{ env.REV }}),
+            verified to match the SHA-256 pinned in bol/config.py.
+            Verify provenance with: gh attestation verify <file> --repo ${{ github.repository }}
+          files: |
+            dist/GDK-Proton-xuser-${{ env.REV }}.tar.gz
+            dist/GDK-Proton-xuser-${{ env.REV }}.tar.gz.sha256
+          fail_on_unmatched_files: true

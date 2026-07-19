@@ -1,0 +1,143 @@
+# Tier 1: compile WineGDK from source and publish it as an independently
+# verifiable, attested artifact so the engine build can reuse it (the expensive
+# ~1h compile is not repeated on every engine rebuild).
+#
+# Source: https://github.com/Weather-OS/WineGDK. The reviewed target commit
+# pinned in bol/config.py (WINEGDK_SOURCE_COMMIT) is not on any branch, so it is
+# fetched by SHA. build-winegdk-bullseye.sh compiles it in a Debian 11 Bullseye
+# chroot under a glibc-2.31 ceiling; the build is byte-reproducible.
+#
+# Reusable (workflow_call) so the engine workflow can rebuild from source on
+# demand, and standalone (workflow_dispatch) to publish + attest a release.
+
+name: Build WineGDK
+
+on:
+  workflow_call:
+    inputs:
+      publish:
+        description: "Publish + attest the prefix as a release"
+        type: boolean
+        default: false
+    outputs:
+      artifact:
+        description: "Name of the uploaded WineGDK prefix artifact"
+        value: winegdk-prefix
+      sha256:
+        description: "SHA-256 of the packed WineGDK prefix"
+        value: ${{ jobs.build.outputs.sha256 }}
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish + attest the prefix as a release on this fork"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    # Elevated permissions are used only by the publish/attest steps, which are
+    # gated on inputs.publish. A workflow_call rebuild passes publish=false, so
+    # those steps are skipped and the grants go unused.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    outputs:
+      sha256: ${{ steps.pack.outputs.sha256 }}
+      commit: ${{ steps.pack.outputs.commit }}
+      short: ${{ steps.pack.outputs.short }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends debootstrap uidmap
+
+      - name: Enable unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Configure subuid/subgid ranges for the runner user
+        run: |
+          user="$(id -un)"
+          grep -q "^${user}:" /etc/subuid || echo "${user}:100000:65536" | sudo tee -a /etc/subuid
+          grep -q "^${user}:" /etc/subgid || echo "${user}:100000:65536" | sudo tee -a /etc/subgid
+
+      - name: Prepare work area on the large /mnt volume
+        run: |
+          sudo mkdir -p /mnt/engine
+          sudo chown "$(id -un):$(id -gn)" /mnt/engine
+
+      - name: Fetch the pinned WineGDK source commit
+        run: |
+          # Not on any branch; fetch it by SHA. build-winegdk-bullseye.sh only
+          # needs that commit's tree, so a shallow fetch is enough.
+          commit="$(grep -m1 '^WINEGDK_SOURCE_COMMIT = ' bol/config.py | cut -d'"' -f2)"
+          git init -q /mnt/engine/WineGDK
+          git -C /mnt/engine/WineGDK remote add origin https://github.com/Weather-OS/WineGDK
+          git -C /mnt/engine/WineGDK fetch --depth 1 origin "$commit"
+          git -C /mnt/engine/WineGDK branch bol-target FETCH_HEAD
+
+      - name: Build WineGDK (Bullseye chroot, glibc-2.31 ceiling)
+        run: scripts/build-winegdk-bullseye.sh /mnt/engine/winegdk-work /mnt/engine/WineGDK
+
+      - name: Pack the prefix deterministically
+        id: pack
+        run: |
+          commit="$(grep -m1 '^WINEGDK_SOURCE_COMMIT = ' bol/config.py | cut -d'"' -f2)"
+          short="${commit:0:12}"
+          out="winegdk-prefix-${short}.tar.gz"
+          # Deterministic tar + gzip -n mirrors package-engine.sh so the prefix
+          # tarball is byte-reproducible. Includes the .bol-winegdk-* provenance
+          # dotfiles the packager requires.
+          tar --sort=name --format=gnu --hard-dereference \
+            --mtime=@1784308597 --owner=0 --group=0 --numeric-owner \
+            -C /mnt/engine/winegdk-work -cf - prefix | gzip -n -6 > "$out"
+          sha="$(sha256sum "$out" | cut -d' ' -f1)"
+          echo "$sha  $out" > "$out.sha256"
+          {
+            echo "sha256=$sha"
+            echo "commit=$commit"
+            echo "short=$short"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "TARBALL=$out"
+            echo "SHORT=$short"
+          } >> "$GITHUB_ENV"
+          echo "built WineGDK prefix: $out  sha256=$sha"
+
+      - name: Upload prefix artifact (reuse within a run)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: winegdk-prefix
+          path: |
+            ${{ env.TARBALL }}
+            ${{ env.TARBALL }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Attest build provenance
+        if: ${{ inputs.publish }}
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: ${{ env.TARBALL }}
+
+      - name: Publish the WineGDK prefix release
+        if: ${{ inputs.publish }}
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: winegdk-${{ env.SHORT }}
+          name: WineGDK prefix ${{ env.SHORT }}
+          body: >
+            Reproducible WineGDK build from source commit
+            ${{ steps.pack.outputs.commit }}.
+            SHA-256 ${{ steps.pack.outputs.sha256 }}.
+            Verify provenance with: gh attestation verify <file> --repo ${{ github.repository }}
+          files: |
+            ${{ env.TARBALL }}
+            ${{ env.TARBALL }}.sha256
+          fail_on_unmatched_files: true

@@ -56,22 +56,29 @@ GDK_DEPS_DLLS = ("libHttpClient.GDK.dll", "XCurl.dll")
 # Minecraft's PlayFab traffic goes over OpenSSL TLS instead of Wine secur32
 # (whose handshake Azure Front Door silently FINs → endless sign-in loop).
 # Too big to bundle (20 MB) — downloaded once from the app's releases as
-# openssl-xcurl-set-<rev>.tar.gz. Republish: scripts/package-openssl-xcurl.sh.
+# openssl-xcurl-set-<rev>.tar.gz. This fork builds it reproducibly from source
+# (scripts/build-openssl-xcurl.sh: pinned msys2 curl closure + source shim +
+# source cryptbase stub), so the rev/SHA below track our own build.
 OPENSSL_XCURL_SET = DATA / "xodus-xcurl" / "openssl-set"
-OPENSSL_XCURL_REV = "17bc4b81e178"
+OPENSSL_XCURL_REV = "313c1409fbdf"
 # Exact reviewed online-login payload. A filename/revision alone is not an
 # integrity boundary; local siblings and downloaded assets must match this pin.
-OPENSSL_XCURL_ARCHIVE_SHA256 = "17bc4b81e178422e12b238cca7ce4be0f06d9f64fa9a0dae4076d861c2f66983"
+OPENSSL_XCURL_ARCHIVE_SHA256 = "313c1409fbdf4318a86c18b3ef19be2d65b25487ec5b26abd7944cb9ed2d0afb"
 WINEGDK_OUT = PROTON_DIR / "GDK-Proton-xuser"
 # Prebuilt engine: users download GDK-Proton-xuser-<build-rev>.tar.gz from the
 # app's releases instead of compiling Wine.  Managed engines are fail-closed:
 # the launcher only accepts the exact archive hash compiled into this version.
 # Build locally with scripts/package-engine.sh, then pin its printed SHA-256.
-WINEGDK_PREBUILT_REPO = "Wyze3306/BedrockOnLinux"
+# This fork consumes its own reproducibly CI-built engine (see
+# .github/workflows/build-engine.yml), which reproduces the exact bytes below.
+WINEGDK_PREBUILT_REPO = "CryptoFewka/BedrockOnLinux"
 # Bump when the build/packaging method changes → forces a clean rebuild.
 WINEGDK_BUILD_REV = "wow64-archs-native5"
 # SHA-256 of the reviewed, deterministic engine archive. An invalid value makes
 # the installer fail closed rather than accepting a differently packed engine.
 WINEGDK_ARCHIVE_SHA256 = "35a2ead372f51bd3fc330a2da91e2a0846aa03a80bb0c175f049bef719398fcf"
 
-SELF_REPO = WINEGDK_PREBUILT_REPO
+# Decoupled from the engine repo: the launcher checks upstream for its own
+# update notifications so this follow-upstream fork still learns about new
+# upstream releases, while the engine above comes from our own CI build.
+SELF_REPO = "Wyze3306/BedrockOnLinux"
