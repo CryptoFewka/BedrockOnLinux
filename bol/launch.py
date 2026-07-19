@@ -39,7 +39,7 @@ from .prefix import (
     proton_umu_cmd,
 )
 from .proton import custom_proton, patch_proton, proton_path
-from .util import _screen_wh, load_settings
+from .util import _screen_wh, apply_custom_env, load_settings
 from .vkd3d import prepare_universal_vkd3d
 from .winegdk import ensure_winegdk
 
@@ -261,6 +261,7 @@ def _launch_once():
     if not account_epoch_is_current(account_epoch):
         die("The Microsoft account changed before the game process started. "
             "Minecraft was not started; click PLAY again.")
+    apply_custom_env(env, s.get("custom_env") or "")
     info("Starting Minecraft … sign in with Microsoft in-game, then "
          "join your server from the Servers tab.")
     glog = open(LOGS / "minecraft.log", "w")
