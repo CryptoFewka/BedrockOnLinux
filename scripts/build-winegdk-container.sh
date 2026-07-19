@@ -79,17 +79,20 @@ elf=0 failures=0
 while IFS= read -r -d '' f; do
   readelf -h -- "$f" >/dev/null 2>&1 || continue
   elf=$((elf + 1))
-  max="$(readelf --version-info -- "$f" 2>/dev/null \
-    | grep -oE 'GLIBC_[0-9]+([.][0-9]+)*' | sed 's/GLIBC_//' | sort -Vu | tail -n1)"
+  # `|| true`: a file with no GLIBC version symbols makes grep exit 1, which
+  # would otherwise trip set -e via pipefail.
+  vers="$(readelf --version-info -- "$f" 2>/dev/null \
+    | grep -oE 'GLIBC_[0-9]+([.][0-9]+)*' || true)"
+  max="$(printf '%s\n' "$vers" | sed 's/GLIBC_//' | sort -Vu | tail -n1)"
   if [ -n "$max" ] && version_is_greater "$max" "$GLIBC_CEILING"; then
     echo "ABI violation: ${f#"$PREFIX"/} needs GLIBC_$max" >&2
     failures=$((failures + 1))
   fi
 done < <(find "$PREFIX" -type f -print0)
 [ "$elf" -gt 0 ] || { echo "!! no ELF file in prefix" >&2; exit 1; }
-find "$PREFIX" -type f -name wineserver | grep -q . \
+[ -n "$(find "$PREFIX" -type f -name wineserver -print -quit)" ] \
   || { echo "!! prefix has no wineserver" >&2; exit 1; }
-find "$PREFIX" -type f -path '*/x86_64-unix/ntdll.so' | grep -q . \
+[ -n "$(find "$PREFIX" -type f -path '*/x86_64-unix/ntdll.so' -print -quit)" ] \
   || { echo "!! prefix has no x86_64-unix/ntdll.so" >&2; exit 1; }
 [ "$failures" = 0 ] || { echo "!! $failures ELF file(s) exceed GLIBC_$GLIBC_CEILING" >&2; exit 1; }
 
