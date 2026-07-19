@@ -1,0 +1,123 @@
+# Tier 1: build the OpenSSL-XCurl online-login set entirely from source and
+# publish it as an attested artifact for the app build (and runtime) to consume.
+#
+# No opaque prebuilt binary: the runtime DLLs are the msys2 MinGW curl closure
+# pinned by SHA in third_party/xcurl-msys2.lock, and the CA-shim + cryptbase RNG
+# stub are compiled from src/. The build is byte-reproducible, so it asserts the
+# result matches the SHA-256 pinned in bol/config.py (OPENSSL_XCURL_ARCHIVE_SHA256).
+# If a pinned msys2 package rotates off the mirror, regenerate the lock (delete
+# it and re-run scripts/build-openssl-xcurl.sh) and re-pin config.
+#
+# The compile runs in a debian:trixie container via `docker run` so the JS
+# actions (checkout, attest, publish) keep Node.js on the host.
+
+name: Build OpenSSL-XCurl set
+
+on:
+  workflow_call:
+    inputs:
+      publish:
+        description: "Publish + attest the set as a release"
+        type: boolean
+        default: false
+    outputs:
+      artifact:
+        description: "Name of the uploaded xcurl artifact"
+        value: openssl-xcurl-set
+      sha256:
+        description: "SHA-256 of the built set"
+        value: ${{ jobs.build.outputs.sha256 }}
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish + attest the set as a release on this fork"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    outputs:
+      sha256: ${{ steps.build.outputs.sha256 }}
+      rev: ${{ steps.build.outputs.rev }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Build the set from source in a pinned Trixie container
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo debian:trixie \
+            bash -euo pipefail -c '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                gcc-mingw-w64-x86-64 binutils-mingw-w64 curl ca-certificates \
+                tar zstd gzip coreutils gawk python3
+              scripts/build-openssl-xcurl.sh /tmp/xcurl-work
+            '
+          sudo chown -R "$(id -u):$(id -g)" dist
+
+      - name: Assert the set reproduces the pinned SHA-256
+        id: build
+        run: |
+          rev="$(grep -m1 '^OPENSSL_XCURL_REV = ' bol/config.py | cut -d'"' -f2)"
+          pin="$(grep -m1 '^OPENSSL_XCURL_ARCHIVE_SHA256 = ' bol/config.py | cut -d'"' -f2)"
+          f="dist/openssl-xcurl-set-${rev}.tar.gz"
+          if [ ! -f "$f" ]; then
+            echo "::error::expected $f but it was not produced; the build likely" \
+                 "resolved a different msys2 set than the config pin. Regenerate" \
+                 "the lock and re-pin config." >&2
+            ls -la dist || true
+            exit 1
+          fi
+          built="$(sha256sum "$f" | cut -d' ' -f1)"
+          echo "pinned : $pin"
+          echo "built  : $built"
+          if [ "$built" != "$pin" ]; then
+            echo "::error::xcurl set SHA-256 does not match the config pin." >&2
+            exit 1
+          fi
+          echo "$built  openssl-xcurl-set-${rev}.tar.gz" > "$f.sha256"
+          echo "sha256=$built" >> "$GITHUB_OUTPUT"
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+          echo "TARBALL=$f" >> "$GITHUB_ENV"
+          echo "REV=$rev" >> "$GITHUB_ENV"
+
+      - name: Upload artifact (reuse within a run)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: openssl-xcurl-set
+          path: |
+            ${{ env.TARBALL }}
+            ${{ env.TARBALL }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Attest build provenance
+        if: ${{ inputs.publish }}
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: ${{ env.TARBALL }}
+
+      - name: Publish the set release
+        if: ${{ inputs.publish }}
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: xcurl-${{ env.REV }}
+          name: OpenSSL-XCurl set ${{ env.REV }} (from source)
+          body: >
+            Reproducible from-source OpenSSL-XCurl set: the msys2 MinGW curl
+            closure (pinned by SHA in third_party/xcurl-msys2.lock) plus the
+            CA-shim and cryptbase RNG stub compiled from src/. SHA-256
+            ${{ steps.build.outputs.sha256 }}.
+            Verify with: gh attestation verify <file> --repo ${{ github.repository }}
+          files: |
+            ${{ env.TARBALL }}
+            ${{ env.TARBALL }}.sha256
+          fail_on_unmatched_files: true
