@@ -41,6 +41,7 @@ readonly -a BUILD_PACKAGES=(
 
 echo "== Installing build dependencies"
 export DEBIAN_FRONTEND=noninteractive
+bash "$PROJECT_ROOT/scripts/pin-apt-snapshot.sh" bullseye
 apt-get update -qq
 apt-get install -y --no-install-recommends git "${BUILD_PACKAGES[@]}" >/dev/null
 

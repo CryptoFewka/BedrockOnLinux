@@ -51,16 +51,18 @@ jobs:
       - name: Build universal vkd3d-proton in a pinned Trixie container
         run: |
           mkdir -p "$RUNNER_TEMP/vkout"
-          # Toolchain versions are pinned in provenance.env; if apt has moved
-          # past them and the output hashes fail, pin these installs to a
-          # snapshot.debian.org date that serves the recorded versions rather
-          # than loosening the script's checks.
+          # The image is digest-pinned and apt is pinned to a snapshot.debian.org
+          # date (scripts/pin-apt-snapshot.sh), so the toolchain is frozen and the
+          # output stays reproducible across time; provenance.env records the
+          # resulting versions. build-vkd3d-universal.sh's OUTPUT-SHA256SUMS check
+          # is the fail-closed gate. A drift means re-baseline, not loosening it.
           docker run --rm \
             -v "$PWD:/src:ro" \
             -v "$RUNNER_TEMP/vkout:/out" \
-            debian:trixie \
+            debian:trixie@sha256:fac46bff2e02f51425b6e33b0e1169f55dfb053d83511ca28aa50c09fd5ed7a4 \
             bash -euo pipefail -c '
               export DEBIAN_FRONTEND=noninteractive LC_ALL=C LANG=C
+              bash /src/scripts/pin-apt-snapshot.sh trixie
               apt-get update
               apt-get install -y --no-install-recommends \
                 ca-certificates git python3 python3-pip \

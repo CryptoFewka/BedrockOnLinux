@@ -76,7 +76,7 @@ WINEGDK_PREBUILT_REPO = "CryptoFewka/BedrockOnLinux"
 WINEGDK_BUILD_REV = "wow64-archs-native5"
 # SHA-256 of the reviewed, deterministic engine archive. An invalid value makes
 # the installer fail closed rather than accepting a differently packed engine.
-WINEGDK_ARCHIVE_SHA256 = "0c2572619e24facf405170235023d8a5d11d22080dfe8c67975fd2c461201c4d"
+WINEGDK_ARCHIVE_SHA256 = "d501d9fa86a01f51cd8697cd7c8012ce9cf5eeac701b41a8feaafb694a9757b5"
 
 # Decoupled from the engine repo: the launcher checks upstream for its own
 # update notifications so this follow-upstream fork still learns about new

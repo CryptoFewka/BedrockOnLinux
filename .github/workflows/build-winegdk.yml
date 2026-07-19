@@ -73,7 +73,7 @@ jobs:
             -v "/mnt/engine/WineGDK:/winegdk-src:ro" \
             -v "/mnt/engine/wg-work:/winegdk" \
             -v "/mnt/engine/prefix:/prefix" \
-            -w /repo debian:bullseye \
+            -w /repo debian:bullseye@sha256:6cb68b1be980a0e5b19be25582b34b5cf9cb466d52d08ab4354b79051f2cd298 \
             scripts/build-winegdk-container.sh /winegdk-src /prefix
           # docker writes as root; hand the prefix back to the runner user.
           sudo chown -R "$(id -u):$(id -g)" /mnt/engine/prefix

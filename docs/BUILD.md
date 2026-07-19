@@ -53,11 +53,12 @@ Notes:
   there even as root). The container build enforces the same glibc-2.31 ABI
   ceiling and writes the same provenance. `build-winegdk-bullseye.sh` is kept
   for local unprivileged builds.
-  Determinism rests on three pinned inputs: `SOURCE_DATE_EPOCH`, the glibc-2.31
-  toolchain, and a **fixed install prefix** (`/prefix` in the container). Wine's
-  `configure --prefix` is baked into the binaries, so the workflow always builds
-  to the same path; changing it changes the bytes (this is the Wine analogue of
-  pinning a timestamp). Two builds to the same fixed prefix are byte-identical.
+  Determinism rests on pinned inputs: `SOURCE_DATE_EPOCH`, the digest-pinned
+  Bullseye image + snapshot-pinned apt toolchain, and a **fixed install prefix**
+  (`/prefix` in the container). Wine's `configure --prefix` is baked into the
+  binaries, so the workflow always builds to the same path; changing it changes
+  the bytes (the Wine analogue of pinning a timestamp). Two builds to the same
+  fixed prefix in the pinned environment are byte-identical.
 - **Engine** is assembled from the public, SHA-pinned `Weather-OS/GDK-Proton`
   `release10-32` base. `scripts/package-engine.sh` overlays the WineGDK prefix,
   installs the universal vkd3d DLLs, reconciles the `files/bin` wow64 launch
@@ -92,7 +93,15 @@ not to loosen the check:
 
 ## CI environment
 
+The build environment itself is pinned, so the builds are reproducible across
+*time*, not just run-to-run: a later Debian package update cannot silently
+change the output bytes.
+
 - **Hosted runners only** (no self-hosted) for public verifiability.
 - All GitHub Actions are pinned by commit SHA.
+- Every build container is pinned by `@sha256:` digest, not a floating tag.
+- `apt` is pinned to a fixed `snapshot.debian.org` timestamp
+  (`scripts/pin-apt-snapshot.sh`), so the compiler toolchain is frozen. Bump the
+  timestamp only alongside a deliberate re-baseline of the affected hashes.
 - The only non-source inputs are the public GDK-Proton base and the msys2
   packages, both SHA-pinned.

@@ -78,7 +78,15 @@ else
     [ -n "$desc" ] && [ -f "$desc" ] || { echo "!! no desc for $pkg" >&2; exit 1; }
     while IFS= read -r dep; do
       [ -n "$dep" ] || continue
-      if r="$(resolve "$dep")"; then queue+=("$r"); fi
+      if r="$(resolve "$dep")"; then
+        queue+=("$r")
+      else
+        # Fail closed: a dropped dependency would silently produce an incomplete
+        # closure. DEPENDS version constraints are already stripped by parse_field,
+        # so an unresolved token means the msys2 set changed; review and re-pin.
+        echo "!! unresolved dependency '$dep' of '$pkg'; closure would be incomplete" >&2
+        exit 1
+      fi
     done < <(parse_field DEPENDS "$desc")
   done
   echo "   resolved ${#order[@]} packages; writing $LOCK"

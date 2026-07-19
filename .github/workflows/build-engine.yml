@@ -131,6 +131,10 @@ jobs:
           mkdir -p "${{ runner.temp }}/base" "${{ runner.temp }}/engine"
           gh release download release10-32 -R Weather-OS/GDK-Proton \
             -p GDK-Proton10-32.tar.gz -D "${{ runner.temp }}/base"
+          # Pin the public base by SHA-256 (the release10-32 asset digest) so a
+          # changed base fails here, not only transitively via the engine assert.
+          echo "1e80f4e714f877f42101d5775bd38ca0a15a38d304e24af1f15c6deec4ebac2d  ${{ runner.temp }}/base/GDK-Proton10-32.tar.gz" \
+            | sha256sum -c -
           tar -C "${{ runner.temp }}/engine" -xzf "${{ runner.temp }}/base/GDK-Proton10-32.tar.gz"
 
       - name: Package the engine
@@ -147,7 +151,7 @@ jobs:
         run: |
           rev="$(grep -m1 '^WINEGDK_BUILD_REV = ' bol/config.py | cut -d'"' -f2)"
           pin="$(grep -m1 '^WINEGDK_ARCHIVE_SHA256 = ' bol/config.py | cut -d'"' -f2)"
-          built="$(cut -d' ' -f1 "dist/GDK-Proton-xuser-${rev}.tar.gz.sha256")"
+          built="$(sha256sum "dist/GDK-Proton-xuser-${rev}.tar.gz" | cut -d' ' -f1)"
           echo "pinned : $pin"
           echo "built  : $built"
           if [ "$built" != "$pin" ]; then
