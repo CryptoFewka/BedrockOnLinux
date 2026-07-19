@@ -211,7 +211,7 @@ def _launch_once():
                or s.get("input_backend") or "auto").lower()
     if backend == "auto":
         backend = "x11"
-    gs_opt = os.environ.get("BOL_GAMESCOPE")
+    gs_opt = s.get("gamescope") or os.environ.get("BOL_GAMESCOPE")
     want_gamescope = bool(gs_opt) and \
         gs_opt.lower() not in ("0", "no", "off", "false")
     use_gamescope = want_gamescope and bool(shutil.which("gamescope"))
