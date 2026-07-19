@@ -89,6 +89,7 @@ not to loosen the check:
   SHA in `provenance.env` and `package-engine.sh`).
 - xcurl set → `OPENSSL_XCURL_REV` + `OPENSSL_XCURL_ARCHIVE_SHA256` (regenerate
   `third_party/xcurl-msys2.lock` if msys2 rotated a package off the mirror).
+- WineGDK prefix → `WINEGDK_PREFIX_SHA256` (the reuse path and `build-winegdk.yml` both assert it).
 - engine → `WINEGDK_ARCHIVE_SHA256` and the `bol/vkd3d.py` manifest pins.
 
 ## CI environment

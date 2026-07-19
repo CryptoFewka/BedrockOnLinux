@@ -77,6 +77,11 @@ WINEGDK_BUILD_REV = "wow64-archs-native5"
 # SHA-256 of the reviewed, deterministic engine archive. An invalid value makes
 # the installer fail closed rather than accepting a differently packed engine.
 WINEGDK_ARCHIVE_SHA256 = "d501d9fa86a01f51cd8697cd7c8012ce9cf5eeac701b41a8feaafb694a9757b5"
+# SHA-256 of the deterministic WineGDK prefix tarball (build intermediate, not a
+# runtime download). build-winegdk.yml asserts it, and build-engine.yml verifies
+# a reused prefix against it, so the reuse path fails fast against a committed
+# expectation instead of only transitively via the engine archive hash above.
+WINEGDK_PREFIX_SHA256 = "e65d30369729260f6e8ea067e98b17c3c9460d1ed2190a0a570a11ad60836046"
 
 # Decoupled from the engine repo: the launcher checks upstream for its own
 # update notifications so this follow-upstream fork still learns about new
