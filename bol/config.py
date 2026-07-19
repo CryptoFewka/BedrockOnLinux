@@ -56,12 +56,14 @@ GDK_DEPS_DLLS = ("libHttpClient.GDK.dll", "XCurl.dll")
 # Minecraft's PlayFab traffic goes over OpenSSL TLS instead of Wine secur32
 # (whose handshake Azure Front Door silently FINs → endless sign-in loop).
 # Too big to bundle (20 MB) — downloaded once from the app's releases as
-# openssl-xcurl-set-<rev>.tar.gz. Republish: scripts/package-openssl-xcurl.sh.
+# openssl-xcurl-set-<rev>.tar.gz. Built reproducibly from source by
+# scripts/build-openssl-xcurl.sh (pinned msys2 curl closure + source shim +
+# source cryptbase stub); the rev/SHA below track that build.
 OPENSSL_XCURL_SET = DATA / "xodus-xcurl" / "openssl-set"
-OPENSSL_XCURL_REV = "17bc4b81e178"
+OPENSSL_XCURL_REV = "313c1409fbdf"
 # Exact reviewed online-login payload. A filename/revision alone is not an
 # integrity boundary; local siblings and downloaded assets must match this pin.
-OPENSSL_XCURL_ARCHIVE_SHA256 = "17bc4b81e178422e12b238cca7ce4be0f06d9f64fa9a0dae4076d861c2f66983"
+OPENSSL_XCURL_ARCHIVE_SHA256 = "313c1409fbdf4318a86c18b3ef19be2d65b25487ec5b26abd7944cb9ed2d0afb"
 WINEGDK_OUT = PROTON_DIR / "GDK-Proton-xuser"
 # Prebuilt engine: users download GDK-Proton-xuser-<build-rev>.tar.gz from the
 # app's releases instead of compiling Wine.  Managed engines are fail-closed:
