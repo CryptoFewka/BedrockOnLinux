@@ -164,6 +164,16 @@ fi
 if [[ -n "$WINEGDK_PREFIX" ]]; then
   cp -a --remove-destination "$WINEGDK_PREFIX/." "$STAGED_ENGINE/files/"
   echo "   staged reviewed WineGDK prefix overlay"
+  # The public GE-Proton base ships real Wine-10 wine64 + *-preloader binaries in
+  # files/bin; the WineGDK overlay only replaces `wine` (Wine 11 wow64 drops the
+  # separate 64-bit loader and preloaders). Recreate the wow64 launch aliases as
+  # symlinks to the staged WineGDK `wine`, so files/bin runs one coherent Wine
+  # runtime and matches the reviewed runtime-link layout.
+  for alias in wine64 wine-preloader wine64-preloader; do
+    rm -f "$STAGED_ENGINE/files/bin/$alias"
+    ln -s wine "$STAGED_ENGINE/files/bin/$alias"
+  done
+  echo "   reconciled files/bin wow64 launch aliases"
 fi
 
 # Wine's installed headers are build-time material, not part of the Proton
@@ -797,7 +807,6 @@ gdk_proton_provenance_files = {
 
 critical_relative_paths = tuple(dict.fromkeys((
     *REQUIRED_CRITICAL_FILE_PATHS,
-    "files/lib/x86_64-linux-gnu/libunwind.so.8.0.1",
     *sorted(provenance_files),
 )))
 critical_files = {}

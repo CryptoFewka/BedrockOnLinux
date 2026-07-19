@@ -70,7 +70,6 @@ REQUIRED_CRITICAL_FILE_PATHS = (
     "files/bin-wow64/wineserver",
     "files/bin-wow64/msidb",
     "files/share/wine/wine.inf",
-    "files/lib/x86_64-linux-gnu/libunwind.so.8",
     "files/lib/wine/x86_64-windows/ntdll.dll",
     "files/lib/wine/x86_64-windows/combase.dll",
     "files/lib/wine/x86_64-windows/xgameruntime.dll",
@@ -100,36 +99,35 @@ REQUIRED_RUNTIME_LINK_TARGETS = {
     "files/bin/wine64-preloader": "wine",
     "files/bin-wow64/wine-preloader": "wine",
     "files/bin-wow64/msidb": "wine",
-    "files/lib/x86_64-linux-gnu/libunwind.so.8": "libunwind.so.8.0.1",
 }
 REQUIRED_VARIANT_HASHES = {
     EXT_DGC: {
         ("files/lib/wine/vkd3d-proton/x86_64-windows/"
          "d3d12.dll.bol-ext-dgc"):
-            "d942c92f28312c7e61d23ef8bccbd68ffc68f13a70d6a69e1e867afe4e52a57a",
+            "d6f4e30131e5f05f9167f93c2277652b7d2299ef43a4f623990ee4fd8a34cc4c",
         ("files/lib/wine/vkd3d-proton/x86_64-windows/"
          "d3d12core.dll.bol-ext-dgc"):
-            "a4f71ddb2136d63035392cac53693d73363580d08d6571c39e6942db30345fff",
+            "870d498f1762b99c18fc3fa02cb92bc35dfbbf121162fa49e06521d8d5ef54da",
         ("files/lib/wine/vkd3d-proton/i386-windows/"
          "d3d12.dll.bol-ext-dgc"):
-            "32adf60d5df2d4e7521e2f040b588936d6d2e2aa6acb22fe61667776621df5f5",
+            "aac73e3555cb3ca893b3ef11ab033e42a0ffa3139e3ac4ae8ded1667cd321190",
         ("files/lib/wine/vkd3d-proton/i386-windows/"
          "d3d12core.dll.bol-ext-dgc"):
-            "86b8c69cff105f3b37cad995bf40a7f648d8a1afb9b2de46918d711d5eaac554",
+            "48ecfec79064ea81fcca378239da02051655588fff69005678b2483b7a2f0daa",
     },
     NV_DGC: {
         ("files/lib/wine/vkd3d-proton/x86_64-windows/"
          "d3d12.dll.bol-nv-dgc"):
-            "d942c92f28312c7e61d23ef8bccbd68ffc68f13a70d6a69e1e867afe4e52a57a",
+            "d6f4e30131e5f05f9167f93c2277652b7d2299ef43a4f623990ee4fd8a34cc4c",
         ("files/lib/wine/vkd3d-proton/x86_64-windows/"
          "d3d12core.dll.bol-nv-dgc"):
-            "a4f71ddb2136d63035392cac53693d73363580d08d6571c39e6942db30345fff",
+            "870d498f1762b99c18fc3fa02cb92bc35dfbbf121162fa49e06521d8d5ef54da",
         ("files/lib/wine/vkd3d-proton/i386-windows/"
          "d3d12.dll.bol-nv-dgc"):
-            "32adf60d5df2d4e7521e2f040b588936d6d2e2aa6acb22fe61667776621df5f5",
+            "aac73e3555cb3ca893b3ef11ab033e42a0ffa3139e3ac4ae8ded1667cd321190",
         ("files/lib/wine/vkd3d-proton/i386-windows/"
          "d3d12core.dll.bol-nv-dgc"):
-            "86b8c69cff105f3b37cad995bf40a7f648d8a1afb9b2de46918d711d5eaac554",
+            "48ecfec79064ea81fcca378239da02051655588fff69005678b2483b7a2f0daa",
     },
 }
 
