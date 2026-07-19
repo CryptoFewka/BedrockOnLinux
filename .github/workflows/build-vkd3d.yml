@@ -75,11 +75,15 @@ jobs:
                 update-alternatives --set "${a}-w64-mingw32-${t}" \
                   "/usr/bin/${a}-w64-mingw32-${t}-win32" || true
               done; done
-              # The NV-DGC revert restores vendored source whose exact upstream
-              # whitespace the repo deliberately tolerates (.gitattributes); the
-              # container git is stricter, so relax its whitespace check. The
-              # byte-for-byte cmp against restore-nv-dgc.patch still guards it.
+              # Match the environment the vendored restore-nv-dgc.patch was
+              # generated in: relax the whitespace check (the NV-DGC revert
+              # restores vendored source whose exact upstream whitespace the
+              # repo tolerates via .gitattributes) and pin the diff index-line
+              # blob-hash abbreviation to 7 chars (git auto-scales it by object
+              # count; a fresh full-submodule clone would otherwise emit 8).
+              # The byte-for-byte cmp against restore-nv-dgc.patch still guards it.
               git config --global core.whitespace "-blank-at-eof,-blank-at-eol,-space-before-tab"
+              git config --global core.abbrev 7
               /src/scripts/build-vkd3d-universal.sh /out
             '
           # docker writes as root; hand the tree back to the runner user.
