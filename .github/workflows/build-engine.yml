@@ -40,12 +40,20 @@ jobs:
   # package job within this run. They inherit the top-level contents: read.
   winegdk:
     if: ${{ inputs.rebuild_from_source }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/build-winegdk.yml
     with:
       publish: false
 
   vkd3d:
     if: ${{ inputs.rebuild_from_source }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/build-vkd3d.yml
     with:
       publish: false
