@@ -270,13 +270,13 @@ verify_reviewed_provenance() {
     "dc626520dcd53a22f727af3ee42c770e56c97a64fe3adb063799d8ab032fe551" \
     "vkd3d-proton LGPL notice"
   verify_sha256 "$root/provenance.env" \
-    "d74e69bf8d710ce153e5bb0fcbc1f48f4ced08992a37300fde5ee3853e05a366" \
+    "a2c6f2f6f36c426034d5845aee0c98a6bc07a5a63849b829ab377b89e9319262" \
     "vkd3d-proton provenance lock"
   verify_sha256 "$root/submodules.lock" \
     "19ae5e28d0828ebf911fe99569e4de56328ea39e1a076a11506a78d98c76f3aa" \
     "vkd3d-proton submodule lock"
   verify_sha256 "$root/OUTPUT-SHA256SUMS" \
-    "c4928f2df72a029ed20a86ae6ecb0b0ed958350885a85dea9943f64fd838efea" \
+    "c64397dec052d7f86f65a0f39d6aecb813d4d1527327fe572cab3e4b59d6ad24" \
     "vkd3d-proton output hash lock"
   verify_sha256 "$root/restore-nv-dgc.patch" \
     "91878d389dc0e315f770fa6c7fffea8f78f410a04796c38e2a6410ff0b9b4a33" \
