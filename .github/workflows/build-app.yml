@@ -1,0 +1,136 @@
+# Tier 3: build the BedrockOnLinux application artifacts (.deb, AppImage,
+# portable .pyz, Flatpak) from source, consuming this fork's attested engine and
+# OpenSSL-XCurl set, then attest + publish them. Completes the traceable chain
+# source -> engine/xcurl (attested) -> installable app (attested).
+#
+# Requires the engine and xcurl releases to already exist on this fork (run
+# "Build managed engine" and "Build OpenSSL-XCurl set" with publish first).
+#
+# NOTE: AppImage (appimagetool) and Flatpak (flatpak-builder) builds are
+# environment-sensitive; the first runs will likely need iteration. Set the repo
+# variable BOL_ALLOW_PARTIAL_ARTIFACTS=1 to let build-release.sh keep going when
+# an optional format fails.
+
+name: Build application artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish + attest the app artifacts as a release on this fork"
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "app-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      APPIMAGE_EXTRACT_AND_RUN: "1"
+      BOL_ALLOW_PARTIAL_ARTIFACTS: ${{ vars.BOL_ALLOW_PARTIAL_ARTIFACTS }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install the packaging toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            dpkg-dev patchelf squashfs-tools zsync desktop-file-utils file \
+            python3 python3-pip python3-venv python3-tk \
+            build-essential ca-certificates curl \
+            flatpak flatpak-builder
+
+      - name: Enable unprivileged user namespaces (flatpak-builder / appimage)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Add the flathub remote
+        run: |
+          flatpak remote-add --user --if-not-exists flathub \
+            https://flathub.org/repo/flathub.flatpakrepo
+
+      - name: Fetch + verify the attested engine and xcurl set into dist/
+        run: |
+          rev="$(grep -m1 '^WINEGDK_BUILD_REV = ' bol/config.py | cut -d'"' -f2)"
+          xrev="$(grep -m1 '^OPENSSL_XCURL_REV = ' bol/config.py | cut -d'"' -f2)"
+          mkdir -p dist
+          gh release download "engine-${rev}" -R "${{ github.repository }}" \
+            -p "GDK-Proton-xuser-${rev}.tar.gz*" -D dist
+          gh attestation verify "dist/GDK-Proton-xuser-${rev}.tar.gz" \
+            -R "${{ github.repository }}"
+          gh release download "xcurl-${xrev}" -R "${{ github.repository }}" \
+            -p "openssl-xcurl-set-${xrev}.tar.gz*" -D dist
+          gh attestation verify "dist/openssl-xcurl-set-${xrev}.tar.gz" \
+            -R "${{ github.repository }}"
+
+      - name: Build the glibc-2.31 Tcl/Tk cache in a Debian 11 (Bullseye) container
+        run: |
+          # The AppImage enforces a glibc-2.31 baseline, so its Tcl/Tk must be
+          # compiled on Bullseye (hosted runners are glibc 2.38 and cannot run the
+          # debootstrap+userns path). Build the cache in a container; the host
+          # build-release.sh below reuses it. A repo copy keeps the container's
+          # root-owned dist/ out of the checkout; the cache dir path is specific
+          # (not /cache) so the relocatability scanner does not false-positive.
+          cp -r "$PWD" "$RUNNER_TEMP/tkcache-build"
+          mkdir -p "$RUNNER_TEMP/appimage-cache"
+          docker run --rm \
+            -v "$RUNNER_TEMP/tkcache-build:/work/BedrockOnLinux" \
+            -v "$RUNNER_TEMP/appimage-cache:/bol-appimage-cache" \
+            -w /work/BedrockOnLinux \
+            -e BOL_APPIMAGE_BUILD_CACHE=/bol-appimage-cache \
+            -e APPIMAGE_EXTRACT_AND_RUN=1 \
+            debian:bullseye bash -euo pipefail -c '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                build-essential patchelf curl ca-certificates python3 python3-pip \
+                python3-venv file zlib1g-dev libx11-dev libxext-dev libxft-dev \
+                libxrender-dev libxss-dev pkg-config libfuse2 zsync desktop-file-utils
+              bash scripts/build-appimage.sh
+            '
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/appimage-cache"
+
+      - name: Build the application artifacts
+        env:
+          BOL_APPIMAGE_BUILD_CACHE: ${{ runner.temp }}/appimage-cache
+        run: |
+          scripts/build-release.sh
+          echo "VER=$(grep -m1 '^VERSION = ' bol/config.py | cut -d'"' -f2)" >> "$GITHUB_ENV"
+
+      - name: Attest application artifacts
+        if: ${{ github.event_name == 'push' || inputs.publish }}
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: |
+            dist/bedrock-on-linux_*.deb
+            dist/bedrock-on-linux-*.pyz
+            dist/BedrockOnLinux-*-x86_64.AppImage
+            dist/BedrockOnLinux-*-x86_64.flatpak
+            dist/BedrockOnLinux-*-SHA256SUMS
+
+      - name: Publish the application release
+        if: ${{ github.event_name == 'push' || inputs.publish }}
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: app-v${{ env.VER }}
+          name: BedrockOnLinux ${{ env.VER }}
+          body: >
+            Application artifacts built from source, consuming this fork's
+            attested engine and OpenSSL-XCurl set. Verify any file with:
+            gh attestation verify <file> --repo ${{ github.repository }}
+          files: |
+            dist/bedrock-on-linux_*.deb
+            dist/bedrock-on-linux-*.pyz
+            dist/BedrockOnLinux-*-x86_64.AppImage
+            dist/BedrockOnLinux-*-x86_64.flatpak
+            dist/BedrockOnLinux-*-SHA256SUMS
+          fail_on_unmatched_files: false
