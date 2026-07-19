@@ -82,10 +82,25 @@ jobs:
           su=$(awk -F: -v n="$(id -un)" -v i="$u" '($1==n||$1==i)&&$3>=65535{print $2;exit}' /etc/subuid)
           sg=$(awk -F: -v n="$(id -un)" -v i="$g" '($1==n||$1==i)&&$3>=65535{print $2;exit}' /etc/subgid)
           echo "SUBUID_START=$su SUBGID_START=$sg"
-          echo "--- script's exact range-map preflight ---"
+          echo "--- T0: script's exact range-map preflight ---"
           unshare --user --map-users "0:$u:1" --map-users "1:$su:65535" \
                   --map-groups "0:$g:1" --map-groups "1:$sg:65535" \
-                  --setgid 0 --setuid 0 -- id 2>&1 || echo "range-map FAILED rc=$?"
+                  --setgid 0 --setuid 0 -- id 2>&1 || echo "T0 FAILED rc=$?"
+          echo "--- T1: same but with --setgroups deny ---"
+          unshare --user --setgroups deny \
+                  --map-users "0:$u:1" --map-users "1:$su:65535" \
+                  --map-groups "0:$g:1" --map-groups "1:$sg:65535" \
+                  --setgid 0 --setuid 0 -- id 2>&1 || echo "T1 FAILED rc=$?"
+          echo "--- T2: range map WITHOUT setgid/setuid ---"
+          unshare --user --map-users "0:$u:1" --map-users "1:$su:65535" \
+                  --map-groups "0:$g:1" --map-groups "1:$sg:65535" \
+                  -- id 2>&1 || echo "T2 FAILED rc=$?"
+          echo "--- T3: as root (sudo) with a root subid range ---"
+          grep -q '^root:' /etc/subuid || echo 'root:300000:65536' | sudo tee -a /etc/subuid >/dev/null
+          grep -q '^root:' /etc/subgid || echo 'root:300000:65536' | sudo tee -a /etc/subgid >/dev/null
+          sudo unshare --user --map-users "0:0:1" --map-users "1:300000:65535" \
+                  --map-groups "0:0:1" --map-groups "1:300000:65535" \
+                  --setgid 0 --setuid 0 -- id 2>&1 || echo "T3 FAILED rc=$?"
 
       - name: Prepare work area on the large /mnt volume
         run: |
