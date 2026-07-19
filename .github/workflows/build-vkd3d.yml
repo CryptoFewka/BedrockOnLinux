@@ -64,6 +64,7 @@ jobs:
               apt-get update
               apt-get install -y --no-install-recommends \
                 ca-certificates git python3 python3-pip \
+                binutils diffutils file gawk \
                 meson glslang-tools spirv-tools \
                 gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 \
                 g++-mingw-w64-x86-64 g++-mingw-w64-i686 \

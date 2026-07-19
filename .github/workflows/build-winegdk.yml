@@ -67,6 +67,26 @@ jobs:
           grep -q "^${user}:" /etc/subuid || echo "${user}:100000:65536" | sudo tee -a /etc/subuid
           grep -q "^${user}:" /etc/subgid || echo "${user}:100000:65536" | sudo tee -a /etc/subgid
 
+      - name: Diagnose user namespaces
+        run: |
+          echo "id: $(id)"
+          echo "apparmor userns sysctl:"
+          sysctl kernel.apparmor_restrict_unprivileged_userns 2>&1 || echo "(key absent)"
+          echo "max_user_namespaces: $(cat /proc/sys/user/max_user_namespaces 2>&1)"
+          echo "--- /etc/subuid ---"; cat /etc/subuid || true
+          echo "--- /etc/subgid ---"; cat /etc/subgid || true
+          ls -l "$(command -v newuidmap)" "$(command -v newgidmap)" || true
+          echo "--- basic userns (map-root-user) ---"
+          unshare --user --map-root-user id 2>&1 || echo "map-root-user FAILED rc=$?"
+          u=$(id -u); g=$(id -g)
+          su=$(awk -F: -v n="$(id -un)" -v i="$u" '($1==n||$1==i)&&$3>=65535{print $2;exit}' /etc/subuid)
+          sg=$(awk -F: -v n="$(id -un)" -v i="$g" '($1==n||$1==i)&&$3>=65535{print $2;exit}' /etc/subgid)
+          echo "SUBUID_START=$su SUBGID_START=$sg"
+          echo "--- script's exact range-map preflight ---"
+          unshare --user --map-users "0:$u:1" --map-users "1:$su:65535" \
+                  --map-groups "0:$g:1" --map-groups "1:$sg:65535" \
+                  --setgid 0 --setuid 0 -- id 2>&1 || echo "range-map FAILED rc=$?"
+
       - name: Prepare work area on the large /mnt volume
         run: |
           sudo mkdir -p /mnt/engine
