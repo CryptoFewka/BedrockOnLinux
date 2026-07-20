@@ -286,6 +286,9 @@ env -i TCL_LIBRARY="$PYHOME/lib/tcl8.6" TK_LIBRARY="$PYHOME/lib/tk8.6" \
    ${DISPLAY:+DISPLAY="$DISPLAY"} ${XAUTHORITY:+XAUTHORITY="$XAUTHORITY"} \
    "$PYBIN" - <<'PY'
 import os
+import ssl
+import time
+import urllib.error
 import urllib.request
 
 import _tkinter
@@ -307,10 +310,35 @@ expected = {
 }
 actual = {package: version(package) for package in expected}
 assert actual == expected, (actual, expected)
-with urllib.request.urlopen("https://api.github.com", timeout=20) as response:
-    response.read(16)
+def verify_https():
+    # The point of this check is that the bundled OpenSSL + certifi CA can
+    # complete a real TLS handshake. A certificate/TLS failure is a genuine
+    # bundling defect and must fail the build; a network/HTTP error (offline
+    # runner, sandbox, or the host being briefly unreachable) is environmental
+    # and must not, since the crypto stack already imported and loaded its CA.
+    last = None
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen("https://api.github.com", timeout=20) as response:
+                response.read(16)
+            return "HTTPS via bundled CA"
+        except urllib.error.URLError as exc:
+            reason = getattr(exc, "reason", exc)
+            if isinstance(reason, ssl.SSLError):
+                raise SystemExit(f"bundled TLS/CA verification failed: {reason}")
+            last = exc
+        except ssl.SSLError as exc:
+            raise SystemExit(f"bundled TLS/CA verification failed: {exc}")
+        except OSError as exc:
+            last = exc
+        time.sleep(2 * (attempt + 1))
+    print(f"  (warning: could not live-test HTTPS against api.github.com ({last});"
+          " bundled crypto imported OK, skipping the online check)")
+    return "HTTPS online check skipped (network unavailable)"
+
+https_status = verify_https()
 msg = (f"  bundle OK: Tk {_tkinter.TK_VERSION} | cryptography {cryptography.__version__}"
-       f" | customtkinter {customtkinter.__version__} | HTTPS via bundled CA")
+       f" | customtkinter {customtkinter.__version__} | {https_status}")
 if os.environ.get("DISPLAY"):
     import tkinter
     from tkinter import font

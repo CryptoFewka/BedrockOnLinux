@@ -177,14 +177,16 @@ APPIMAGE="$OUT/BedrockOnLinux-${VER}-x86_64.AppImage"
 # before starting too, otherwise an early dependency/network failure could make
 # an old file look like the successful result of this invocation.
 rm -f -- "$APPIMAGE"
-if bash "$SRC/scripts/build-appimage.sh" >/dev/null 2>&1 \
+APPIMAGE_LOG="$OUT/appimage-build.log"
+if bash "$SRC/scripts/build-appimage.sh" >"$APPIMAGE_LOG" 2>&1 \
     && [[ -s "$APPIMAGE" ]]; then
   echo "  ✓ dist/$(basename "$APPIMAGE")"
   built_artifacts+=("$APPIMAGE")
   verified_artifacts+=("$APPIMAGE")
 else
   rm -f -- "$APPIMAGE"
-  echo "  !! AppImage build failed — run scripts/build-appimage.sh to see why"
+  echo "  !! AppImage build failed — last 40 lines of scripts/build-appimage.sh:"
+  tail -n 40 "$APPIMAGE_LOG" | sed 's/^/     /'
   required_failures+=("AppImage")
 fi
 
@@ -193,13 +195,15 @@ rm -f -- "$FLATPAK"
 if command -v flatpak-builder >/dev/null \
     || { command -v flatpak >/dev/null \
          && flatpak info org.flatpak.Builder >/dev/null 2>&1; }; then
-  if bash "$SRC/scripts/build-flatpak.sh" >/dev/null 2>&1 \
+  FLATPAK_LOG="$OUT/flatpak-build.log"
+  if bash "$SRC/scripts/build-flatpak.sh" >"$FLATPAK_LOG" 2>&1 \
       && [[ -s "$FLATPAK" ]]; then
     echo "  ✓ dist/$(basename "$FLATPAK")"
     built_artifacts+=("$FLATPAK")
   else
     rm -f -- "$FLATPAK"
-    echo "  !! Flatpak build failed — run scripts/build-flatpak.sh to see why"
+    echo "  !! Flatpak build failed — last 40 lines of scripts/build-flatpak.sh:"
+    tail -n 40 "$FLATPAK_LOG" | sed 's/^/     /'
     required_failures+=("Flatpak")
   fi
 else
