@@ -540,6 +540,51 @@ def gui():
                       "cursor escaping in windowed mode)", variable=confine_v,
                       command=save_confine, progress_color=GREEN,
                       font=font(13)).pack(anchor="w", pady=7)
+
+        ctk.CTkLabel(wrap, text="Custom Environment Variables",
+                     text_color=SUB, font=font(11, "bold"),
+                     anchor="w").pack(anchor="w", pady=(4, 3))
+
+        def save_custom_env(_event=None):
+            s2 = load_settings()
+            s2["custom_env"] = env_entry.get()
+            save_settings(s2)
+
+        env_entry = ctk.CTkEntry(
+            wrap,
+            placeholder_text="e.g., PROTON_USE_WINED3D=1 KEY=VALUE",
+            fg_color=FIELD, border_color=FIELD, text_color=FG,
+            placeholder_text_color=SUB, corner_radius=10, height=36,
+            font=font(13))
+        env_entry.pack(fill="x", pady=(0, 7))
+        saved_env = load_settings().get("custom_env") or ""
+        if saved_env:
+            env_entry.insert(0, saved_env)
+        env_entry.bind("<KeyRelease>", save_custom_env)
+        env_entry.bind("<FocusOut>", save_custom_env)
+
+        ctk.CTkLabel(wrap, text="Gamescope",
+                     text_color=SUB, font=font(11, "bold"),
+                     anchor="w").pack(anchor="w", pady=(4, 3))
+
+        def save_gamescope(_event=None):
+            s2 = load_settings()
+            s2["gamescope"] = gamescope_entry.get()
+            save_settings(s2)
+
+        gamescope_entry = ctk.CTkEntry(
+            wrap,
+            placeholder_text="1 for auto, or e.g. -w 1920 -h 1080 -f",
+            fg_color=FIELD, border_color=FIELD, text_color=FG,
+            placeholder_text_color=SUB, corner_radius=10, height=36,
+            font=font(13))
+        gamescope_entry.pack(fill="x", pady=(0, 7))
+        saved_gamescope = load_settings().get("gamescope") or ""
+        if saved_gamescope:
+            gamescope_entry.insert(0, saved_gamescope)
+        gamescope_entry.bind("<KeyRelease>", save_gamescope)
+        gamescope_entry.bind("<FocusOut>", save_gamescope)
+
         ctk.CTkFrame(wrap, fg_color=CARD2, height=1).pack(fill="x", pady=14)
 
         imp_status = tk.StringVar(value="")

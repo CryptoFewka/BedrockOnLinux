@@ -5,6 +5,7 @@ import http.client
 import fcntl
 import json
 import os
+import shlex
 import socket
 import subprocess
 import tempfile
@@ -82,6 +83,25 @@ def save_settings(s):
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
         finally:
             os.close(lock_fd)
+
+
+def apply_custom_env(env, custom_env):
+    """Merge KEY=VALUE tokens from a space-separated string into env."""
+    if not custom_env or not str(custom_env).strip():
+        return
+    try:
+        tokens = shlex.split(str(custom_env).strip())
+    except ValueError as e:
+        warn(f"Custom environment variables ignored — invalid syntax ({e}). "
+             "Check for a missing closing quote.")
+        return
+    for token in tokens:
+        if "=" not in token:
+            continue
+        key, _, value = token.partition("=")
+        key = key.strip()
+        if key:
+            env[key] = value
 
 
 def http_json(url):
