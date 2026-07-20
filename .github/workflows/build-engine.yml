@@ -195,14 +195,19 @@ jobs:
           mkdir -p "${{ runner.temp }}/smoke"
           tar -C "${{ runner.temp }}/smoke" -xzf "dist/GDK-Proton-xuser-${{ env.REV }}.tar.gz"
           eng="${{ runner.temp }}/smoke/GDK-Proton-xuser"
-          out="$(docker run --rm -v "$eng:/engine:ro" \
-            registry.gitlab.steamos.cloud/steamrt/sniper/platform@sha256:ab8bb63cd74743bfd7fbc2116c77055a077a59004b6f91455f6243ef931f95b1 \
+          sniper='registry.gitlab.steamos.cloud/steamrt/sniper/platform@sha256:ab8bb63cd74743bfd7fbc2116c77055a077a59004b6f91455f6243ef931f95b1'
+          # Pull first so docker's "Pulling…/Downloaded" progress does not land in
+          # the captured wine output.
+          docker pull -q "$sniper" >/dev/null
+          out="$(docker run --rm -v "$eng:/engine:ro" "$sniper" \
             bash -c 'LD_LIBRARY_PATH=/engine/files/lib/x86_64-linux-gnu /engine/files/bin/wine --version' 2>&1)"
-          echo "sniper: $out"
-          case "$out" in
-            wine-*) echo "engine loads in sniper" ;;
-            *) echo "::error::engine failed to load inside the sniper runtime: $out" >&2; exit 1 ;;
-          esac
+          echo "sniper output: $out"
+          if printf '%s\n' "$out" | grep -qE '^wine-[0-9]'; then
+            echo "engine loads in sniper"
+          else
+            echo "::error::engine failed to load inside the sniper runtime: $out" >&2
+            exit 1
+          fi
 
       - name: Attest engine provenance
         if: ${{ github.event_name == 'push' || inputs.publish }}
