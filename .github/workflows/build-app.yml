@@ -178,7 +178,11 @@ jobs:
           # softprops does not move an existing tag, so delete the rolling nightly
           # release + tag first; the publish step recreates it at the current commit
           # (keeping its "Source code" snapshot and ref in sync with the build).
-          gh release delete nightly -R "${{ github.repository }}" --cleanup-tag --yes || true
+          # Only tolerate "not present" (first run) — a real delete failure must
+          # surface, otherwise the tag would silently regress to stale.
+          if gh release view nightly -R "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release delete nightly -R "${{ github.repository }}" --cleanup-tag --yes
+          fi
 
       - name: Publish the application release
         if: ${{ github.event_name == 'push' || inputs.publish }}

@@ -24,7 +24,8 @@ cleanup_build_trees() {
   # as well. Do not touch config.txt, engine candidates, or XCurl assets.
   rm -rf "$OUT/appimagetool" "$OUT/BedrockOnLinux.AppDir" "$OUT/deb" \
          "$OUT/portable" "$OUT/pyz-stage" "$OUT/flatpak-build" "$OUT/.cache"
-  rm -f "$OUT"/BedrockOnLinux-*-SHA256SUMS.tmp.*
+  rm -f "$OUT"/BedrockOnLinux-*-SHA256SUMS.tmp.* \
+        "$OUT/appimage-build.log" "$OUT/flatpak-build.log"
 }
 trap cleanup_build_trees EXIT
 cleanup_build_trees

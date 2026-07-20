@@ -324,12 +324,15 @@ def verify_https():
             return "HTTPS via bundled CA"
         except urllib.error.URLError as exc:
             reason = getattr(exc, "reason", exc)
-            if isinstance(reason, ssl.SSLError):
+            # Only a certificate-verification failure proves the bundled CA is
+            # broken. Other ssl.SSLError subtypes (SSLEOFError, reset mid-
+            # handshake, etc.) are transport hiccups -> retry, then skip.
+            if isinstance(reason, ssl.SSLCertVerificationError):
                 raise SystemExit(f"bundled TLS/CA verification failed: {reason}")
             last = exc
-        except ssl.SSLError as exc:
+        except ssl.SSLCertVerificationError as exc:
             raise SystemExit(f"bundled TLS/CA verification failed: {exc}")
-        except OSError as exc:
+        except (ssl.SSLError, OSError) as exc:
             last = exc
         time.sleep(2 * (attempt + 1))
     print(f"  (warning: could not live-test HTTPS against api.github.com ({last});"
