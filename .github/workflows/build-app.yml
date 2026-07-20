@@ -152,7 +152,12 @@ jobs:
             third_party/vkd3d-proton-universal/provenance.env | cut -d= -f2 | tr -d "'\"")"
           channel="${{ inputs.channel || 'release' }}"
           if [ "$channel" = "nightly" ]; then
-            tag="nightly"; name="BedrockOnLinux nightly ${ver}"; pre="true"
+            # Rolling nightly: one release/tag, moved to HEAD each run (see the
+            # "Roll the nightly tag" step). Date + short commit in the name give
+            # freshness and traceability without accumulating releases.
+            tag="nightly"
+            name="BedrockOnLinux nightly ${ver} ($(date -u +%Y-%m-%d), ${GITHUB_SHA:0:7})"
+            pre="true"
           else
             tag="app-v${ver}"; name="BedrockOnLinux ${ver}"; pre="false"
           fi
