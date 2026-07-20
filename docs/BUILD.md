@@ -92,6 +92,30 @@ not to loosen the check:
 - WineGDK prefix → `WINEGDK_PREFIX_SHA256` (the reuse path and `build-winegdk.yml` both assert it).
 - engine → `WINEGDK_ARCHIVE_SHA256` and the `bol/vkd3d.py` manifest pins.
 
+## Divergence from the upstream engine
+
+This engine is rebuilt from public inputs, so it is verified two ways against
+upstream's `Wyze3306` engine: components upstream took as prebuilt binaries are
+reproduced **byte-identically**, and everything compiled is **functionally
+equivalent** (same sources/versions, different bytes from a different toolchain).
+
+- **Byte-identical to upstream:** the bundled `libunwind.so.8` (stock Debian 11
+  package) and DXVK (stock **v3.0.1** release, swapped in by
+  `scripts/apply-dxvk-301.sh` since the public GDK-Proton base ships 2.7.1;
+  `.bol-pre301` backups preserved, exactly as upstream).
+- **Functionally equivalent, different bytes (by design):** WineGDK, vkd3d-proton
+  and the OpenSSL-XCurl set — built from source with pinned public toolchains
+  instead of upstream's private build. This is the whole point of the pipeline.
+- **One deliberate omission:** the optional Wine **gphoto2** (camera) and **sane**
+  (scanner) drivers are not built (we don't install `libgphoto2-dev`/`libsane-dev`).
+  Minecraft never loads them, and they link libraries the sniper runtime lacks, so
+  even upstream's copies can't load there. Omitting them keeps the build lean; it
+  is the only intentional file-set difference from upstream's engine.
+
+A `build-engine.yml` smoke test runs the packaged engine's `wine --version` inside
+the Steam Runtime sniper container and fails the build if it does not load, so a
+"reproducible but unrunnable" engine can never ship.
+
 ## CI environment
 
 The build environment itself is pinned, so the builds are reproducible across

@@ -222,9 +222,10 @@ ARCHES=(x86_64-windows i386-windows)
 DLLS=(d3d12.dll d3d12core.dll)
 EXT_MARKER="VK_EXT_device_generated_commands"
 NV_MARKER="VK_NV_device_generated_commands"
-# DXVK ships as-is from the public GDK-Proton base (Minecraft Bedrock uses the
-# D3D12/vkd3d path, not DXVK); pin the version the pinned base actually bundles.
-DXVK_VERSION="2.7.1"
+# DXVK is swapped to stock v3.0.1 by scripts/apply-dxvk-301.sh before packaging
+# (the public GDK-Proton base ships 2.7.1; upstream's engine used 3.0.1). This
+# validates the swapped-in version.
+DXVK_VERSION="3.0.1"
 VKD3D_BASE_VERSION="3.0.1"
 VKD3D_EXT_VERSION="3.0.1-bol-dgc"
 VKD3D_NV_VERSION="3.0.1-bol-dgc"
@@ -807,6 +808,7 @@ gdk_proton_provenance_files = {
 
 critical_relative_paths = tuple(dict.fromkeys((
     *REQUIRED_CRITICAL_FILE_PATHS,
+    "files/lib/x86_64-linux-gnu/libunwind.so.8.0.1",
     *sorted(provenance_files),
 )))
 critical_files = {}

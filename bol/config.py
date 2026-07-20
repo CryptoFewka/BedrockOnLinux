@@ -76,12 +76,12 @@ WINEGDK_PREBUILT_REPO = "CryptoFewka/BedrockOnLinux"
 WINEGDK_BUILD_REV = "wow64-archs-native5"
 # SHA-256 of the reviewed, deterministic engine archive. An invalid value makes
 # the installer fail closed rather than accepting a differently packed engine.
-WINEGDK_ARCHIVE_SHA256 = "d501d9fa86a01f51cd8697cd7c8012ce9cf5eeac701b41a8feaafb694a9757b5"
+WINEGDK_ARCHIVE_SHA256 = "4c0b8b0f147b38bf4e34cef68ecda35172fc1728b43bf604d3554ccc595c72af"
 # SHA-256 of the deterministic WineGDK prefix tarball (build intermediate, not a
 # runtime download). build-winegdk.yml asserts it, and build-engine.yml verifies
 # a reused prefix against it, so the reuse path fails fast against a committed
 # expectation instead of only transitively via the engine archive hash above.
-WINEGDK_PREFIX_SHA256 = "e65d30369729260f6e8ea067e98b17c3c9460d1ed2190a0a570a11ad60836046"
+WINEGDK_PREFIX_SHA256 = "bbb249a999bc6000c0cf0cb2654382cb4e0988a6c2424cb1f12d8d2aa90810c6"
 
 # Decoupled from the engine repo: the launcher checks upstream for its own
 # update notifications so this follow-upstream fork still learns about new

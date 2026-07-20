@@ -238,6 +238,13 @@ internal_build_stage() {
         --prefix=/work/prefix
       make -j"$MAKE_JOBS"
       make install
+      # ntdll links libunwind but the sniper runtime ships none; bundle the
+      # bullseye libunwind so the engine is self-contained (matches the
+      # container build and the upstream engine layout).
+      luw="$(readlink -f /usr/lib/x86_64-linux-gnu/libunwind.so.8)"
+      mkdir -p /work/prefix/lib/x86_64-linux-gnu
+      cp -a "$luw" "/work/prefix/lib/x86_64-linux-gnu/$(basename "$luw")"
+      ln -sf "$(basename "$luw")" /work/prefix/lib/x86_64-linux-gnu/libunwind.so.8
     '
 }
 

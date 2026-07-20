@@ -25,7 +25,7 @@ VARIANTS = (EXT_DGC, NV_DGC)
 ARCHES = ("x86_64-windows", "i386-windows")
 DLL_NAMES = ("d3d12.dll", "d3d12core.dll")
 
-DXVK_COMPONENT_VERSION = "2.7.1"
+DXVK_COMPONENT_VERSION = "3.0.1"
 VKD3D_COMPAT_COMPONENT_VERSION = "3.0.1-bol-dgc"
 VKD3D_EXT_DGC_COMPONENT_VERSION = VKD3D_COMPAT_COMPONENT_VERSION
 VKD3D_NV_DGC_COMPONENT_VERSION = VKD3D_COMPAT_COMPONENT_VERSION
@@ -70,6 +70,7 @@ REQUIRED_CRITICAL_FILE_PATHS = (
     "files/bin-wow64/wineserver",
     "files/bin-wow64/msidb",
     "files/share/wine/wine.inf",
+    "files/lib/x86_64-linux-gnu/libunwind.so.8",
     "files/lib/wine/x86_64-windows/ntdll.dll",
     "files/lib/wine/x86_64-windows/combase.dll",
     "files/lib/wine/x86_64-windows/xgameruntime.dll",
@@ -99,6 +100,7 @@ REQUIRED_RUNTIME_LINK_TARGETS = {
     "files/bin/wine64-preloader": "wine",
     "files/bin-wow64/wine-preloader": "wine",
     "files/bin-wow64/msidb": "wine",
+    "files/lib/x86_64-linux-gnu/libunwind.so.8": "libunwind.so.8.0.1",
 }
 REQUIRED_VARIANT_HASHES = {
     EXT_DGC: {

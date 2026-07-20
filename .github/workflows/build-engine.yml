@@ -157,6 +157,10 @@ jobs:
             | sha256sum -c -
           tar -C "${{ runner.temp }}/engine" -xzf "${{ runner.temp }}/base/GDK-Proton10-32.tar.gz"
 
+      - name: Swap in DXVK v3.0.1 (the public base ships 2.7.1; upstream used 3.0.1)
+        run: |
+          bash scripts/apply-dxvk-301.sh "${{ runner.temp }}/engine/GDK-Proton10-32"
+
       - name: Package the engine
         run: |
           commit="$(grep -m1 '^WINEGDK_SOURCE_COMMIT = ' bol/config.py | cut -d'"' -f2)"
@@ -180,6 +184,25 @@ jobs:
             exit 1
           fi
           echo "REV=$rev" >> "$GITHUB_ENV"
+
+      - name: Smoke test - the engine loads inside the sniper runtime
+        run: |
+          # The assert above proves the bytes are the reproducible ones; this
+          # proves they RUN. Wine's ntdll must dlopen inside the pressure-vessel/
+          # sniper runtime, which ships no system libunwind, so this catches a
+          # reproducible-but-unrunnable engine that the hash + manifest checks
+          # cannot. Proton puts files/lib/x86_64-linux-gnu on LD_LIBRARY_PATH.
+          mkdir -p "${{ runner.temp }}/smoke"
+          tar -C "${{ runner.temp }}/smoke" -xzf "dist/GDK-Proton-xuser-${{ env.REV }}.tar.gz"
+          eng="${{ runner.temp }}/smoke/GDK-Proton-xuser"
+          out="$(docker run --rm -v "$eng:/engine:ro" \
+            registry.gitlab.steamos.cloud/steamrt/sniper/platform@sha256:ab8bb63cd74743bfd7fbc2116c77055a077a59004b6f91455f6243ef931f95b1 \
+            bash -c 'LD_LIBRARY_PATH=/engine/files/lib/x86_64-linux-gnu /engine/files/bin/wine --version' 2>&1)"
+          echo "sniper: $out"
+          case "$out" in
+            wine-*) echo "engine loads in sniper" ;;
+            *) echo "::error::engine failed to load inside the sniper runtime: $out" >&2; exit 1 ;;
+          esac
 
       - name: Attest engine provenance
         if: ${{ github.event_name == 'push' || inputs.publish }}

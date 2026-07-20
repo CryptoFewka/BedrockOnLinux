@@ -70,6 +70,19 @@ echo "== Configuring + building WineGDK (i386 + x86_64)"
 # runtime material; drop them so the prefix is relocatable + reproducible.
 rm -rf "$PREFIX/include"
 
+# ntdll.so links libunwind (configure autodetects libunwind-dev), but the
+# pressure-vessel/sniper runtime ships no libunwind, so bundle the exact bullseye
+# libunwind alongside the engine's other x86_64-linux-gnu libs. Proton's wrapper
+# puts files/lib/x86_64-linux-gnu on LD_LIBRARY_PATH, so ntdll resolves it there.
+# This matches the upstream engine layout that REQUIRED_*_PATHS pin.
+echo "== Bundling libunwind for the sniper runtime"
+libunwind_real="$(readlink -f /usr/lib/x86_64-linux-gnu/libunwind.so.8)"
+[ -f "$libunwind_real" ] \
+  || { echo "!! libunwind.so.8 missing from the build container" >&2; exit 1; }
+mkdir -p "$PREFIX/lib/x86_64-linux-gnu"
+cp -a "$libunwind_real" "$PREFIX/lib/x86_64-linux-gnu/$(basename "$libunwind_real")"
+ln -sf "$(basename "$libunwind_real")" "$PREFIX/lib/x86_64-linux-gnu/libunwind.so.8"
+
 echo "== Enforcing GLIBC_$GLIBC_CEILING ABI ceiling"
 version_is_greater() {  # $1 > $2 ?
   local greatest
