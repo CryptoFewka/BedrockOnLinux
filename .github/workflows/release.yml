@@ -1,0 +1,162 @@
+# Top-level release orchestrator: one run, one graph, source -> Tier-1 ->
+# engine -> app.
+#
+# It reads the pinned versions from source (bol/config.py + third_party/), and
+# for each Tier-1 component decides reuse-or-build:
+#   - if the pinned, attested release already exists (and, where a SHA is
+#     committed, its published sidecar matches the pin) -> REUSE it,
+#   - otherwise -> BUILD it from source and publish it (attested).
+# The engine and app then always assemble from those (cheap), verifying every
+# input against the committed pins. It NEVER mutates a pin; it only asserts them.
+#
+# Triggers:
+#   - workflow_dispatch: cut a versioned release (publish=true) or dry-run
+#     (publish=false: build + verify the engine/app without publishing them;
+#     a missing Tier-1 building block is still published so it can be reused).
+#     force_rebuild rebuilds every tier from source even if a release exists.
+#   - schedule: nightly. Reuses the pinned engine/Tier-1 and rebuilds the app
+#     from the default branch, publishing a rolling "nightly" prerelease.
+#
+# Reproducibility drift is best caught by a separate periodic job that runs the
+# engine with rebuild_from_source=true; this orchestrator is about releasing.
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish the engine + app releases (off = dry run)"
+        type: boolean
+        default: true
+      force_rebuild:
+        description: "Rebuild every tier from source even if a release exists"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 7 * * *" # nightly ~07:00 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    outputs:
+      build_xcurl: ${{ steps.probe.outputs.build_xcurl }}
+      build_winegdk: ${{ steps.probe.outputs.build_winegdk }}
+      build_vkd3d: ${{ steps.probe.outputs.build_vkd3d }}
+      channel: ${{ steps.probe.outputs.channel }}
+      publish: ${{ steps.probe.outputs.publish }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Resolve pins and decide reuse-or-build per tier
+        id: probe
+        run: |
+          set -euo pipefail
+          repo="${{ github.repository }}"
+          force="${{ inputs.force_rebuild || 'false' }}"
+          cfg=bol/config.py
+          xrev="$(grep -m1 '^OPENSSL_XCURL_REV = ' $cfg | cut -d'"' -f2)"
+          xsha="$(grep -m1 '^OPENSSL_XCURL_ARCHIVE_SHA256 = ' $cfg | cut -d'"' -f2)"
+          commit="$(grep -m1 '^WINEGDK_SOURCE_COMMIT = ' $cfg | cut -d'"' -f2)"
+          wshort="${commit:0:12}"
+          wpre="$(grep -m1 '^WINEGDK_PREFIX_SHA256 = ' $cfg | cut -d'"' -f2)"
+          vtag="vkd3d-3.0.1-nv-dgc"
+          # Reuse a release when it exists and (if a SHA is committed) its
+          # published sidecar matches the pin. Missing or drifted -> rebuild.
+          needs_build() {
+            local tag="$1" base="$2" pin="$3" got
+            [ "$force" = "true" ] && { echo true; return; }
+            gh release view "$tag" -R "$repo" >/dev/null 2>&1 || { echo true; return; }
+            if [ -n "$pin" ]; then
+              rm -rf /tmp/pb; mkdir -p /tmp/pb
+              gh release download "$tag" -R "$repo" -p "${base}.sha256" -D /tmp/pb 2>/dev/null \
+                || { echo true; return; }
+              got="$(cut -d' ' -f1 "/tmp/pb/${base}.sha256" 2>/dev/null | head -1)"
+              [ "$got" = "$pin" ] && echo false || echo true
+            else
+              echo false
+            fi
+          }
+          bx="$(needs_build "xcurl-${xrev}" "openssl-xcurl-set-${xrev}.tar.gz" "$xsha")"
+          bw="$(needs_build "winegdk-${wshort}" "winegdk-prefix-${wshort}.tar.gz" "$wpre")"
+          bv="$(needs_build "$vtag" "vkd3d-universal-3.0.1-nv-dgc.tar.gz" "")"
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            channel=nightly; publish=true
+          else
+            channel=release; publish="${{ inputs.publish }}"
+          fi
+          {
+            echo "build_xcurl=$bx"
+            echo "build_winegdk=$bw"
+            echo "build_vkd3d=$bv"
+            echo "channel=$channel"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+          echo "resolved: xcurl=$bx winegdk=$bw vkd3d=$bv channel=$channel publish=$publish"
+
+  # ---- Tier 1: built (and published, so it can be reused) only when needed ----
+  xcurl:
+    needs: resolve
+    if: ${{ needs.resolve.outputs.build_xcurl == 'true' }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/build-xcurl.yml
+    with:
+      publish: true
+
+  winegdk:
+    needs: resolve
+    if: ${{ needs.resolve.outputs.build_winegdk == 'true' }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/build-winegdk.yml
+    with:
+      publish: true
+
+  vkd3d:
+    needs: resolve
+    if: ${{ needs.resolve.outputs.build_vkd3d == 'true' }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/build-vkd3d.yml
+    with:
+      publish: true
+
+  # ---- Engine: always reuses the now-present Tier-1, verifies + asserts ----
+  engine:
+    needs: [resolve, xcurl, winegdk, vkd3d]
+    if: ${{ !cancelled() && !failure() }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/build-engine.yml
+    with:
+      rebuild_from_source: false
+      # On nightly the engine is unchanged (pinned), so verify-only; a real
+      # release republishes it. Tier-1 building blocks always publish when built.
+      publish: ${{ needs.resolve.outputs.publish == 'true' && needs.resolve.outputs.channel == 'release' }}
+
+  # ---- App: reuses engine + xcurl, publishes with the pinned bill of materials
+  app:
+    needs: [resolve, engine]
+    if: ${{ !cancelled() && !failure() }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/build-app.yml
+    with:
+      publish: ${{ needs.resolve.outputs.publish == 'true' }}
+      channel: ${{ needs.resolve.outputs.channel }}

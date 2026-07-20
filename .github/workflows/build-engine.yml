@@ -17,6 +17,16 @@
 name: Build managed engine
 
 on:
+  workflow_call:
+    inputs:
+      rebuild_from_source:
+        description: "Rebuild WineGDK + vkd3d from source instead of reusing published releases"
+        type: boolean
+        default: false
+      publish:
+        description: "Publish + attest the built engine as a release on this fork"
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       rebuild_from_source:

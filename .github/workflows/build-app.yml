@@ -14,12 +14,26 @@
 name: Build application artifacts
 
 on:
+  workflow_call:
+    inputs:
+      publish:
+        description: "Publish + attest the app artifacts as a release on this fork"
+        type: boolean
+        default: false
+      channel:
+        description: "release (versioned) or nightly (rolling prerelease)"
+        type: string
+        default: release
   workflow_dispatch:
     inputs:
       publish:
         description: "Publish + attest the app artifacts as a release on this fork"
         type: boolean
         default: false
+      channel:
+        description: "release (versioned) or nightly (rolling prerelease)"
+        type: string
+        default: release
   push:
     tags:
       - "app-v*"
@@ -125,15 +139,52 @@ jobs:
             dist/BedrockOnLinux-*-x86_64.flatpak
             dist/BedrockOnLinux-*-SHA256SUMS
 
+      - name: Compute release metadata + bill of materials
+        if: ${{ github.event_name == 'push' || inputs.publish }}
+        run: |
+          ver="$(grep -m1 '^VERSION = ' bol/config.py | cut -d'"' -f2)"
+          eng_rev="$(grep -m1 '^WINEGDK_BUILD_REV = ' bol/config.py | cut -d'"' -f2)"
+          eng_sha="$(grep -m1 '^WINEGDK_ARCHIVE_SHA256 = ' bol/config.py | cut -d'"' -f2)"
+          wg_commit="$(grep -m1 '^WINEGDK_SOURCE_COMMIT = ' bol/config.py | cut -d'"' -f2)"
+          wg_prefix="$(grep -m1 '^WINEGDK_PREFIX_SHA256 = ' bol/config.py | cut -d'"' -f2)"
+          xcurl_rev="$(grep -m1 '^OPENSSL_XCURL_REV = ' bol/config.py | cut -d'"' -f2)"
+          vkd3d_hashes="$(grep -m1 '^VKD3D_OUTPUT_HASHES_SHA256=' \
+            third_party/vkd3d-proton-universal/provenance.env | cut -d= -f2 | tr -d "'\"")"
+          channel="${{ inputs.channel || 'release' }}"
+          if [ "$channel" = "nightly" ]; then
+            tag="nightly"; name="BedrockOnLinux nightly ${ver}"; pre="true"
+          else
+            tag="app-v${ver}"; name="BedrockOnLinux ${ver}"; pre="false"
+          fi
+          {
+            echo "VER=$ver"
+            echo "RELEASE_TAG=$tag"
+            echo "RELEASE_NAME=$name"
+            echo "RELEASE_PRERELEASE=$pre"
+            echo "BOM_ENGINE=${eng_rev} (sha256 ${eng_sha})"
+            echo "BOM_WINEGDK=${wg_commit} (prefix sha256 ${wg_prefix})"
+            echo "BOM_VKD3D=3.0.1-nv-dgc (output-hashes sha256 ${vkd3d_hashes})"
+            echo "BOM_XCURL=${xcurl_rev}"
+          } >> "$GITHUB_ENV"
+
       - name: Publish the application release
         if: ${{ github.event_name == 'push' || inputs.publish }}
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          tag_name: app-v${{ env.VER }}
-          name: BedrockOnLinux ${{ env.VER }}
-          body: >
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_NAME }}
+          prerelease: ${{ env.RELEASE_PRERELEASE }}
+          body: |
             Application artifacts built from source, consuming this fork's
-            attested engine and OpenSSL-XCurl set. Verify any file with:
+            attested, pinned engine and OpenSSL-XCurl set.
+
+            Bill of materials (pinned + reproducible):
+            - Managed engine: ${{ env.BOM_ENGINE }}
+            - WineGDK source: ${{ env.BOM_WINEGDK }}
+            - vkd3d-proton: ${{ env.BOM_VKD3D }}
+            - OpenSSL-XCurl set: ${{ env.BOM_XCURL }}
+
+            Verify any file with:
             gh attestation verify <file> --repo ${{ github.repository }}
           files: |
             dist/bedrock-on-linux_*.deb
