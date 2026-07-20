@@ -10,10 +10,12 @@
 # input against the committed pins. It NEVER mutates a pin; it only asserts them.
 #
 # Triggers:
-#   - workflow_dispatch: cut a versioned release (publish=true) or dry-run
-#     (publish=false: build + verify the engine/app without publishing them;
-#     a missing Tier-1 building block is still published so it can be reused).
-#     force_rebuild rebuilds every tier from source even if a release exists.
+#   - workflow_dispatch: cut a versioned release (publish=true), or dry-run
+#     (publish=false) to build + verify the whole chain without cutting the app
+#     release. A dry run still publishes the reusable building blocks it needs
+#     (a missing Tier-1, and the engine) so the app can be verified against them;
+#     only the user-facing app release is withheld. force_rebuild rebuilds every
+#     tier from source even if a release exists.
 #   - schedule: nightly. Reuses the pinned engine/Tier-1 and rebuilds the app
 #     from the default branch, publishing a rolling "nightly" prerelease.
 #
@@ -84,6 +86,10 @@ jobs:
           }
           bx="$(needs_build "xcurl-${xrev}" "openssl-xcurl-set-${xrev}.tar.gz" "$xsha")"
           bw="$(needs_build "winegdk-${wshort}" "winegdk-prefix-${wshort}.tar.gz" "$wpre")"
+          # vkd3d has no single committed tarball SHA (its wrapper is not the
+          # integrity boundary; the DLL hashes in OUTPUT-SHA256SUMS are). So it
+          # reuses on existence; build-engine verifies the DLLs against that
+          # committed file and fails fast on drift. force_rebuild heals a stale one.
           bv="$(needs_build "$vtag" "vkd3d-universal-3.0.1-nv-dgc.tar.gz" "")"
           if [ "${{ github.event_name }}" = "schedule" ]; then
             channel=nightly; publish=true
@@ -144,9 +150,12 @@ jobs:
     uses: ./.github/workflows/build-engine.yml
     with:
       rebuild_from_source: false
-      # On nightly the engine is unchanged (pinned), so verify-only; a real
-      # release republishes it. Tier-1 building blocks always publish when built.
-      publish: ${{ needs.resolve.outputs.publish == 'true' && needs.resolve.outputs.channel == 'release' }}
+      # The engine is a building block (like Tier-1): publish it on the release
+      # channel so the app job can reuse it in the same run, including a dry run
+      # (publish=false) that still needs to verify the app against it. Only the
+      # app *release* is gated by publish. On nightly the engine is unchanged
+      # (pinned) and already published, so verify-only.
+      publish: ${{ needs.resolve.outputs.channel == 'release' }}
 
   # ---- App: reuses engine + xcurl, publishes with the pinned bill of materials
   app:

@@ -134,10 +134,16 @@ jobs:
             -R "${{ github.repository }}"
           (cd "${{ runner.temp }}/vk-dl" && sha256sum -c "vkd3d-universal-3.0.1-nv-dgc.tar.gz.sha256")
 
-      - name: Unpack vkd3d
+      - name: Unpack + verify vkd3d against the committed DLL hashes
         run: |
           mkdir -p "${{ runner.temp }}/vk"
           tar -C "${{ runner.temp }}/vk" -xzf "${{ runner.temp }}"/vk-dl/vkd3d-universal-*.tar.gz
+          # vkd3d is reused by tag (its tarball wrapper is not itself a committed
+          # pin), so verify the DLLs against the reproducible OUTPUT-SHA256SUMS
+          # here: fail fast and clearly on drift instead of only later, and
+          # transitively, via the engine archive assert.
+          ( cd "${{ runner.temp }}/vk/vkd3d-proton-3.0.1-nv-dgc" \
+            && sha256sum -c "$GITHUB_WORKSPACE/third_party/vkd3d-proton-universal/OUTPUT-SHA256SUMS" )
 
       # ---- GDK-Proton base (extracted tree = ENGINE_DIR) ----
       - name: Fetch + extract the GDK-Proton base

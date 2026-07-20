@@ -167,6 +167,14 @@ jobs:
             echo "BOM_XCURL=${xcurl_rev}"
           } >> "$GITHUB_ENV"
 
+      - name: Roll the nightly tag to the current commit
+        if: ${{ (github.event_name == 'push' || inputs.publish) && env.RELEASE_TAG == 'nightly' }}
+        run: |
+          # softprops does not move an existing tag, so delete the rolling nightly
+          # release + tag first; the publish step recreates it at the current commit
+          # (keeping its "Source code" snapshot and ref in sync with the build).
+          gh release delete nightly -R "${{ github.repository }}" --cleanup-tag --yes || true
+
       - name: Publish the application release
         if: ${{ github.event_name == 'push' || inputs.publish }}
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
