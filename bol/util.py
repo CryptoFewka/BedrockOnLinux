@@ -29,6 +29,14 @@ from .log import IS_TTY, die, warn
 
 def run(cmd, **kw):
     kw.setdefault("check", True)
+    # Some hardware/locale combos emit non-UTF-8 bytes on stdout/stderr
+    # (e.g. xrandr output on certain Nvidia/Intel hybrid setups under a
+    # non-English locale). When decoding is requested (text=True or an
+    # explicit encoding), don't let a single bad byte crash the whole
+    # launcher — fall back to dropping undecodable bytes unless the
+    # caller already specified its own `errors` policy.
+    if (kw.get("text") or kw.get("encoding")) and "errors" not in kw:
+        kw["errors"] = "ignore"
     return subprocess.run(cmd, **kw)
 
 
