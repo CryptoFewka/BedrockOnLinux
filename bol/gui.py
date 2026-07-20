@@ -261,7 +261,8 @@ def gui():
                 rels = gh_releases(SELF_REPO)
                 root.after(0, lambda: show_changelog(rels))
             except Exception as e:
-                root.after(0, lambda: show_error(str(e)))
+                err_msg = str(e)
+                root.after(0, lambda: show_error(err_msg))
                 
         threading.Thread(target=work, daemon=True).start()
 
