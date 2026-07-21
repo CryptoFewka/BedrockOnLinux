@@ -1,5 +1,5 @@
-/* cryptbase.dll stub — the RtlGenRandom family (SystemFunction036/040/041)
- * that GDK's OpenSSL TLS RNG resolves through advapi32. GDK-Proton forwards
+/* cryptbase.dll stub: RtlGenRandom (SystemFunction036), the one export GDK's
+ * OpenSSL TLS RNG resolves through advapi32. GDK-Proton forwards
  * advapi32.SystemFunction036 (RtlGenRandom) to cryptbase, and OpenSSL's Windows
  * RAND aborts at its first TLS RNG draw without it. Built for Wine (x86_64) and
  * installed into the prefix system32 in place of the opaque prebuilt stub, so
@@ -90,19 +90,7 @@ SystemFunction036(PVOID buffer, ULONG length)
     return FALSE;
 }
 
-/* SystemFunction040 == RtlEncryptMemory, SystemFunction041 == RtlDecryptMemory.
- * The GDK/OpenSSL TLS path only needs the RNG above; provide success-returning
- * pass-throughs so any incidental caller keeps working. */
-__declspec(dllexport) LONG WINAPI
-SystemFunction040(PVOID memory, ULONG length, ULONG flags)
-{
-    (void)memory; (void)length; (void)flags;
-    return 0; /* STATUS_SUCCESS */
-}
-
-__declspec(dllexport) LONG WINAPI
-SystemFunction041(PVOID memory, ULONG length, ULONG flags)
-{
-    (void)memory; (void)length; (void)flags;
-    return 0; /* STATUS_SUCCESS */
-}
+/* SystemFunction040/041 (RtlEncryptMemory/RtlDecryptMemory) are intentionally
+ * not exported: the GDK/OpenSSL TLS path only needs the RNG above, and a no-op
+ * that returns success without encrypting/decrypting is worse than an honest
+ * "not found". If a caller ever needs them, add a real implementation. */
