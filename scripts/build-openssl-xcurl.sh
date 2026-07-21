@@ -120,7 +120,9 @@ echo "== Building the source DLLs (shim + cryptbase)"
 # shellcheck disable=SC2054  # commas are intentional -Wl linker-arg separators
 DET=(-s -Wl,--no-insert-timestamp -Wl,--image-base,0x180000000)
 "$CC" -O2 -shared "${DET[@]}" -o "$SET/xcurl-cashim.dll" "$SRC/src/xcurl-cashim.c"
-"$CC" -O2 -shared "${DET[@]}" -o "$SET/cryptbase.dll" "$SRC/src/cryptbase-stub.c" -lbcrypt
+# -mrdrnd enables the RDRAND intrinsic; no -lbcrypt so cryptbase never imports
+# bcrypt (whose RNG loops back to RtlGenRandom -> this stub -> stack overflow).
+"$CC" -O2 -mrdrnd -shared "${DET[@]}" -o "$SET/cryptbase.dll" "$SRC/src/cryptbase-stub.c"
 python3 "$SRC/scripts/pe-zero-timestamps.py" \
   "$SET/xcurl-cashim.dll" "$SET/cryptbase.dll"
 # Keep the shim source beside the set (matches the reviewed layout).
