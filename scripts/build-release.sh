@@ -223,24 +223,38 @@ fi
 echo "== Verifying embedded candidate metadata =="
 "$SRC/scripts/verify-release-candidate.sh" "${verified_artifacts[@]}"
 
-# Checksums contain the validated engine input plus only application files
-# successfully rebuilt by this invocation.  The temp+rename sequence prevents
-# an interrupted hash pass leaving a plausible but incomplete SHA256SUMS file.
+# The application checksum file lists only the app artifacts rebuilt by this
+# invocation. The engine and XCurl archives ship from their own separately
+# attested releases and are not attached here, so their hashes go in a sidecar
+# inputs file instead of this one. The temp+rename sequence prevents an
+# interrupted hash pass leaving a plausible but incomplete checksum file.
 CHECKSUM="$OUT/BedrockOnLinux-${VER}-SHA256SUMS"
 CHECKSUM_TMP="$CHECKSUM.tmp.$$"
-rm -f -- "$CHECKSUM" "$CHECKSUM_TMP"
+INPUTS_SUMS="$OUT/BedrockOnLinux-${VER}-inputs.sha256"
+INPUTS_TMP="$INPUTS_SUMS.tmp.$$"
+rm -f -- "$CHECKSUM" "$CHECKSUM_TMP" "$INPUTS_SUMS" "$INPUTS_TMP"
 (
   cd "$OUT"
   for artifact in "${built_artifacts[@]}"; do
-    sha256sum -- "$(basename "$artifact")"
+    base="$(basename "$artifact")"
+    if [ "$base" = "$ENGINE_ASSET" ] || [ "$base" = "$XCURL_ASSET" ]; then
+      continue
+    fi
+    sha256sum -- "$base"
   done
 ) > "$CHECKSUM_TMP"
 mv -f -- "$CHECKSUM_TMP" "$CHECKSUM"
-echo "  ✓ dist/$(basename "$CHECKSUM")"
+echo "  ✓ dist/$(basename "$CHECKSUM") (application artifacts only)"
+(
+  cd "$OUT"
+  sha256sum -- "$ENGINE_ASSET" "$XCURL_ASSET"
+) > "$INPUTS_TMP"
+mv -f -- "$INPUTS_TMP" "$INPUTS_SUMS"
+echo "  ✓ dist/$(basename "$INPUTS_SUMS") (pinned engine + online-login inputs)"
 
 echo
 echo "Unreleased candidate artifacts in $OUT:"
-for artifact in "${built_artifacts[@]}" "$CHECKSUM"; do
+for artifact in "${built_artifacts[@]}" "$CHECKSUM" "$INPUTS_SUMS"; do
   ls -1sh "$artifact"
 done
 echo
