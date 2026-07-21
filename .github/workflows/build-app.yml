@@ -141,6 +141,7 @@ jobs:
             dist/BedrockOnLinux-*-x86_64.AppImage
             dist/BedrockOnLinux-*-x86_64.flatpak
             dist/BedrockOnLinux-*-SHA256SUMS
+            dist/BedrockOnLinux-*-inputs.sha256
 
   # Attest + publish only. Runs on tag push or an explicit publish request, holds
   # the write/id-token/attestations scopes the build job does not, and touches
@@ -172,6 +173,7 @@ jobs:
             dist/BedrockOnLinux-*-x86_64.AppImage
             dist/BedrockOnLinux-*-x86_64.flatpak
             dist/BedrockOnLinux-*-SHA256SUMS
+            dist/BedrockOnLinux-*-inputs.sha256
 
       - name: Compute release metadata + bill of materials
         run: |
@@ -241,4 +243,5 @@ jobs:
             dist/BedrockOnLinux-*-x86_64.AppImage
             dist/BedrockOnLinux-*-x86_64.flatpak
             dist/BedrockOnLinux-*-SHA256SUMS
+            dist/BedrockOnLinux-*-inputs.sha256
           fail_on_unmatched_files: false

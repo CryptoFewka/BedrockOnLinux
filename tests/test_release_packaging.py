@@ -345,11 +345,18 @@ class BuildReleaseHygieneTests(unittest.TestCase):
             )
 
             expected = hashlib.sha256(current_pyz.read_bytes()).hexdigest()
+            # The app checksum file lists only the attached app artifacts.
             self.assertEqual(
                 checksum.read_text(encoding="utf-8"),
-                f"{engine_sha}  {engine.name}\n"
-                f"{xcurl_sha}  {xcurl.name}\n"
                 f"{expected}  {current_pyz.name}\n",
+            )
+            # Engine + XCurl inputs (separately released, not attached) live in
+            # a sidecar inputs checksum file, not the app SHA256SUMS.
+            inputs = dist / f"BedrockOnLinux-{VERSION}-inputs.sha256"
+            self.assertEqual(
+                inputs.read_text(encoding="utf-8"),
+                f"{engine_sha}  {engine.name}\n"
+                f"{xcurl_sha}  {xcurl.name}\n",
             )
 
             first_pyz = current_pyz.read_bytes()
