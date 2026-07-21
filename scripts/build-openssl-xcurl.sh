@@ -123,6 +123,24 @@ DET=(-s -Wl,--no-insert-timestamp -Wl,--image-base,0x180000000)
 # -mrdrnd enables the RDRAND intrinsic; no -lbcrypt so cryptbase never imports
 # bcrypt (whose RNG loops back to RtlGenRandom -> this stub -> stack overflow).
 "$CC" -O2 -mrdrnd -shared "${DET[@]}" -o "$SET/cryptbase.dll" "$SRC/src/cryptbase-stub.c"
+
+# Regression guard for that recursion: under Wine's advapi32->cryptbase forward,
+# any RNG import (bcrypt) or self-forward (advapi32) makes cryptbase's
+# RtlGenRandom re-enter itself and overflow the stack. Assert the built DLL
+# imports neither -- a millisecond static check, no Wine or game run needed.
+OBJDUMP="${CC%-gcc}-objdump"
+command -v "$OBJDUMP" >/dev/null 2>&1 ||
+  { echo "!! $OBJDUMP not found (install binutils-mingw-w64)" >&2; exit 1; }
+cb_bad="$("$OBJDUMP" -p "$SET/cryptbase.dll" | awk '/DLL Name:/{print tolower($NF)}' \
+  | grep -iE '^(bcrypt|advapi32)\.dll$' || true)"
+if [ -n "$cb_bad" ]; then
+  echo "!! cryptbase.dll imports '$cb_bad': its RtlGenRandom would recurse to a" \
+       "stack overflow under Wine's advapi32->cryptbase forward. Keep the RNG" \
+       "self-contained (source entropy without advapi32/bcrypt)." >&2
+  exit 1
+fi
+echo "   cryptbase RNG self-contained: no bcrypt/advapi32 import (ok)"
+
 python3 "$SRC/scripts/pe-zero-timestamps.py" \
   "$SET/xcurl-cashim.dll" "$SET/cryptbase.dll"
 # Keep the shim source beside the set (matches the reviewed layout).

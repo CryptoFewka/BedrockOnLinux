@@ -10,22 +10,44 @@
  * SystemFunction036 forwards to THIS cryptbase.SystemFunction036, our impl calls
  * BCryptGenRandom, and Wine's bcrypt seeds its DRBG via RtlGenRandom, which is
  * advapi32.SystemFunction036 again -> back into this stub -> unbounded recursion.
- * So draw entropy from the RDRAND hardware instruction (with a CPUID guard and a
- * self-seeded fallback), importing only kernel32/msvcrt -- never advapi32/bcrypt.
+ * So draw entropy without touching advapi32/bcrypt: the host CSPRNG via Wine's
+ * unix path (/dev/urandom) as the primary, RDRAND as the fallback. cryptbase
+ * imports only kernel32/msvcrt.
  *
  * Build: x86_64-w64-mingw32-gcc -O2 -mrdrnd -shared -o cryptbase.dll cryptbase-stub.c
  */
-#ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x0600   /* GetTickCount64 (Vista+) */
-#endif
 #include <windows.h>
 #include <immintrin.h>
 #include <intrin.h>
-#include <stdint.h>
 #include <string.h>
 
-/* CPUID.01H:ECX.RDRAND[bit 30]. Executing rdrand on a CPU without it faults
- * (#UD), so gate on the feature bit before ever issuing the instruction. */
+/* Primary: read the host CSPRNG through Wine's unix path. This DLL only ever
+ * runs under Wine, where "\\?\unix\dev\urandom" maps to the host /dev/urandom --
+ * cryptographically strong on every CPU, exactly what Wine's builtin cryptbase
+ * uses. Imports only kernel32, so no advapi32/bcrypt loop. */
+static int read_dev_urandom(unsigned char *p, ULONG len)
+{
+    HANDLE h = CreateFileW(L"\\\\?\\unix\\dev\\urandom", GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                           OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE)
+        return 0;
+    ULONG total = 0;
+    int ok = 1;
+    while (total < len) {
+        DWORD got = 0;
+        if (!ReadFile(h, p + total, len - total, &got, NULL) || got == 0) {
+            ok = 0;
+            break;
+        }
+        total += got;
+    }
+    CloseHandle(h);
+    return ok;
+}
+
+/* Fallback: RDRAND. CPUID.01H:ECX.RDRAND[bit 30] -- the instruction faults (#UD)
+ * on a CPU without it, so gate on the feature bit first. Self-contained; no loop. */
 static int have_rdrand(void)
 {
     int regs[4];
@@ -33,64 +55,39 @@ static int have_rdrand(void)
     return (regs[2] >> 30) & 1;
 }
 
-static int rdrand64(unsigned long long *out)
+static int fill_rdrand(unsigned char *p, ULONG len)
 {
-    for (int i = 0; i < 32; i++)
-        if (_rdrand64_step(out))
-            return 1;
-    return 0;
+    if (!have_rdrand())
+        return 0;
+    ULONG i = 0;
+    while (i < len) {
+        unsigned long long r;
+        int ok = 0;
+        for (int t = 0; t < 32 && !ok; t++)
+            ok = _rdrand64_step(&r);
+        if (!ok)
+            return 0;
+        ULONG n = (len - i < sizeof(r)) ? (len - i) : (ULONG)sizeof(r);
+        memcpy(p + i, &r, n);
+        i += n;
+    }
+    return 1;
 }
 
-/* Self-contained fallback for the rare CPU without RDRAND: a splitmix64 stream
- * seeded from process/time/address state. Only kernel32 imports, no advapi32
- * loop. Best-effort, not a hardware RNG -- RDRAND is the real path. */
-static unsigned long long seed_state(void)
-{
-    LARGE_INTEGER pc;
-    QueryPerformanceCounter(&pc);
-    unsigned long long s = (unsigned long long)pc.QuadPart;
-    s ^= (unsigned long long)GetTickCount64() * 0x9E3779B97F4A7C15ULL;
-    s ^= (unsigned long long)GetCurrentProcessId() << 32;
-    s ^= (unsigned long long)GetCurrentThreadId();
-    s ^= (unsigned long long)(uintptr_t)&pc;
-    return s ? s : 0x1234567890ABCDEFULL;
-}
-
-static unsigned long long splitmix64(unsigned long long *st)
-{
-    unsigned long long z = (*st += 0x9E3779B97F4A7C15ULL);
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-    return z ^ (z >> 31);
-}
-
-/* SystemFunction036 == RtlGenRandom: fill the buffer with random bytes.
- * Returns TRUE on success. */
+/* SystemFunction036 == RtlGenRandom: fill the buffer with cryptographic random
+ * bytes. Fail closed (FALSE) rather than return weak/predictable bytes if
+ * neither strong source is available. Returns TRUE on success. */
 __declspec(dllexport) BOOLEAN WINAPI
 SystemFunction036(PVOID buffer, ULONG length)
 {
     if (!buffer && length)
         return FALSE;
     unsigned char *p = (unsigned char *)buffer;
-    int hw = have_rdrand();
-    unsigned long long st = hw ? 0 : seed_state();
-    ULONG i = 0;
-    while (i < length) {
-        unsigned long long r;
-        if (hw) {
-            if (!rdrand64(&r)) {        /* transient exhaustion: drop to fallback */
-                hw = 0;
-                st = seed_state();
-                r = splitmix64(&st);
-            }
-        } else {
-            r = splitmix64(&st);
-        }
-        ULONG n = (length - i < sizeof(r)) ? (length - i) : (ULONG)sizeof(r);
-        memcpy(p + i, &r, n);
-        i += n;
-    }
-    return TRUE;
+    if (read_dev_urandom(p, length))
+        return TRUE;
+    if (fill_rdrand(p, length))
+        return TRUE;
+    return FALSE;
 }
 
 /* SystemFunction040 == RtlEncryptMemory, SystemFunction041 == RtlDecryptMemory.
