@@ -22,9 +22,9 @@
 #include <string.h>
 
 /* Primary: read the host CSPRNG through Wine's unix path. This DLL only ever
- * runs under Wine, where "\\?\unix\dev\urandom" maps to the host /dev/urandom --
- * cryptographically strong on every CPU, exactly what Wine's builtin cryptbase
- * uses. Imports only kernel32, so no advapi32/bcrypt loop. */
+ * runs under Wine, where "\\?\unix\dev\urandom" maps to the host /dev/urandom,
+ * cryptographically strong on every CPU. Imports only kernel32, so no
+ * advapi32/bcrypt loop. */
 static int read_dev_urandom(unsigned char *p, ULONG len)
 {
     HANDLE h = CreateFileW(L"\\\\?\\unix\\dev\\urandom", GENERIC_READ,
