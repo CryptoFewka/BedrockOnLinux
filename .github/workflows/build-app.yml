@@ -42,12 +42,13 @@ permissions:
   contents: read
 
 jobs:
+  # Build with least privilege: read-only token, no attest/publish scopes. The
+  # artifacts are handed to the elevated `publish` job below, so nothing that
+  # runs build scripts / downloads deps ever holds a write or signing token.
   build:
     runs-on: ubuntu-24.04
     permissions:
-      contents: write
-      id-token: write
-      attestations: write
+      contents: read
     env:
       GH_TOKEN: ${{ github.token }}
       APPIMAGE_EXTRACT_AND_RUN: "1"
@@ -128,8 +129,41 @@ jobs:
           scripts/build-release.sh
           echo "VER=$(grep -m1 '^VERSION = ' bol/config.py | cut -d'"' -f2)" >> "$GITHUB_ENV"
 
+      - name: Upload the built artifacts for the publish job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: app-artifacts
+          if-no-files-found: error
+          retention-days: 1
+          path: |
+            dist/bedrock-on-linux_*.deb
+            dist/bedrock-on-linux-*.pyz
+            dist/BedrockOnLinux-*-x86_64.AppImage
+            dist/BedrockOnLinux-*-x86_64.flatpak
+            dist/BedrockOnLinux-*-SHA256SUMS
+
+  # Attest + publish only. Runs on tag push or an explicit publish request, holds
+  # the write/id-token/attestations scopes the build job does not, and touches
+  # only the already-built artifacts (never build scripts or third-party deps).
+  publish:
+    needs: build
+    if: ${{ github.event_name == 'push' || inputs.publish }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Download the built artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: app-artifacts
+          path: dist
+
       - name: Attest application artifacts
-        if: ${{ github.event_name == 'push' || inputs.publish }}
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: |
@@ -140,7 +174,6 @@ jobs:
             dist/BedrockOnLinux-*-SHA256SUMS
 
       - name: Compute release metadata + bill of materials
-        if: ${{ github.event_name == 'push' || inputs.publish }}
         run: |
           ver="$(grep -m1 '^VERSION = ' bol/config.py | cut -d'"' -f2)"
           eng_rev="$(grep -m1 '^WINEGDK_BUILD_REV = ' bol/config.py | cut -d'"' -f2)"
@@ -173,7 +206,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Roll the nightly tag to the current commit
-        if: ${{ (github.event_name == 'push' || inputs.publish) && env.RELEASE_TAG == 'nightly' }}
+        if: ${{ env.RELEASE_TAG == 'nightly' }}
         run: |
           # softprops does not move an existing tag, so delete the rolling nightly
           # release + tag first; the publish step recreates it at the current commit
@@ -185,7 +218,6 @@ jobs:
           fi
 
       - name: Publish the application release
-        if: ${{ github.event_name == 'push' || inputs.publish }}
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}

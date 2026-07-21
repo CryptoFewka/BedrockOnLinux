@@ -31,10 +31,12 @@ cp -r "$SRC/bol"                       "$PKG/usr/lib/bedrock-on-linux/bol"
 # customtkinter's theme/font assets load fine. cryptography/tk stay apt deps.
 # python-xlib (+ six) is bundled the same way for bol.x11's primary-monitor
 # lookup; it's optional (bol.x11 falls back to the xrandr CLI without it).
-python3 -m pip install --quiet --no-cache-dir --no-compile --no-deps --target \
+# Hash-pinned, wheels only, no sdist builds: closure + SHA-256s live in
+# third_party/requirements-deb.txt (--require-hashes rejects any mismatch).
+python3 -m pip install --quiet --no-cache-dir --no-compile --no-deps \
+  --require-hashes --only-binary=:all: --target \
   "$PKG/usr/lib/bedrock-on-linux" \
-  'customtkinter==5.2.2' 'darkdetect==0.8.0' 'packaging==26.2' \
-  'python-xlib==0.33' 'six==1.17.0'
+  -r "$SRC/third_party/requirements-deb.txt"
 rm -rf "$PKG/usr/lib/bedrock-on-linux"/bin 2>/dev/null || true
 find "$PKG/usr/lib/bedrock-on-linux" -name __pycache__ -type d -exec rm -rf {} +
 for metadata in \
