@@ -56,6 +56,7 @@ def _xrandr_provider_count(env: Mapping[str, str], runner=None) -> Optional[int]
             env=dict(env),
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=4,
             check=False,
         )
@@ -448,6 +449,7 @@ def _kernel_journal_text(binary: str, runner, boot: int) -> Optional[str]:
             args,
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=5,
             check=False,
         )
