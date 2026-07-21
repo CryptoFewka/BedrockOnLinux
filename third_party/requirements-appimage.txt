@@ -1,0 +1,43 @@
+# Hash-pinned wheel closure bundled into the AppImage (scripts/build-appimage.sh).
+# Install with: pip install --require-hashes --only-binary=:all: --no-deps -r <this>
+#   --require-hashes  every wheel must match a pin below (no silent substitution)
+#   --only-binary=:all:  never build from an sdist (no arbitrary setup.py at build)
+#   --no-deps  the list is the full, curated runtime closure; do not resolve more
+# Target interpreter: the bundled CPython 3.12 on the glibc-2.31 (Bullseye) base.
+# Regenerate the hashes from PyPI (pypi.org/pypi/<pkg>/<ver>/json) when a version
+# bumps; keep versions in step with build-deb.sh and the Flatpak manifest.
+
+# cryptography signs the MSA login; kept <44 for the glibc-2.31 baseline. abi3
+# wheels, so one set covers every CPython >= 3.7 on this base.
+cryptography==43.0.3 \
+    --hash=sha256:7e1ce50266f4f70bf41a2c6dc4358afadae90e2a1e5342d3c08883df1675374f \
+    --hash=sha256:74f57f24754fe349223792466a709f8e0c093205ff0dca557af51072ff47ab18 \
+    --hash=sha256:81ef806b1fef6b06dcebad789f988d3b37ccaee225695cf3e07648eee0fc6b73 \
+    --hash=sha256:0f996e7268af62598f2fc1204afa98a3b5712313a55c4c9d434aef49cadc91d4 \
+    --hash=sha256:c2e6fc39c4ab499049df3bdf567f768a723a5e8464816e8f009f121a5a9f4405 \
+    --hash=sha256:df6b6c6d742395dd77a23ea3728ab62f98379eff8fb61be2744d4679ab678f73 \
+    --hash=sha256:281c945d0e28c92ca5e5930664c1cefd85efe80e5c0d2bc58dd63383fda29f83 \
+    --hash=sha256:1ec0bcf7e17c0c5669d881b1cd38c4972fade441b27bda1051665faaa89bdcaa
+
+certifi==2026.6.17 \
+    --hash=sha256:2227dcbaafe0d2f59279d1762ddddc37783ed4354594f194ffc31d20f41fc3db
+
+# cffi/pycparser back cryptography's FFI; cffi is compiled, so its wheels are
+# CPython-3.12 + linux/x86_64 specific.
+cffi==2.0.0 \
+    --hash=sha256:3e17ed538242334bf70832644a32a7aae3d83b57567f9fd60a26257e992b79ba \
+    --hash=sha256:2c8f814d84194c9ea681642fd164267891702542f028a15fc97d4674b6206187
+pycparser==3.0 \
+    --hash=sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992
+
+# GUI toolkit + X11 primary-monitor lookup (pure Python).
+customtkinter==5.2.2 \
+    --hash=sha256:14ad3e7cd3cb3b9eb642b9d4e8711ae80d3f79fb82545ad11258eeffb2e6b37c
+darkdetect==0.8.0 \
+    --hash=sha256:a7509ccf517eaad92b31c214f593dbcf138ea8a43b2935406bbd565e15527a85
+packaging==26.2 \
+    --hash=sha256:5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e
+python-xlib==0.33 \
+    --hash=sha256:c3534038d42e0df2f1392a1b30a15a4ff5fdc2b86cfa94f072bf11b10a164398
+six==1.17.0 \
+    --hash=sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274

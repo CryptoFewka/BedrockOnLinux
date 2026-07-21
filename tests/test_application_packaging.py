@@ -28,18 +28,30 @@ class ApplicationPackagingPolicyTests(unittest.TestCase):
         self.assertIn('rm -f "$DYN"/_crypt.*.so', script)
         self.assertIn('"libcrypt.so.1", "libXss.so.1"', script)
         self.assertIn('runtime is not statically linked', script)
+        # Wheels are hash-pinned, binary-only, no sdist builds; the pinned
+        # closure lives in the requirements file the script installs from.
+        self.assertIn("--require-hashes --only-binary=:all:", script)
+        self.assertIn("third_party/requirements-appimage.txt", script)
+        reqs = (ROOT / "third_party/requirements-appimage.txt").read_text(
+            encoding="utf-8")
         for requirement in (
                 "cryptography==43.0.3", "cffi==2.0.0", "pycparser==3.0",
                 "customtkinter==5.2.2", "darkdetect==0.8.0",
                 "packaging==26.2"):
-            self.assertIn(requirement, script)
+            self.assertIn(requirement, reqs)
+        self.assertIn("--hash=sha256:", reqs)
 
     def test_deb_preserves_dependency_licenses_and_normalizes_modes(self):
         script = (ROOT / "scripts/build-deb.sh").read_text(encoding="utf-8")
+        self.assertIn("--require-hashes --only-binary=:all:", script)
+        self.assertIn("third_party/requirements-deb.txt", script)
+        reqs = (ROOT / "third_party/requirements-deb.txt").read_text(
+            encoding="utf-8")
         for requirement in (
                 "customtkinter==5.2.2", "darkdetect==0.8.0",
                 "packaging==26.2"):
-            self.assertIn(requirement, script)
+            self.assertIn(requirement, reqs)
+        self.assertIn("--hash=sha256:", reqs)
         self.assertNotIn('*.dist-info', script)
         self.assertIn("usr/share/doc/bedrock-on-linux/copyright", script)
         self.assertIn("-iname 'LICENSE*'", script)

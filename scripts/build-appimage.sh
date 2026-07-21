@@ -134,12 +134,11 @@ for library in "$PYLIB/libtcl8.6.so" "$PYLIB/libtk8.6.so"; do
 done
 
 echo "== installing portable cryptography + certifi + customtkinter + python-xlib into the bundle"
+# Hash-pinned, wheels only, no sdist builds: the closure + SHA-256s live in
+# third_party/requirements-appimage.txt (--require-hashes rejects any mismatch).
 "$PYBIN" -m pip install --no-cache-dir --no-compile \
-    --no-deps \
-    'cryptography==43.0.3' 'certifi==2026.6.17' \
-    'cffi==2.0.0' 'pycparser==3.0' \
-    'customtkinter==5.2.2' 'darkdetect==0.8.0' 'packaging==26.2' \
-    'python-xlib==0.33' 'six==1.17.0' \
+    --no-deps --require-hashes --only-binary=:all: \
+    -r "$SRC/third_party/requirements-appimage.txt" \
     >/dev/null
 
 PY3="$PYLIB/python3.12"
