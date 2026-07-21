@@ -15,6 +15,7 @@ from .auth import (
     NativeAuth,
     msa_logout,
     msa_signed_in,
+    msa_gamertag,
 )
 from .config import LOGS, PRETTY, VERSION
 from .content import _mojang_dir, import_content
@@ -54,27 +55,36 @@ def _desktop_error(message):
 # Palette
 # --------------------------------------------------------------------------
 class Theme:
-    BG        = "#0f1115"   # window
-    CARD      = "#181b22"   # primary panels
-    CARD_2    = "#20242e"   # nested surfaces (fields, rows)
-    CARD_3    = "#2a2f3b"   # hover / raised state
-    BORDER    = "#2a2e38"   # border outline
+    BG          = "#0f1115"   # window
+    CARD        = "#181b22"   # primary panels
+    CARD_2      = "#20242e"   # nested surfaces (fields, rows)
+    CARD_3      = "#2a2f3b"   # hover / raised state
+    BORDER      = "#2a2e38"   # border outline
 
-    FG        = "#f2f4f7"   # primary
-    SUB       = "#8b93a7"   # secondary
-    MUTED     = "#5d6577"   # tertiary
+    FG          = "#f2f4f7"   # primary
+    SUB         = "#8b93a7"   # secondary
+    MUTED       = "#5d6577"   # tertiary
 
-    GREEN     = "#43a047"   # play
-    GREEN_HOV = "#4fc153"   # hover play
-    GREEN_DIM = "#1c2c1c"   # dimmed play
+    GREEN       = "#43a047"   # play
+    GREEN_HOV   = "#4fc153"   # hover play
+    GREEN_DIM   = "#1c2c1c"   # dimmed play
+    GREEN_LIGHT = "#cfe8c2"   # active
+    GREEN_MUTED = "#9fb89a"   # muted
+    GREEN_DARK  = "#33421f"   # inactive
 
-    GOLD      = "#e3b34a"   # beta
-    GOLD_DIM  = "#33291a"   # dimmed beta
+    GOLD        = "#e3b34a"   # beta
+    GOLD_HOV    = "#f3c35a"   # hover beta
+    GOLD_DIM    = "#33291a"   # dimmed beta
 
-    RED       = "#e2685a"   # danger
-    RED_DIM   = "#341f1d"   # dommed danger
+    RED         = "#e2685a"   # danger
+    RED_HOV     = "#ea7c70"   # hover danger
+    RED_DIM     = "#341f1d"   # dommed danger
 
-    BLUE      = "#5b9bd9"   # other
+    BLUE        = "#5b9bd9"   # other
+    BROWN       = "#8C6446"   # code text
+
+    CONSOLE_BG  = "#0b0d11"   # background
+    CONSOLE_FG  = "#7fd97f"   # foreground
 
 
 def gui():
@@ -96,6 +106,13 @@ def gui():
         return
 
     T = Theme
+    from .util import load_settings, save_settings
+    s = load_settings()
+    _init_beta = s.get("ui_is_beta", False)
+    T.THEME_ACCENT = T.GOLD if _init_beta else T.GREEN
+    T.THEME_HOV    = T.GOLD_HOV if _init_beta else T.GREEN_HOV
+    T.THEME_DIM    = T.GOLD_DIM if _init_beta else T.GREEN_DIM
+
     ctk.set_appearance_mode("dark")
     try:
         root = ctk.CTk(className=PRETTY)
@@ -154,11 +171,11 @@ def gui():
 
     def mkbtn(parent, text, cmd, kind="ghost", **kw):
         base = {
-            "play":    dict(fg_color=T.GREEN, hover_color=T.GREEN_HOV,
+            "play":    dict(fg_color=T.THEME_ACCENT, hover_color=T.THEME_HOV,
                              text_color="white"),
-            "primary": dict(fg_color=T.GREEN, hover_color=T.GREEN_HOV,
+            "primary": dict(fg_color=T.THEME_ACCENT, hover_color=T.THEME_HOV,
                              text_color="white"),
-            "danger":  dict(fg_color=T.RED, hover_color="#ea7c70",
+            "danger":  dict(fg_color=T.RED, hover_color=T.RED_HOV,
                              text_color="white"),
             "ghost":   dict(fg_color=T.CARD_2, hover_color=T.CARD_3,
                              text_color=T.FG),
@@ -237,33 +254,52 @@ def gui():
 
     brand = ctk.CTkFrame(top, fg_color=T.CARD, corner_radius=14)
     brand.pack(side="left")
-    ll = logo_label(brand, 30, T.CARD)
-    if ll:
-        ll.pack(side="left", padx=(10, 8), pady=8)
-    brand_lbl = ctk.CTkLabel(brand, text="BedrockOnLinux", font=font(16, "bold"),
-                             text_color=T.FG, cursor="hand2")
-    brand_lbl.pack(side="left", pady=8)
+    icon_btn = ctk.CTkFrame(brand, fg_color=T.CARD_2, corner_radius=8)
+    icon_btn.pack(side="left", padx=(6, 3), pady=5)
     
-    brand_lbl.bind("<Button-1>", lambda e: subprocess.Popen(
-        ["xdg-open", "https://github.com/Wyze3306/BedrockOnLinux"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
-    brand_lbl.bind("<Enter>", lambda e: brand_lbl.configure(text_color=T.GREEN))
+    ll = logo_label(icon_btn, 24, T.CARD_2)
+    if not ll:
+        ll = tk.Label(icon_btn, text="GitHub", bg=T.CARD_2, fg=T.SUB, font=("sans-serif", 10, "bold"), bd=0)
+    ll.pack(padx=6, pady=6)
+
+    brand_lbl = ctk.CTkLabel(brand, text="What's New", font=font(16, "bold"),
+                             text_color=T.FG)
+    brand_lbl.pack(side="left", padx=(3, 6), pady=8)
+    
+    brand_lbl.bind("<Button-1>", lambda e: toggle_changelog())
+    brand_lbl.bind("<Enter>", lambda e: brand_lbl.configure(text_color=T.THEME_ACCENT))
     brand_lbl.bind("<Leave>", lambda e: brand_lbl.configure(text_color=T.FG))
+    Tooltip(brand_lbl, "Changelog")
 
     ctk.CTkLabel(brand, text=f"v{VERSION}", font=font(12, "bold"), text_color=T.SUB
-                 ).pack(side="left", padx=(6, 12), pady=8)
+                 ).pack(side="left", padx=(0, 10), pady=8)
+
+    def _open_github(_e=None):
+        subprocess.Popen(
+            ["xdg-open", "https://github.com/Wyze3306/BedrockOnLinux"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+    def _icon_hover(on):
+        c = T.CARD_3 if on else T.CARD_2
+        icon_btn.configure(fg_color=c)
+        if ll:
+            ll.configure(bg=c)
+            
+    for w in [icon_btn, ll]:
+        w.bind("<Button-1>", _open_github)
+        w.bind("<Enter>", lambda e: _icon_hover(True))
+        w.bind("<Leave>", lambda e: _icon_hover(False))
+        Tooltip(w, "GitHub")
 
     acct = ctk.CTkFrame(top, fg_color=T.CARD, corner_radius=14)
     acct.pack(side="right")
-    
-    ctk.CTkLabel(top, text='"Minecraft: Bedrock Edition for Linux"',
-                 font=font(14, "bold"), text_color=T.MUTED).place(relx=0.5, rely=0.5, anchor="center")
     acct_dot = ctk.CTkLabel(acct, text="●", text_color=T.SUB, font=font(12),
                              width=10)
     acct_dot.pack(side="left", padx=(14, 4), pady=8)
     acct_txt = tk.StringVar(value="Not signed in")
-    ctk.CTkLabel(acct, textvariable=acct_txt, text_color=T.FG,
-                 font=font(13)).pack(side="left", padx=(0, 10))
+    acct_txt_lbl = ctk.CTkLabel(acct, textvariable=acct_txt, text_color=T.FG,
+                 font=font(13))
+    acct_txt_lbl.pack(side="left", padx=(0, 8))
     acct_btn = mkbtn(acct, "Sign in", lambda: acct_click(), kind="ghost",
                       width=88, height=30, font=font(12, "bold"))
     acct_btn.pack(side="left", padx=(0, 8), pady=8)
@@ -274,9 +310,22 @@ def gui():
     view_area = ctk.CTkFrame(root, fg_color="transparent")
     view_area.pack(fill="both", expand=True, padx=22, pady=6)
 
+    hero = ctk.CTkFrame(view_area, fg_color=T.CARD, corner_radius=18,
+                         border_width=1, border_color=T.BORDER)
+    hw = ctk.CTkFrame(hero, fg_color="transparent")
+    hw.place(relx=0.5, rely=0.44, anchor="center")
+    hl = logo_label(hw, 118, T.CARD)
+    if hl:
+        hl.pack()
+    ctk.CTkLabel(hw, text="Minecraft Bedrock", font=font(28, "bold"),
+                 text_color=T.FG).pack(pady=(16, 2))
+    ctk.CTkLabel(hw, text="Bedrock Edition for Linux", font=font(13),
+                 text_color=T.SUB).pack()
+
     selected_chip = ctk.CTkLabel(
-        view_area, text="", font=font(12, "bold"), text_color=T.GREEN,
-        fg_color=T.GREEN_DIM, corner_radius=8)
+        hw, text="", font=font(12, "bold"), text_color=T.THEME_ACCENT,
+        fg_color=T.THEME_DIM, bg_color=T.CARD, corner_radius=8)
+    selected_chip.pack(pady=(14, 0))
 
     # ==================================================================
     # Status + progress
@@ -288,7 +337,7 @@ def gui():
                                font=font(12), anchor="w")
     status_lbl.pack(fill="x")
     prog = ctk.CTkProgressBar(status, height=8, corner_radius=4,
-                               progress_color=T.GREEN, fg_color=T.CARD_2)
+                               progress_color=T.THEME_ACCENT, fg_color=T.CARD_2)
     prog.set(0)
 
     # ==================================================================
@@ -339,11 +388,65 @@ def gui():
             selected_chip.configure(text="")
             return
         is_beta = "beta" in lab
+        
+        s = load_settings()
+        if s.get("ui_is_beta") != is_beta:
+            s["ui_is_beta"] = is_beta
+            save_settings(s)
+            
         selected_chip.configure(
             text=f"  {lab.split('  ')[0]}"
                  f"{'  ·  BETA' if is_beta else ''}  ",
             text_color=T.GOLD if is_beta else T.GREEN,
             fg_color=T.GOLD_DIM if is_beta else T.GREEN_DIM)
+
+        def _sync_theme(w):
+            if w == acct_dot:
+                return
+            c_new = T.GOLD if is_beta else T.GREEN
+            h_new = T.GOLD_HOV if is_beta else T.GREEN_HOV
+            c_old = T.GREEN if is_beta else T.GOLD
+            h_old = T.GREEN_HOV if is_beta else T.GOLD_HOV
+            
+            T.THEME_ACCENT = c_new
+            T.THEME_HOV = h_new
+            T.THEME_DIM = T.GOLD_DIM if is_beta else T.GREEN_DIM
+            
+            for attr in ("fg_color", "text_color", "progress_color"):
+                try:
+                    if w.cget(attr) == c_old:
+                        w.configure(**{attr: c_new})
+                except Exception:
+                    pass
+            try:
+                if w.cget("hover_color") == h_old:
+                    w.configure(hover_color=h_new)
+            except Exception:
+                pass
+            try:
+                if w.cget("segmented_button_selected_color") == c_old:
+                    w.configure(segmented_button_selected_color=c_new,
+                                segmented_button_selected_hover_color=h_new)
+            except Exception:
+                pass
+            if hasattr(w, "_segmented_button"):
+                try: w._segmented_button.configure(selected_color=c_new, selected_hover_color=h_new)
+                except Exception: pass
+            if hasattr(w, "tag_configure"):
+                try: w.tag_configure("link", foreground=c_new)
+                except Exception: pass
+                try: w.tag_configure("release_title", foreground=c_new)
+                except Exception: pass
+            elif hasattr(w, "_textbox"):
+                try: w._textbox.tag_configure("link", foreground=c_new)
+                except Exception: pass
+                try: w._textbox.tag_configure("release_title", foreground=c_new)
+                except Exception: pass
+                
+            for child in w.winfo_children():
+                _sync_theme(child)
+                
+        _sync_theme(root)
 
     def open_picker():
         if _pick["win"] is not None:
@@ -363,7 +466,7 @@ def gui():
         else:
             h = min(360, 40 + 32 * min(len(labels), 8))
         
-        win = ctk.CTkFrame(root, width=w, height=h, fg_color=T.CARD_2, bg_color=T.CARD_2, border_width=1, border_color=T.BORDER, corner_radius=12)
+        win = ctk.CTkFrame(root, width=w, height=h, fg_color=T.CARD_2, bg_color=T.CARD, border_width=1, border_color=T.BORDER, corner_radius=12)
         _pick["win"] = win
         win.pack_propagate(False)
         win.place(x=x, y=y - h - 4)
@@ -427,9 +530,10 @@ def gui():
         _pick["buttons"] = []
         for lab in labels:
             is_beta = "beta" in lab
+            c_cur = T.GOLD if "beta" in cur else T.GREEN
             row = ctk.CTkButton(
                 sf, text=lab, anchor="w", height=30, corner_radius=6,
-                fg_color=T.GREEN if lab == cur else "transparent",
+                fg_color=c_cur if lab == cur else "transparent",
                 hover_color=T.CARD_3,
                 text_color="white" if lab == cur else (T.GOLD if is_beta else T.FG),
                 font=font(12), command=lambda l=lab: set_version(l))
@@ -490,7 +594,7 @@ def gui():
 
     root.bind_all("<Button-1>", global_click, add="+")
 
-    ver_field = ctk.CTkFrame(vbox, fg_color=T.CARD_2, corner_radius=10,
+    ver_field = ctk.CTkFrame(vbox, fg_color=T.CARD_2, bg_color=T.CARD, corner_radius=10,
                               width=220, height=38)
     ver_field.pack(anchor="w")
     ver_field.pack_propagate(False)
@@ -536,7 +640,7 @@ def gui():
     ctk.CTkLabel(log_head, text="ACTIVITY LOG", text_color=T.MUTED,
                  font=font(10, "bold")).pack(side="left")
 
-    logbox = tk.Text(detwrap, height=10, bg="#0b0d11", fg="#7fd97f", bd=0,
+    logbox = tk.Text(detwrap, height=10, bg=T.CONSOLE_BG, fg=T.CONSOLE_FG, bd=0,
                       font=(MONO, 10), highlightthickness=0,
                       padx=12, pady=10, insertbackground=T.FG, wrap="word")
 
@@ -666,39 +770,72 @@ def gui():
     def acct_state(ph):
         if ph == "in":
             acct_dot.configure(text_color=T.GREEN)
+            acct_txt_lbl.configure(cursor="", text_color=T.FG)
             acct_txt.set("Signed in")
-            acct_btn.configure(text="Sign out")
+            acct_btn.configure(text="Sign out", fg_color=T.CARD_2, hover_color=T.CARD_3, text_color=T.FG)
             acct_btn._mode = "out"
+            acct_btn._confirm_out = False
         elif ph == "auth":
+            acct_txt_lbl.configure(cursor="", text_color=T.FG)
             acct_dot.configure(text_color=T.GOLD)
             acct_txt.set("Sign-in pending…")
             acct_btn._mode = "out"
+            acct_btn._confirm_out = False
         else:
+            acct_txt_lbl.configure(cursor="", text_color=T.FG)
             acct_dot.configure(text_color=T.SUB)
             acct_txt.set("Not signed in")
-            acct_btn.configure(text="Sign in")
+            acct_btn.configure(text="Sign in", fg_color=T.CARD_2, hover_color=T.CARD_3, text_color=T.FG)
             acct_btn._mode = "in"
+            acct_btn._confirm_out = False
 
     def acct_click():
         if getattr(acct_btn, "_mode", "in") == "out":
-            na.stop()
-            try:
-                with prefix_operation_lock("sign out of Microsoft"):
-                    msa_logout()
-            except BolError as exc:
-                warn(str(exc))
-                acct_state("in" if msa_signed_in() else "out")
-                return
-            acct_state("out")
+            if getattr(acct_btn, "_confirm_out", False):
+                na.stop()
+                try:
+                    with prefix_operation_lock("sign out of Microsoft"):
+                        msa_logout()
+                except BolError as exc:
+                    warn(str(exc))
+                    acct_state("in" if msa_signed_in() else "out")
+                    return
+                acct_state("out")
+            else:
+                acct_btn._confirm_out = True
+                acct_btn.configure(text="Sign out?", fg_color=T.RED, hover_color=T.RED_HOV, text_color="white")
         else:
             threading.Thread(target=lambda: na.start(on_auth, on_online),
                               daemon=True).start()
+
+    def _cancel_signout(e):
+        if getattr(acct_btn, "_confirm_out", False):
+            cp = str(e.widget)
+            bp = str(acct_btn)
+            if cp != bp and not cp.startswith(bp + "."):
+                acct_btn._confirm_out = False
+                acct_btn.configure(text="Sign out", fg_color=T.CARD_2, hover_color=T.CARD_3, text_color=T.FG)
+    root.bind_all("<Button-1>", _cancel_signout, add="+")
 
     def on_auth(url, code):
         root.after(0, lambda: (acct_state("auth"), code_dialog(url, code)))
 
     def on_online():
         root.after(0, lambda: acct_state("in"))
+        def _bg_fetch():
+            from .auth import msa_load, msa_refresh, xbl_preauth, _account_cache_epoch
+            from .config import DATA
+            try:
+                tok = msa_load()
+                if not tok: return
+                fresh = msa_refresh(tok.get("refresh_token"))
+                if fresh and fresh.get("access_token"):
+                    ep = _account_cache_epoch(DATA / "winegdk-preauth")
+                    if xbl_preauth(fresh.get("access_token"), ep):
+                        root.after(0, lambda: acct_state("in"))
+            except Exception:
+                pass
+        threading.Thread(target=_bg_fetch, daemon=True).start()
 
     def code_dialog(url, code):
         d = dialog("Sign in to Microsoft", 380, 220)
@@ -811,18 +948,24 @@ def gui():
     def toggle_settings():
         if settings_view.winfo_ismapped():
             settings_view.pack_forget()
-            changelog_view.pack(fill="both", expand=True)
+            hero.pack(fill="both", expand=True)
             settings_btn.configure(fg_color=T.CARD_2)
-            if ui["changelog_head"]:
-                selected_chip.place(in_=ui["changelog_head"], relx=0.5, rely=0.5, anchor="center")
-                selected_chip.lift()
         else:
+            hero.pack_forget()
             changelog_view.pack_forget()
             settings_view.pack(fill="both", expand=True)
             settings_btn.configure(fg_color=T.CARD_3)
-            if ui["settings_head"]:
-                selected_chip.place(in_=ui["settings_head"], relx=0.5, rely=0.5, anchor="center")
-                selected_chip.lift()
+
+    def toggle_changelog():
+        if changelog_view.winfo_ismapped():
+            changelog_view.pack_forget()
+            hero.pack(fill="both", expand=True)
+        else:
+            hero.pack_forget()
+            settings_view.pack_forget()
+            changelog_view.pack(fill="both", expand=True)
+            settings_btn.configure(fg_color=T.CARD_2)
+            load_changelogs()
 
     def _build_settings():
         d = root
@@ -838,8 +981,8 @@ def gui():
 
         tabs = ctk.CTkTabview(
             outer, fg_color=T.CARD_2, segmented_button_fg_color=T.CARD_2,
-            segmented_button_selected_color=T.GREEN,
-            segmented_button_selected_hover_color=T.GREEN_HOV,
+            segmented_button_selected_color=T.THEME_ACCENT,
+            segmented_button_selected_hover_color=T.THEME_HOV,
             segmented_button_unselected_color=T.CARD_2,
             text_color=T.FG, corner_radius=12)
         tabs.pack(fill="both", expand=True)
@@ -858,7 +1001,7 @@ def gui():
             load_changelogs(force=True)
         ctk.CTkSwitch(tab_general, text="Show beta / preview versions",
                       variable=beta_v, command=save_beta,
-                      progress_color=T.GREEN, font=font(13)
+                      progress_color=T.THEME_ACCENT, font=font(13)
                       ).pack(anchor="w", pady=8, padx=4)
 
         confine_v = tk.BooleanVar(
@@ -871,7 +1014,7 @@ def gui():
         ctk.CTkSwitch(tab_general, text="Keep the mouse inside the window\n"
                       "(fixes the cursor escaping in windowed mode)",
                       variable=confine_v, command=save_confine,
-                      progress_color=T.GREEN, font=font(13)
+                      progress_color=T.THEME_ACCENT, font=font(13)
                       ).pack(anchor="w", pady=8, padx=4)
 
         # ---- Advanced ---------------------------------------------------
@@ -884,7 +1027,7 @@ def gui():
         ctk.CTkSwitch(tab_advanced, text="Advanced diagnostics\n"
                       "(verbose logs — for bug reports)",
                       variable=diag_v, command=save_diag,
-                      progress_color=T.GREEN, font=font(13)
+                      progress_color=T.THEME_ACCENT, font=font(13)
                       ).pack(anchor="w", pady=(4, 12), padx=4)
 
         ctk.CTkLabel(tab_advanced, text="Custom environment variables",
@@ -1347,7 +1490,7 @@ def gui():
                                  spacing1=4, spacing3=2)
             widget.tag_configure("code", font=(MONO, 9),
                                  background=T.CARD_2,
-                                 foreground="#8C6446")
+                                 foreground=T.BROWN)
             widget.tag_configure("code_block", font=(MONO, 9),
                                  background=T.CARD_2, foreground=T.FG,
                                  lmargin1=10, rmargin=10,
@@ -1355,7 +1498,7 @@ def gui():
             widget.tag_configure("bullet", font=(f_family, 11),
                                  lmargin1=14, lmargin2=24)
             widget.tag_configure("link", underline=True,
-                                 foreground=T.GREEN)
+                                 foreground=T.THEME_ACCENT)
 
             def on_link_click(event):
                 idx = widget.index(f"@{event.x},{event.y}")
@@ -1376,7 +1519,7 @@ def gui():
 
             widget.tag_configure("release_title",
                                  font=(f_family, 15, "bold"),
-                                 foreground=T.GREEN,
+                                 foreground=T.THEME_ACCENT,
                                  spacing1=8, spacing3=1)
             widget.tag_configure("release_date", font=(f_family, 11),
                                  foreground=T.SUB,
@@ -1452,14 +1595,16 @@ def gui():
 
         ui["changelog_head"] = ctk.CTkFrame(outer, fg_color="transparent", height=28)
         ui["changelog_head"].pack(fill="x", pady=(0, 12))
-        selected_chip.place(in_=ui["changelog_head"], relx=0.5, rely=0.5, anchor="center")
-        selected_chip.lift()
+        ctk.CTkLabel(ui["changelog_head"], text="Changelog", font=font(16, "bold"),
+                     text_color=T.FG).pack(side="left")
+        mkbtn(ui["changelog_head"], "← Back", toggle_changelog, kind="flat", width=76,
+              height=28, font=font(12)).pack(side="right")
 
         tabs = ctk.CTkTabview(
             outer, fg_color=T.CARD_2,
             segmented_button_fg_color=T.CARD_2,
-            segmented_button_selected_color=T.GREEN,
-            segmented_button_selected_hover_color=T.GREEN_HOV,
+            segmented_button_selected_color=T.THEME_ACCENT,
+            segmented_button_selected_hover_color=T.THEME_HOV,
             segmented_button_unselected_color=T.CARD_2,
             text_color=T.FG, corner_radius=12)
         tabs.pack(fill="both", expand=True)
@@ -1525,10 +1670,10 @@ def gui():
         bn = ctk.CTkFrame(root, fg_color=T.GREEN_DIM, corner_radius=12,
                            border_width=1, border_color=T.GREEN)
         ctk.CTkLabel(bn, text=f"⟳   Update available — v{rel['version']}   "
-                     f"(you have {VERSION})", text_color="#cfe8c2",
+                     f"(you have {VERSION})", text_color=T.GREEN_LIGHT,
                      font=font(12, "bold")).pack(side="left", padx=18, pady=9)
         mkbtn(bn, "Later", bn.destroy, kind="flat", width=64, height=30,
-              text_color="#9fb89a", hover_color="#33421f").pack(
+              text_color=T.GREEN_MUTED, hover_color=T.GREEN_DARK).pack(
                   side="right", padx=(0, 14), pady=7)
         mkbtn(bn, "Update now", lambda: run_update(rel, bn), kind="primary",
               width=112, height=30, font=font(12, "bold")).pack(
@@ -1543,9 +1688,8 @@ def gui():
     acct_state("in" if msa_signed_in() else "out")
     threading.Thread(target=refresh_versions, daemon=True).start()
     threading.Thread(target=update_check, daemon=True).start()
-
-    changelog_view.pack(fill="both", expand=True)
-    load_changelogs()
+    
+    hero.pack(fill="both", expand=True)
 
     root.update_idletasks()
 
