@@ -55,6 +55,8 @@ jobs:
       BOL_ALLOW_PARTIAL_ARTIFACTS: ${{ vars.BOL_ALLOW_PARTIAL_ARTIFACTS }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Install the packaging toolchain
         run: |
@@ -158,6 +160,8 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
       - name: Download the built artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -176,6 +180,8 @@ jobs:
             dist/BedrockOnLinux-*-inputs.sha256
 
       - name: Compute release metadata + bill of materials
+        env:
+          CHANNEL_INPUT: ${{ inputs.channel }}
         run: |
           ver="$(grep -m1 '^VERSION = ' bol/config.py | cut -d'"' -f2)"
           eng_rev="$(grep -m1 '^WINEGDK_BUILD_REV = ' bol/config.py | cut -d'"' -f2)"
@@ -185,7 +191,7 @@ jobs:
           xcurl_rev="$(grep -m1 '^OPENSSL_XCURL_REV = ' bol/config.py | cut -d'"' -f2)"
           vkd3d_hashes="$(grep -m1 '^VKD3D_OUTPUT_HASHES_SHA256=' \
             third_party/vkd3d-proton-universal/provenance.env | cut -d= -f2 | tr -d "'\"")"
-          channel="${{ inputs.channel || 'release' }}"
+          channel="${CHANNEL_INPUT:-release}"
           if [ "$channel" = "nightly" ]; then
             # Rolling nightly: one release/tag, moved to HEAD each run (see the
             # "Roll the nightly tag" step). Date + short commit in the name give
