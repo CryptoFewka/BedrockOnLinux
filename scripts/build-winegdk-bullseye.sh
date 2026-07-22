@@ -16,8 +16,8 @@ export LC_ALL=C
 export LANG=C
 export TZ=UTC
 
-readonly SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
-readonly PROJECT_ROOT="$(cd -- "$(dirname -- "$SCRIPT_PATH")/.." && pwd -P)"
+SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"; readonly SCRIPT_PATH
+PROJECT_ROOT="$(cd -- "$(dirname -- "$SCRIPT_PATH")/.." && pwd -P)"; readonly PROJECT_ROOT
 readonly EXPECTED_COMMIT="75637b674e1f191e65753663c4c0c32bea05ba6e"
 readonly PUBLIC_BASE_COMMIT="e75ddb5f5d8874eecf8e8c1742e6aaa4db9cd4a3"
 readonly EXPECTED_SOURCE_DATE_EPOCH="1784308597"
@@ -238,6 +238,13 @@ internal_build_stage() {
         --prefix=/work/prefix
       make -j"$MAKE_JOBS"
       make install
+      # ntdll links libunwind but the sniper runtime ships none; bundle the
+      # bullseye libunwind so the engine is self-contained (matches the
+      # container build and the upstream engine layout).
+      luw="$(readlink -f /usr/lib/x86_64-linux-gnu/libunwind.so.8)"
+      mkdir -p /work/prefix/lib/x86_64-linux-gnu
+      cp -a "$luw" "/work/prefix/lib/x86_64-linux-gnu/$(basename "$luw")"
+      ln -sf "$(basename "$luw")" /work/prefix/lib/x86_64-linux-gnu/libunwind.so.8
     '
 }
 
@@ -345,10 +352,10 @@ for command_name in awk chroot cp debootstrap find flock git grep id mount \
   require_command "$command_name"
 done
 
-readonly CONFIG_COMMIT="$(
+CONFIG_COMMIT="$(
   awk -F'"' '/^WINEGDK_SOURCE_COMMIT = "/ { print $2; exit }' \
     "$PROJECT_ROOT/bol/config.py"
-)"
+)"; readonly CONFIG_COMMIT
 [[ "$CONFIG_COMMIT" == "$EXPECTED_COMMIT" ]] ||
   die "bol/config.py pins '$CONFIG_COMMIT', expected '$EXPECTED_COMMIT'"
 

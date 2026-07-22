@@ -1,0 +1,15 @@
+# Hash-pinned wheels bundled into the .deb (scripts/build-deb.sh), installed with
+# --require-hashes --only-binary=:all: --no-deps into the package tree. These are
+# the pure-Python GUI/X11 helpers Debian does not package; cryptography and Tk
+# stay apt dependencies (see build-deb.sh). Keep versions in step with
+# requirements-appimage.txt; regenerate hashes from PyPI when a version bumps.
+customtkinter==5.2.2 \
+    --hash=sha256:14ad3e7cd3cb3b9eb642b9d4e8711ae80d3f79fb82545ad11258eeffb2e6b37c
+darkdetect==0.8.0 \
+    --hash=sha256:a7509ccf517eaad92b31c214f593dbcf138ea8a43b2935406bbd565e15527a85
+packaging==26.2 \
+    --hash=sha256:5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e
+python-xlib==0.33 \
+    --hash=sha256:c3534038d42e0df2f1392a1b30a15a4ff5fdc2b86cfa94f072bf11b10a164398
+six==1.17.0 \
+    --hash=sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274

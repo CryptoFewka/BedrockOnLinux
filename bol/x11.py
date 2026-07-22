@@ -56,7 +56,7 @@ def _primary_via_xrandr_cli(runner=None):
     def run(args):
         try:
             return runner([binary] + args, capture_output=True, text=True,
-                          timeout=5, check=False)
+                          errors="replace", timeout=5, check=False)
         except (OSError, subprocess.SubprocessError):
             return None
 

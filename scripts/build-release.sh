@@ -24,7 +24,8 @@ cleanup_build_trees() {
   # as well. Do not touch config.txt, engine candidates, or XCurl assets.
   rm -rf "$OUT/appimagetool" "$OUT/BedrockOnLinux.AppDir" "$OUT/deb" \
          "$OUT/portable" "$OUT/pyz-stage" "$OUT/flatpak-build" "$OUT/.cache"
-  rm -f "$OUT"/BedrockOnLinux-*-SHA256SUMS.tmp.*
+  rm -f "$OUT"/BedrockOnLinux-*-SHA256SUMS.tmp.* \
+        "$OUT/appimage-build.log" "$OUT/flatpak-build.log"
 }
 trap cleanup_build_trees EXIT
 cleanup_build_trees
@@ -177,14 +178,16 @@ APPIMAGE="$OUT/BedrockOnLinux-${VER}-x86_64.AppImage"
 # before starting too, otherwise an early dependency/network failure could make
 # an old file look like the successful result of this invocation.
 rm -f -- "$APPIMAGE"
-if bash "$SRC/scripts/build-appimage.sh" >/dev/null 2>&1 \
+APPIMAGE_LOG="$OUT/appimage-build.log"
+if bash "$SRC/scripts/build-appimage.sh" >"$APPIMAGE_LOG" 2>&1 \
     && [[ -s "$APPIMAGE" ]]; then
   echo "  ✓ dist/$(basename "$APPIMAGE")"
   built_artifacts+=("$APPIMAGE")
   verified_artifacts+=("$APPIMAGE")
 else
   rm -f -- "$APPIMAGE"
-  echo "  !! AppImage build failed — run scripts/build-appimage.sh to see why"
+  echo "  !! AppImage build failed — last 40 lines of scripts/build-appimage.sh:"
+  tail -n 40 "$APPIMAGE_LOG" | sed 's/^/     /'
   required_failures+=("AppImage")
 fi
 
@@ -193,13 +196,15 @@ rm -f -- "$FLATPAK"
 if command -v flatpak-builder >/dev/null \
     || { command -v flatpak >/dev/null \
          && flatpak info org.flatpak.Builder >/dev/null 2>&1; }; then
-  if bash "$SRC/scripts/build-flatpak.sh" >/dev/null 2>&1 \
+  FLATPAK_LOG="$OUT/flatpak-build.log"
+  if bash "$SRC/scripts/build-flatpak.sh" >"$FLATPAK_LOG" 2>&1 \
       && [[ -s "$FLATPAK" ]]; then
     echo "  ✓ dist/$(basename "$FLATPAK")"
     built_artifacts+=("$FLATPAK")
   else
     rm -f -- "$FLATPAK"
-    echo "  !! Flatpak build failed — run scripts/build-flatpak.sh to see why"
+    echo "  !! Flatpak build failed — last 40 lines of scripts/build-flatpak.sh:"
+    tail -n 40 "$FLATPAK_LOG" | sed 's/^/     /'
     required_failures+=("Flatpak")
   fi
 else
@@ -218,24 +223,38 @@ fi
 echo "== Verifying embedded candidate metadata =="
 "$SRC/scripts/verify-release-candidate.sh" "${verified_artifacts[@]}"
 
-# Checksums contain the validated engine input plus only application files
-# successfully rebuilt by this invocation.  The temp+rename sequence prevents
-# an interrupted hash pass leaving a plausible but incomplete SHA256SUMS file.
+# The application checksum file lists only the app artifacts rebuilt by this
+# invocation. The engine and XCurl archives ship from their own separately
+# attested releases and are not attached here, so their hashes go in a sidecar
+# inputs file instead of this one. The temp+rename sequence prevents an
+# interrupted hash pass leaving a plausible but incomplete checksum file.
 CHECKSUM="$OUT/BedrockOnLinux-${VER}-SHA256SUMS"
 CHECKSUM_TMP="$CHECKSUM.tmp.$$"
-rm -f -- "$CHECKSUM" "$CHECKSUM_TMP"
+INPUTS_SUMS="$OUT/BedrockOnLinux-${VER}-inputs.sha256"
+INPUTS_TMP="$INPUTS_SUMS.tmp.$$"
+rm -f -- "$CHECKSUM" "$CHECKSUM_TMP" "$INPUTS_SUMS" "$INPUTS_TMP"
 (
   cd "$OUT"
   for artifact in "${built_artifacts[@]}"; do
-    sha256sum -- "$(basename "$artifact")"
+    base="$(basename "$artifact")"
+    if [ "$base" = "$ENGINE_ASSET" ] || [ "$base" = "$XCURL_ASSET" ]; then
+      continue
+    fi
+    sha256sum -- "$base"
   done
 ) > "$CHECKSUM_TMP"
 mv -f -- "$CHECKSUM_TMP" "$CHECKSUM"
-echo "  ✓ dist/$(basename "$CHECKSUM")"
+echo "  ✓ dist/$(basename "$CHECKSUM") (application artifacts only)"
+(
+  cd "$OUT"
+  sha256sum -- "$ENGINE_ASSET" "$XCURL_ASSET"
+) > "$INPUTS_TMP"
+mv -f -- "$INPUTS_TMP" "$INPUTS_SUMS"
+echo "  ✓ dist/$(basename "$INPUTS_SUMS") (pinned engine + online-login inputs)"
 
 echo
 echo "Unreleased candidate artifacts in $OUT:"
-for artifact in "${built_artifacts[@]}" "$CHECKSUM"; do
+for artifact in "${built_artifacts[@]}" "$CHECKSUM" "$INPUTS_SUMS"; do
   ls -1sh "$artifact"
 done
 echo

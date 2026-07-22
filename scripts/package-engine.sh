@@ -164,6 +164,16 @@ fi
 if [[ -n "$WINEGDK_PREFIX" ]]; then
   cp -a --remove-destination "$WINEGDK_PREFIX/." "$STAGED_ENGINE/files/"
   echo "   staged reviewed WineGDK prefix overlay"
+  # The public GE-Proton base ships real Wine-10 wine64 + *-preloader binaries in
+  # files/bin; the WineGDK overlay only replaces `wine` (Wine 11 wow64 drops the
+  # separate 64-bit loader and preloaders). Recreate the wow64 launch aliases as
+  # symlinks to the staged WineGDK `wine`, so files/bin runs one coherent Wine
+  # runtime and matches the reviewed runtime-link layout.
+  for alias in wine64 wine-preloader wine64-preloader; do
+    rm -f "$STAGED_ENGINE/files/bin/$alias"
+    ln -s wine "$STAGED_ENGINE/files/bin/$alias"
+  done
+  echo "   reconciled files/bin wow64 launch aliases"
 fi
 
 # Wine's installed headers are build-time material, not part of the Proton
@@ -212,6 +222,9 @@ ARCHES=(x86_64-windows i386-windows)
 DLLS=(d3d12.dll d3d12core.dll)
 EXT_MARKER="VK_EXT_device_generated_commands"
 NV_MARKER="VK_NV_device_generated_commands"
+# DXVK is swapped to stock v3.0.1 by scripts/apply-dxvk-301.sh before packaging
+# (the public GDK-Proton base ships 2.7.1; upstream's engine used 3.0.1). This
+# validates the swapped-in version.
 DXVK_VERSION="3.0.1"
 VKD3D_BASE_VERSION="3.0.1"
 VKD3D_EXT_VERSION="3.0.1-bol-dgc"
@@ -270,13 +283,13 @@ verify_reviewed_provenance() {
     "dc626520dcd53a22f727af3ee42c770e56c97a64fe3adb063799d8ab032fe551" \
     "vkd3d-proton LGPL notice"
   verify_sha256 "$root/provenance.env" \
-    "d74e69bf8d710ce153e5bb0fcbc1f48f4ced08992a37300fde5ee3853e05a366" \
+    "a2c6f2f6f36c426034d5845aee0c98a6bc07a5a63849b829ab377b89e9319262" \
     "vkd3d-proton provenance lock"
   verify_sha256 "$root/submodules.lock" \
     "19ae5e28d0828ebf911fe99569e4de56328ea39e1a076a11506a78d98c76f3aa" \
     "vkd3d-proton submodule lock"
   verify_sha256 "$root/OUTPUT-SHA256SUMS" \
-    "c4928f2df72a029ed20a86ae6ecb0b0ed958350885a85dea9943f64fd838efea" \
+    "c64397dec052d7f86f65a0f39d6aecb813d4d1527327fe572cab3e4b59d6ad24" \
     "vkd3d-proton output hash lock"
   verify_sha256 "$root/restore-nv-dgc.patch" \
     "91878d389dc0e315f770fa6c7fffea8f78f410a04796c38e2a6410ff0b9b4a33" \
@@ -455,7 +468,7 @@ PY
 VKD3D_PROVENANCE_DEST="$STAGED_ENGINE/$VKD3D_PROVENANCE_REL"
 WINEGDK_PROVENANCE_DEST="$STAGED_ENGINE/$WINEGDK_PROVENANCE_REL"
 GDK_PROTON_PROVENANCE_DEST="$STAGED_ENGINE/$GDK_PROTON_PROVENANCE_REL"
-rm -rf "$STAGED_ENGINE/$PROVENANCE_BASE_REL"
+rm -rf "${STAGED_ENGINE:?}/$PROVENANCE_BASE_REL"
 mkdir -p "$VKD3D_PROVENANCE_DEST" "$WINEGDK_PROVENANCE_DEST" \
   "$GDK_PROTON_PROVENANCE_DEST" "$WINEGDK_PROVENANCE_DEST/r12" \
   "$WINEGDK_PROVENANCE_DEST/native5"

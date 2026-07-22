@@ -1,0 +1,27 @@
+# msys2 mingw64 runtime closure of mingw-w64-x86_64-curl (name filename sha256).
+# Regenerate: delete this file and re-run scripts/build-openssl-xcurl.sh.
+mingw-w64-x86_64-curl mingw-w64-x86_64-curl-8.21.0-2-any.pkg.tar.zst 4edcde9de2f033ae6e734e295613aef65c41ce5ab77edfc21ef82f0434d49ea0
+mingw-w64-x86_64-gcc-libs mingw-w64-x86_64-gcc-libs-16.1.0-5-any.pkg.tar.zst aa560f5438c35b71c3e7b24fd5becbca028f70c5b4d1f1697a86ff80fec947da
+mingw-w64-x86_64-c-ares mingw-w64-x86_64-c-ares-1.34.8-1-any.pkg.tar.zst 34c1b4c196f52bd3f0c0b4ac652fabd2325086183c000baa10f721c815b29542
+mingw-w64-x86_64-brotli mingw-w64-x86_64-brotli-1.2.0-1-any.pkg.tar.zst f5f2f7e723a08378241d15f0537386950c1a48e2d82bc47bedd632bd61852aba
+mingw-w64-x86_64-libidn2 mingw-w64-x86_64-libidn2-2.3.8-4-any.pkg.tar.zst f98a157446f9ac35465022e329cdaf6169b0c9fa19837e9d80aff9d4e5109013
+mingw-w64-x86_64-libpsl mingw-w64-x86_64-libpsl-0.21.5-3-any.pkg.tar.zst 2a86f7ce3cd3fabff7eb8e5c0d3eb1134808881a44c3838e1b518b75cb402e35
+mingw-w64-x86_64-zlib mingw-w64-x86_64-zlib-1.3.2-2-any.pkg.tar.zst 9e75842a070ba648e986e12424e1c92c9d7d77200e85f6a34eeb600819f2e694
+mingw-w64-x86_64-zstd mingw-w64-x86_64-zstd-1.5.7-2-any.pkg.tar.zst 1add6705b344664f6aca108c85f79ab5bdd9e1162662bb06a4cf40a34f6e0907
+mingw-w64-x86_64-ca-certificates mingw-w64-x86_64-ca-certificates-20250419-1-any.pkg.tar.zst 200fc95e2b2a1c779d7721ab7b6a1c77fb4524bd5a25a4130d08e4be618617c6
+mingw-w64-x86_64-libssh2 mingw-w64-x86_64-libssh2-1.11.1-2-any.pkg.tar.zst 83d0b99f79e930b30eb642382662686b696d64ceb927c2606debd79cb6ff670a
+mingw-w64-x86_64-openssl mingw-w64-x86_64-openssl-3.6.3-1-any.pkg.tar.zst 82de7ff886112374ffae9e7b3c843c82342e198543fb024790416ef56434fe9f
+mingw-w64-x86_64-nghttp2 mingw-w64-x86_64-nghttp2-1.69.0-1-any.pkg.tar.zst 2dbd0ed693918d1c14f97b33ab738fc9385995ddb82bc47ae3e535ce992829df
+mingw-w64-x86_64-ngtcp2 mingw-w64-x86_64-ngtcp2-1.24.0-1-any.pkg.tar.zst befd7d3837fa66b2da33c29c87fbca1bbb3097ad91649c239daf02100e40f493
+mingw-w64-x86_64-nghttp3 mingw-w64-x86_64-nghttp3-1.17.0-1-any.pkg.tar.zst 4502bde1736c241e446a24cb3b74caf8e7f8081d99b158d81b1b21e24cf783c5
+mingw-w64-x86_64-libwinpthread mingw-w64-x86_64-libwinpthread-14.0.0.r190.g96fb1bff7-1-any.pkg.tar.zst 52e84dbcef7352e3ce4aa04a24d320d8039b0ddc59b0603ccea00f1a975e8374
+mingw-w64-x86_64-tzdata mingw-w64-x86_64-tzdata-2026c-1-any.pkg.tar.zst 502e6f8e65c554e717f6c749dcbb70cc9b85ed94b01c151c26a0c25235e63df2
+mingw-w64-x86_64-gettext-runtime mingw-w64-x86_64-gettext-runtime-1.0-1-any.pkg.tar.zst be68d7f260633284b910c588c6d82ee304a81c8817a686d2cd9df83f872c27af
+mingw-w64-x86_64-libiconv mingw-w64-x86_64-libiconv-1.19-1-any.pkg.tar.zst 21e334d0911f25de75d3e18e0697648bcecfa9658256d600cad0827d719c2f35
+mingw-w64-x86_64-libunistring mingw-w64-x86_64-libunistring-1.4.2-1-any.pkg.tar.zst c940cf52fb2b579baa596d3c1d911f7544cbf90f8bd19c260377aa115c65b059
+mingw-w64-x86_64-p11-kit mingw-w64-x86_64-p11-kit-0.26.4-1-any.pkg.tar.zst 418f991311c9e0af3a979d160636ff698b65a663f52680f99479bd7a1c2f9d28
+mingw-w64-x86_64-gnutls mingw-w64-x86_64-gnutls-3.8.13-3-any.pkg.tar.zst 0d5a373ac558af20dc0a46d249e99f8a3b3d3562ae013e73f00642dc3bd118cf
+mingw-w64-x86_64-libtasn1 mingw-w64-x86_64-libtasn1-4.21.0-1-any.pkg.tar.zst 9f7aa213d14135e5856cc7a1254d871cbed60dee00b40db87a6ca7a4e733d2b2
+mingw-w64-x86_64-libffi mingw-w64-x86_64-libffi-3.7.1-1-any.pkg.tar.zst a016df13c67a0438a0b94267f2911c68fd4d7216b4d45fbac7a66af41fe78f44
+mingw-w64-x86_64-gmp mingw-w64-x86_64-gmp-6.3.0-2-any.pkg.tar.zst 8924433974c4add46cb46ea4f6ef283b5c5139d3f552375115b5580f855015cc
+mingw-w64-x86_64-nettle mingw-w64-x86_64-nettle-4.0-1-any.pkg.tar.zst 505773abfb4f3af514012e2926c11db6365299c7eda141d958a065740740dc86

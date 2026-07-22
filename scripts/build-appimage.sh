@@ -134,12 +134,11 @@ for library in "$PYLIB/libtcl8.6.so" "$PYLIB/libtk8.6.so"; do
 done
 
 echo "== installing portable cryptography + certifi + customtkinter + python-xlib into the bundle"
+# Hash-pinned, wheels only, no sdist builds: the closure + SHA-256s live in
+# third_party/requirements-appimage.txt (--require-hashes rejects any mismatch).
 "$PYBIN" -m pip install --no-cache-dir --no-compile \
-    --no-deps \
-    'cryptography==43.0.3' 'certifi==2026.6.17' \
-    'cffi==2.0.0' 'pycparser==3.0' \
-    'customtkinter==5.2.2' 'darkdetect==0.8.0' 'packaging==26.2' \
-    'python-xlib==0.33' 'six==1.17.0' \
+    --no-deps --require-hashes --only-binary=:all: \
+    -r "$SRC/third_party/requirements-appimage.txt" \
     >/dev/null
 
 PY3="$PYLIB/python3.12"
@@ -286,6 +285,9 @@ env -i TCL_LIBRARY="$PYHOME/lib/tcl8.6" TK_LIBRARY="$PYHOME/lib/tk8.6" \
    ${DISPLAY:+DISPLAY="$DISPLAY"} ${XAUTHORITY:+XAUTHORITY="$XAUTHORITY"} \
    "$PYBIN" - <<'PY'
 import os
+import ssl
+import time
+import urllib.error
 import urllib.request
 
 import _tkinter
@@ -307,10 +309,38 @@ expected = {
 }
 actual = {package: version(package) for package in expected}
 assert actual == expected, (actual, expected)
-with urllib.request.urlopen("https://api.github.com", timeout=20) as response:
-    response.read(16)
+def verify_https():
+    # The point of this check is that the bundled OpenSSL + certifi CA can
+    # complete a real TLS handshake. A certificate/TLS failure is a genuine
+    # bundling defect and must fail the build; a network/HTTP error (offline
+    # runner, sandbox, or the host being briefly unreachable) is environmental
+    # and must not, since the crypto stack already imported and loaded its CA.
+    last = None
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen("https://api.github.com", timeout=20) as response:
+                response.read(16)
+            return "HTTPS via bundled CA"
+        except urllib.error.URLError as exc:
+            reason = getattr(exc, "reason", exc)
+            # Only a certificate-verification failure proves the bundled CA is
+            # broken. Other ssl.SSLError subtypes (SSLEOFError, reset mid-
+            # handshake, etc.) are transport hiccups -> retry, then skip.
+            if isinstance(reason, ssl.SSLCertVerificationError):
+                raise SystemExit(f"bundled TLS/CA verification failed: {reason}")
+            last = exc
+        except ssl.SSLCertVerificationError as exc:
+            raise SystemExit(f"bundled TLS/CA verification failed: {exc}")
+        except (ssl.SSLError, OSError) as exc:
+            last = exc
+        time.sleep(2 * (attempt + 1))
+    print(f"  (warning: could not live-test HTTPS against api.github.com ({last});"
+          " bundled crypto imported OK, skipping the online check)")
+    return "HTTPS online check skipped (network unavailable)"
+
+https_status = verify_https()
 msg = (f"  bundle OK: Tk {_tkinter.TK_VERSION} | cryptography {cryptography.__version__}"
-       f" | customtkinter {customtkinter.__version__} | HTTPS via bundled CA")
+       f" | customtkinter {customtkinter.__version__} | {https_status}")
 if os.environ.get("DISPLAY"):
     import tkinter
     from tkinter import font

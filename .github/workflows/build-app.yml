@@ -1,0 +1,247 @@
+# Tier 3: build the BedrockOnLinux application artifacts (.deb, AppImage,
+# portable .pyz, Flatpak) from source, consuming this fork's attested engine and
+# OpenSSL-XCurl set, then attest + publish them. Completes the traceable chain
+# source -> engine/xcurl (attested) -> installable app (attested).
+#
+# Requires the engine and xcurl releases to already exist on this fork (run
+# "Build managed engine" and "Build OpenSSL-XCurl set" with publish first).
+#
+# NOTE: AppImage (appimagetool) and Flatpak (flatpak-builder) builds are
+# environment-sensitive; the first runs will likely need iteration. Set the repo
+# variable BOL_ALLOW_PARTIAL_ARTIFACTS=1 to let build-release.sh keep going when
+# an optional format fails.
+
+name: Build application artifacts
+
+on:
+  workflow_call:
+    inputs:
+      publish:
+        description: "Publish + attest the app artifacts as a release on this fork"
+        type: boolean
+        default: false
+      channel:
+        description: "release (versioned) or nightly (rolling prerelease)"
+        type: string
+        default: release
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish + attest the app artifacts as a release on this fork"
+        type: boolean
+        default: false
+      channel:
+        description: "release (versioned) or nightly (rolling prerelease)"
+        type: string
+        default: release
+  push:
+    tags:
+      - "app-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  # Build with least privilege: read-only token, no attest/publish scopes. The
+  # artifacts are handed to the elevated `publish` job below, so nothing that
+  # runs build scripts / downloads deps ever holds a write or signing token.
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      APPIMAGE_EXTRACT_AND_RUN: "1"
+      BOL_ALLOW_PARTIAL_ARTIFACTS: ${{ vars.BOL_ALLOW_PARTIAL_ARTIFACTS }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install the packaging toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            dpkg-dev patchelf squashfs-tools zsync desktop-file-utils file \
+            python3 python3-pip python3-venv python3-tk \
+            build-essential ca-certificates curl xz-utils \
+            flatpak flatpak-builder
+
+      - name: Enable unprivileged user namespaces (flatpak-builder / appimage)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Add the flathub remote
+        run: |
+          flatpak remote-add --user --if-not-exists flathub \
+            https://flathub.org/repo/flathub.flatpakrepo
+
+      - name: Fetch + verify the attested engine and xcurl set into dist/
+        run: |
+          rev="$(grep -m1 '^WINEGDK_BUILD_REV = ' bol/config.py | cut -d'"' -f2)"
+          xrev="$(grep -m1 '^OPENSSL_XCURL_REV = ' bol/config.py | cut -d'"' -f2)"
+          engine_pin="$(grep -m1 '^WINEGDK_ARCHIVE_SHA256 = ' bol/config.py | cut -d'"' -f2)"
+          xcurl_pin="$(grep -m1 '^OPENSSL_XCURL_ARCHIVE_SHA256 = ' bol/config.py | cut -d'"' -f2)"
+          mkdir -p dist
+          gh release download "engine-${rev}" -R "${{ github.repository }}" \
+            -p "GDK-Proton-xuser-${rev}.tar.gz*" -D dist
+          gh attestation verify "dist/GDK-Proton-xuser-${rev}.tar.gz" \
+            -R "${{ github.repository }}"
+          # Attestation proves provenance; also fail closed unless the bytes equal
+          # the committed pin (not the downloaded .sha256 sidecar).
+          echo "${engine_pin}  dist/GDK-Proton-xuser-${rev}.tar.gz" | sha256sum -c -
+          gh release download "xcurl-${xrev}" -R "${{ github.repository }}" \
+            -p "openssl-xcurl-set-${xrev}.tar.gz*" -D dist
+          gh attestation verify "dist/openssl-xcurl-set-${xrev}.tar.gz" \
+            -R "${{ github.repository }}"
+          echo "${xcurl_pin}  dist/openssl-xcurl-set-${xrev}.tar.gz" | sha256sum -c -
+
+      - name: Build the glibc-2.31 Tcl/Tk cache in a Debian 11 (Bullseye) container
+        run: |
+          # The AppImage enforces a glibc-2.31 baseline, so its Tcl/Tk must be
+          # compiled on Bullseye (hosted runners are glibc 2.38 and cannot run the
+          # debootstrap+userns path). Build the cache in a container; the host
+          # build-release.sh below reuses it. A repo copy keeps the container's
+          # root-owned dist/ out of the checkout; the cache dir path is specific
+          # (not /cache) so the relocatability scanner does not false-positive.
+          cp -r "$PWD" "$RUNNER_TEMP/tkcache-build"
+          mkdir -p "$RUNNER_TEMP/appimage-cache"
+          docker run --rm \
+            -v "$RUNNER_TEMP/tkcache-build:/work/BedrockOnLinux" \
+            -v "$RUNNER_TEMP/appimage-cache:/bol-appimage-cache" \
+            -w /work/BedrockOnLinux \
+            -e BOL_APPIMAGE_BUILD_CACHE=/bol-appimage-cache \
+            -e APPIMAGE_EXTRACT_AND_RUN=1 \
+            debian:bullseye@sha256:6cb68b1be980a0e5b19be25582b34b5cf9cb466d52d08ab4354b79051f2cd298 \
+            bash -euo pipefail -c '
+              export DEBIAN_FRONTEND=noninteractive
+              bash scripts/pin-apt-snapshot.sh bullseye
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                build-essential patchelf curl ca-certificates python3 python3-pip \
+                python3-venv file zlib1g-dev libx11-dev libxext-dev libxft-dev \
+                libxrender-dev libxss-dev pkg-config libfuse2 zsync desktop-file-utils
+              bash scripts/build-appimage.sh
+            '
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/appimage-cache"
+
+      - name: Build the application artifacts
+        env:
+          BOL_APPIMAGE_BUILD_CACHE: ${{ runner.temp }}/appimage-cache
+        run: |
+          scripts/build-release.sh
+          echo "VER=$(grep -m1 '^VERSION = ' bol/config.py | cut -d'"' -f2)" >> "$GITHUB_ENV"
+
+      - name: Upload the built artifacts for the publish job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: app-artifacts
+          if-no-files-found: error
+          retention-days: 1
+          path: |
+            dist/bedrock-on-linux_*.deb
+            dist/bedrock-on-linux-*.pyz
+            dist/BedrockOnLinux-*-x86_64.AppImage
+            dist/BedrockOnLinux-*-x86_64.flatpak
+            dist/BedrockOnLinux-*-SHA256SUMS
+            dist/BedrockOnLinux-*-inputs.sha256
+
+  # Attest + publish only. Runs on tag push or an explicit publish request, holds
+  # the write/id-token/attestations scopes the build job does not, and touches
+  # only the already-built artifacts (never build scripts or third-party deps).
+  publish:
+    needs: build
+    if: ${{ github.event_name == 'push' || inputs.publish }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Download the built artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: app-artifacts
+          path: dist
+
+      - name: Attest application artifacts
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: |
+            dist/bedrock-on-linux_*.deb
+            dist/bedrock-on-linux-*.pyz
+            dist/BedrockOnLinux-*-x86_64.AppImage
+            dist/BedrockOnLinux-*-x86_64.flatpak
+            dist/BedrockOnLinux-*-SHA256SUMS
+            dist/BedrockOnLinux-*-inputs.sha256
+
+      - name: Compute release metadata + bill of materials
+        run: |
+          ver="$(grep -m1 '^VERSION = ' bol/config.py | cut -d'"' -f2)"
+          eng_rev="$(grep -m1 '^WINEGDK_BUILD_REV = ' bol/config.py | cut -d'"' -f2)"
+          eng_sha="$(grep -m1 '^WINEGDK_ARCHIVE_SHA256 = ' bol/config.py | cut -d'"' -f2)"
+          wg_commit="$(grep -m1 '^WINEGDK_SOURCE_COMMIT = ' bol/config.py | cut -d'"' -f2)"
+          wg_prefix="$(grep -m1 '^WINEGDK_PREFIX_SHA256 = ' bol/config.py | cut -d'"' -f2)"
+          xcurl_rev="$(grep -m1 '^OPENSSL_XCURL_REV = ' bol/config.py | cut -d'"' -f2)"
+          vkd3d_hashes="$(grep -m1 '^VKD3D_OUTPUT_HASHES_SHA256=' \
+            third_party/vkd3d-proton-universal/provenance.env | cut -d= -f2 | tr -d "'\"")"
+          channel="${{ inputs.channel || 'release' }}"
+          if [ "$channel" = "nightly" ]; then
+            # Rolling nightly: one release/tag, moved to HEAD each run (see the
+            # "Roll the nightly tag" step). Date + short commit in the name give
+            # freshness and traceability without accumulating releases.
+            tag="nightly"
+            name="BedrockOnLinux nightly ${ver} ($(date -u +%Y-%m-%d), ${GITHUB_SHA:0:7})"
+            pre="true"
+          else
+            tag="app-v${ver}"; name="BedrockOnLinux ${ver}"; pre="false"
+          fi
+          {
+            echo "VER=$ver"
+            echo "RELEASE_TAG=$tag"
+            echo "RELEASE_NAME=$name"
+            echo "RELEASE_PRERELEASE=$pre"
+            echo "BOM_ENGINE=${eng_rev} (sha256 ${eng_sha})"
+            echo "BOM_WINEGDK=${wg_commit} (prefix sha256 ${wg_prefix})"
+            echo "BOM_VKD3D=3.0.1-nv-dgc (output-hashes sha256 ${vkd3d_hashes})"
+            echo "BOM_XCURL=${xcurl_rev}"
+          } >> "$GITHUB_ENV"
+
+      - name: Roll the nightly tag to the current commit
+        if: ${{ env.RELEASE_TAG == 'nightly' }}
+        run: |
+          # softprops does not move an existing tag, so delete the rolling nightly
+          # release + tag first; the publish step recreates it at the current commit
+          # (keeping its "Source code" snapshot and ref in sync with the build).
+          # Only tolerate "not present" (first run) — a real delete failure must
+          # surface, otherwise the tag would silently regress to stale.
+          if gh release view nightly -R "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release delete nightly -R "${{ github.repository }}" --cleanup-tag --yes
+          fi
+
+      - name: Publish the application release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_NAME }}
+          prerelease: ${{ env.RELEASE_PRERELEASE }}
+          body: |
+            Application artifacts built from source, consuming this fork's
+            attested, pinned engine and OpenSSL-XCurl set.
+
+            Bill of materials (pinned + reproducible):
+            - Managed engine: ${{ env.BOM_ENGINE }}
+            - WineGDK source: ${{ env.BOM_WINEGDK }}
+            - vkd3d-proton: ${{ env.BOM_VKD3D }}
+            - OpenSSL-XCurl set: ${{ env.BOM_XCURL }}
+
+            Verify any file with:
+            gh attestation verify <file> --repo ${{ github.repository }}
+          files: |
+            dist/bedrock-on-linux_*.deb
+            dist/bedrock-on-linux-*.pyz
+            dist/BedrockOnLinux-*-x86_64.AppImage
+            dist/BedrockOnLinux-*-x86_64.flatpak
+            dist/BedrockOnLinux-*-SHA256SUMS
+            dist/BedrockOnLinux-*-inputs.sha256
+          fail_on_unmatched_files: false
