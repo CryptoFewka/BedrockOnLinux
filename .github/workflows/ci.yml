@@ -18,6 +18,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
       - name: Run the test suite
         run: |
           python3 -m venv .venv
@@ -29,6 +31,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
       - name: Byte-compile the package
         run: python3 -m compileall -q bol
       - name: Shellcheck the scripts
@@ -45,6 +49,12 @@ jobs:
           echo "${sha}  actionlint.tar.gz" | sha256sum -c -
           tar -xzf actionlint.tar.gz actionlint
           ./actionlint -color
+      - name: Lint Python (ruff, pyflakes rules)
+        run: pipx run --spec 'ruff==0.14.3' ruff check --select F bol/ tests/
+      - name: Audit the workflows (zizmor)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: pipx run --spec 'zizmor==1.5.2' zizmor --persona=regular .github/workflows/
   cryptbase:
     # Wine runtime test for the from-source cryptbase RNG stub: proves
     # SystemFunction036 returns varied random bytes and does not recurse to a
@@ -53,6 +63,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
       - name: Run scripts/test-cryptbase.sh in a pinned Trixie container
         run: |
           docker run --rm -v "$PWD:/repo" -w /repo \
@@ -78,6 +90,8 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
       - name: Verify committed release pins resolve to a matching published asset
         run: |
           set -euo pipefail

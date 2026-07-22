@@ -54,13 +54,18 @@ jobs:
       publish: ${{ steps.probe.outputs.publish }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Resolve pins and decide reuse-or-build per tier
         id: probe
+        env:
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+          PUBLISH_INPUT: ${{ inputs.publish }}
         run: |
           set -euo pipefail
           repo="${{ github.repository }}"
-          force="${{ inputs.force_rebuild || 'false' }}"
+          force="${FORCE_REBUILD:-false}"
           cfg=bol/config.py
           xrev="$(grep -m1 '^OPENSSL_XCURL_REV = ' $cfg | cut -d'"' -f2)"
           xsha="$(grep -m1 '^OPENSSL_XCURL_ARCHIVE_SHA256 = ' $cfg | cut -d'"' -f2)"
@@ -94,7 +99,7 @@ jobs:
           if [ "${{ github.event_name }}" = "schedule" ]; then
             channel=nightly; publish=true
           else
-            channel=release; publish="${{ inputs.publish }}"
+            channel=release; publish="$PUBLISH_INPUT"
           fi
           {
             echo "build_xcurl=$bx"

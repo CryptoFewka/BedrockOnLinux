@@ -1,0 +1,62 @@
+# CodeQL static analysis for the Python launcher and the native C sources
+# (the DLL injector, the cryptbase RNG stub, and the XCurl CA shim: the
+# highest-risk code in the tree). Python needs no build; the C sources are
+# cross-compiled with mingw between init and analyze so the extractor observes
+# them. Results surface in the repository's code-scanning tab.
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 8 * * 1" # weekly, Monday ~08:00 UTC
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      security-events: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: python
+            build-mode: none
+          - language: c-cpp
+            build-mode: manual
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@4187e74d05793876e9989daffde9c3e66b4acd07 # v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - name: Build the native C sources for the extractor
+        if: matrix.build-mode == 'manual'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
+          CC=x86_64-w64-mingw32-gcc
+          "$CC" -c -O2 -mrdrnd src/cryptbase-stub.c -o "$RUNNER_TEMP/cryptbase.o"
+          "$CC" -c -O2 src/xcurl-cashim.c -o "$RUNNER_TEMP/xcurl-cashim.o"
+          "$CC" -c -O2 src/injector.c -o "$RUNNER_TEMP/injector.o"
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@4187e74d05793876e9989daffde9c3e66b4acd07 # v3
+        with:
+          category: "/language:${{ matrix.language }}"

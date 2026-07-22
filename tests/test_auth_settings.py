@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: MIT
 
 import json
-import os
 import stat
 import tempfile
 import unittest
