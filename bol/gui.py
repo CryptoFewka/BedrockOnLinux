@@ -10,7 +10,6 @@ import sys
 import threading
 import zipfile
 from pathlib import Path
-from PIL import Image, ImageDraw
 
 from .auth import (
     NativeAuth,
@@ -192,7 +191,6 @@ def gui():
         return
 
     T = Theme
-    from .util import load_settings, save_settings
     s = load_settings()
     _init_beta = s.get("ui_is_beta", False)
     T.THEME_ACCENT = T.GOLD if _init_beta else T.GREEN
@@ -1026,7 +1024,6 @@ def gui():
         elif mode == "cancel":
             if getattr(acct_btn, "_confirm_cancel", False):
                 na.stop()
-                from .auth import msa_signed_in
                 acct_state("in" if msa_signed_in() else "out")
                 if ui.get("auth_dialog") and ui["auth_dialog"].winfo_exists():
                     ui["auth_dialog"].destroy()
@@ -1082,7 +1079,6 @@ def gui():
         ui["auth_dialog"] = d
         def on_close():
             na.stop()
-            from .auth import msa_signed_in
             acct_state("in" if msa_signed_in() else "out")
             d.destroy()
         d.protocol("WM_DELETE_WINDOW", on_close)
@@ -1585,7 +1581,6 @@ def gui():
     def render_markdown_to_text(widget, md, wrap_width=75):
         lines = md.split("\n")
         in_code_block = False
-        code_in_quote = False
         code_content = []
 
         for line in lines:
@@ -1602,11 +1597,9 @@ def gui():
                     for cl in code_content:
                         widget.insert("end", cl + "\n", "code_block")
                     in_code_block = False
-                    code_in_quote = False
                     code_content = []
                 else:
                     in_code_block = True
-                    code_in_quote = is_quote
                 continue
 
             if in_code_block:
