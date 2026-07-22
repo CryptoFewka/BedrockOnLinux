@@ -56,55 +56,122 @@ def _desktop_error(message):
 # Palette
 # --------------------------------------------------------------------------
 class Theme:
-    BG          = "#0f1115"   # window
-    CARD        = "#181b22"   # primary panels
-    CARD_2      = "#20242e"   # nested surfaces (fields, rows)
-    CARD_3      = "#2a2f3b"   # hover / raised state
-    BORDER      = "#2a2e38"   # border outline
+    BG          = ("#f2f4f7", "#0f1115")
+    FG          = ("#0f1115", "#f2f4f7")
+    SUB         = ("#5d6577", "#8b93a7")
+    MUTED       = ("#8b93a7", "#5d6577")
 
-    FG          = "#f2f4f7"   # primary
-    SUB         = "#8b93a7"   # secondary
-    MUTED       = "#5d6577"   # tertiary
+    CARD        = ("#ffffff", "#181b22")
+    CARD_2      = ("#e8ebf0", "#20242e")
+    CARD_3      = ("#d8dce4", "#2a2f3b")
+    
+    BORDER      = ("#d0d4dc", "#2a2e38")
 
-    GREEN       = "#43a047"   # play
-    GREEN_HOV   = "#4fc153"   # hover play
-    GREEN_DIM   = "#1c2c1c"   # dimmed play
-    GREEN_LIGHT = "#cfe8c2"   # active
-    GREEN_MUTED = "#9fb89a"   # muted
-    GREEN_DARK  = "#33421f"   # inactive
+    RED         = ("#d35446", "#e2685a")
+    RED_HOV     = ("#bc4a3d", "#ea7c70")
+    RED_DIM     = ("#fceceb", "#341f1d")
+    RED_LIGHT   = ("#451c17", "#f2b3ac")
+    RED_MUTED   = ("#b06259", "#c98279")
+    RED_DARK    = ("#f2b3ac", "#451c17")
 
-    GOLD        = "#e3b34a"   # beta
-    GOLD_HOV    = "#f3c35a"   # hover beta
-    GOLD_DIM    = "#33291a"   # dimmed beta
+    GREEN       = ("#43a047", "#43a047")
+    GREEN_HOV   = ("#3b8e3f", "#4fc153")
+    GREEN_DIM   = ("#e6f4e6", "#1c2c1c")
+    GREEN_LIGHT = ("#33421f", "#cfe8c2")
+    GREEN_MUTED = ("#6e8a69", "#9fb89a")
+    GREEN_DARK  = ("#cfe8c2", "#33421f")
 
-    RED         = "#e2685a"   # danger
-    RED_HOV     = "#ea7c70"   # hover danger
-    RED_DIM     = "#341f1d"   # dommed danger
+    BLUE        = ("#3b7bc4", "#5b9bd9")
+    BLUE_HOV    = ("#2a6bb4", "#6caae6")
+    BLUE_DIM    = ("#e6f0fa", "#16202c")
+    BLUE_LIGHT  = ("#1f3342", "#c2d6e8")
+    BLUE_MUTED  = ("#69829e", "#9ab3c9")
+    BLUE_DARK   = ("#c2d6e8", "#1f3342")
 
-    BLUE        = "#5b9bd9"   # other
-    BROWN       = "#8C6446"   # code text
+    GOLD        = ("#d8a230", "#e3b34a")
+    GOLD_HOV    = ("#c2912a", "#f3c35a")
+    GOLD_DIM    = ("#fcf3e1", "#33291a")
+    GOLD_LIGHT  = ("#473510", "#f2ce79")
+    GOLD_MUTED  = ("#b58c31", "#c9a657")
+    GOLD_DARK   = ("#f2ce79", "#473510")
 
-    CONSOLE_BG  = "#0b0d11"   # background
-    CONSOLE_FG  = "#7fd97f"   # foreground
+    BROWN       = ("#8c6446", "#a67958")
+    BROWN_HOV   = ("#75533a", "#bf8d69")
+    BROWN_DIM   = ("#f5ede8", "#2b1c12")
+    BROWN_LIGHT = ("#302217", "#d6b49c")
+    BROWN_MUTED = ("#805e45", "#a68267")
+    BROWN_DARK  = ("#d6b49c", "#302217")
+
+    CONSOLE_BG  = ("#f8f9fa", "#0b0d11")
+    CONSOLE_FG  = ("#3b8e3f", "#7fd97f")
+
+    @classmethod
+    def r(cls, color):
+        import customtkinter as ctk
+        if isinstance(color, tuple):
+            return color[0] if ctk.get_appearance_mode() == "Light" else color[1]
+        return color
 
 
-def _create_play_icon(size=22, color="white"):
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    pad = 2
-    draw.polygon([(pad, pad), (size - pad, size // 2), (pad, size - pad)], fill=color)
-    import customtkinter as ctk
-    return ctk.CTkImage(img, size=(size, size))
+def _create_play_icon(size=16, fg_color="white", bg_color="black"):
+    import tkinter as tk
+    fg = Theme.r(fg_color)
+    bg = Theme.r(bg_color)
+    if not isinstance(fg, str): fg = fg[0] if isinstance(fg, tuple) else "#ffffff"
+    if not isinstance(bg, str): bg = bg[0] if isinstance(bg, tuple) else "#000000"
+    if fg == "white": fg = "#ffffff"
+    if fg == "black": fg = "#000000"
+    if bg == "white": bg = "#ffffff"
+    if bg == "black": bg = "#000000"
+    
+    data = []
+    for y in range(size):
+        row = []
+        for x in range(size):
+            if 5 <= x <= 15:
+                dy = abs(y - size/2.0)
+                max_dy = (15 - x) * 0.5
+                if dy <= max_dy + 0.5:
+                    row.append(fg)
+                else:
+                    row.append(bg)
+            else:
+                row.append(bg)
+        data.append(row)
+    img = tk.PhotoImage(width=size, height=size)
+    img.put(data)
+    return img
 
-def _create_kill_icon(size=22, color="white"):
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
+def _create_kill_icon(size=16, fg_color="white", bg_color="black"):
+    import tkinter as tk
+    fg = Theme.r(fg_color)
+    bg = Theme.r(bg_color)
+    if not isinstance(fg, str): fg = fg[0] if isinstance(fg, tuple) else "#ffffff"
+    if not isinstance(bg, str): bg = bg[0] if isinstance(bg, tuple) else "#000000"
+    if fg == "white": fg = "#ffffff"
+    if fg == "black": fg = "#000000"
+    if bg == "white": bg = "#ffffff"
+    if bg == "black": bg = "#000000"
+    
+    data = []
     pad = 3
-    width = 3
-    draw.line([(pad, pad), (size - pad, size - pad)], fill=color, width=width)
-    draw.line([(size - pad, pad), (pad, size - pad)], fill=color, width=width)
-    import customtkinter as ctk
-    return ctk.CTkImage(img, size=(size, size))
+    thickness = 2
+    for y in range(size):
+        row = []
+        for x in range(size):
+            if pad <= x <= size - pad and pad <= y <= size - pad:
+                d1 = abs(x - y)
+                d2 = abs(x - (size - 1 - y))
+                if d1 <= thickness or d2 <= thickness:
+                    row.append(fg)
+                else:
+                    row.append(bg)
+            else:
+                row.append(bg)
+        data.append(row)
+    img = tk.PhotoImage(width=size, height=size)
+    img.put(data)
+    return img
 
 def gui():
     if os.environ.get("WAYLAND_DISPLAY") and not os.environ.get("DISPLAY"):
@@ -132,7 +199,7 @@ def gui():
     T.THEME_HOV    = T.GOLD_HOV if _init_beta else T.GREEN_HOV
     T.THEME_DIM    = T.GOLD_DIM if _init_beta else T.GREEN_DIM
 
-    ctk.set_appearance_mode("dark")
+    ctk.set_appearance_mode("Light" if s.get("light_theme", False) else "Dark")
     try:
         root = ctk.CTk(className=PRETTY)
     except Exception as e:
@@ -177,12 +244,15 @@ def gui():
             pass
 
     def logo_label(parent, px, bg):
-        """A scaled logo image in a tk.Label (its bg must match the parent)."""
+        """A scaled logo image in a ctk.CTkLabel."""
         if icon_img is None:
             return None
         try:
             im = icon_img.subsample(max(1, icon_img.width() // px))
-            lab = tk.Label(parent, image=im, bg=bg, bd=0)
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                lab = ctk.CTkLabel(parent, image=im, text="", fg_color=bg)
             lab.image = im
             return lab
         except Exception:
@@ -238,14 +308,14 @@ def gui():
         def _show(self):
             if self.win is not None:
                 return
-            self.win = tk.Toplevel(root)
+            self.win = ctk.CTkToplevel(root)
             self.win.overrideredirect(True)
             self.win.attributes("-topmost", True)
             x = self.widget.winfo_rootx() + self.widget.winfo_width() // 2
             y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
-            lab = tk.Label(self.win, text=self.text, bg=T.CARD_3, fg=T.FG,
-                            font=("sans-serif", 10), padx=8, pady=4, bd=0)
-            lab.pack()
+            lab = ctk.CTkLabel(self.win, text=self.text, fg_color=T.CARD_3, text_color=T.FG,
+                               font=font(10))
+            lab.pack(padx=8, pady=4)
             self.win.update_idletasks()
             self.win.geometry(
                 f"+{x - self.win.winfo_width() // 2}+{y}")
@@ -278,7 +348,7 @@ def gui():
     
     ll = logo_label(icon_btn, 24, T.CARD_2)
     if not ll:
-        ll = tk.Label(icon_btn, text="GitHub", bg=T.CARD_2, fg=T.SUB, font=("sans-serif", 10, "bold"), bd=0)
+        ll = ctk.CTkLabel(icon_btn, text="GitHub", fg_color=T.CARD_2, text_color=T.SUB, font=("sans-serif", 10, "bold"))
     ll.pack(padx=6, pady=6)
 
     brand_lbl = ctk.CTkLabel(brand, text="What's New", font=font(16, "bold"),
@@ -302,7 +372,7 @@ def gui():
         c = T.CARD_3 if on else T.CARD_2
         icon_btn.configure(fg_color=c)
         if ll:
-            ll.configure(bg=c)
+            ll.configure(fg_color=c)
             
     for w in [icon_btn, ll]:
         w.bind("<Button-1>", _open_github)
@@ -420,6 +490,73 @@ def gui():
         _update_selected_chip()
         close_picker()
 
+    def _sync_theme(w, is_beta=None):
+        if w == acct_dot:
+            return
+        if is_beta is None:
+            lab = mc_var.get()
+            is_beta = "BETA" in lab if lab else False
+            
+        c_new = T.GOLD if is_beta else T.GREEN
+        h_new = T.GOLD_HOV if is_beta else T.GREEN_HOV
+        d_new = T.GOLD_DIM if is_beta else T.GREEN_DIM
+        c_old = T.GREEN if is_beta else T.GOLD
+        h_old = T.GREEN_HOV if is_beta else T.GOLD_HOV
+        d_old = T.GREEN_DIM if is_beta else T.GOLD_DIM
+        
+        T.THEME_ACCENT = c_new
+        T.THEME_HOV = h_new
+        T.THEME_DIM = d_new
+        
+        for attr in ("fg_color", "text_color", "progress_color", "hover_color", "segmented_button_selected_color", "segmented_button_selected_hover_color"):
+            try:
+                cur = w.cget(attr)
+                if cur == c_old:
+                    w.configure(**{attr: c_new})
+                elif cur == h_old:
+                    w.configure(**{attr: h_new})
+                elif cur == d_old:
+                    w.configure(**{attr: d_new})
+            except Exception:
+                pass
+        if hasattr(w, "_segmented_button"):
+            try: w._segmented_button.configure(selected_color=c_new, selected_hover_color=h_new)
+            except Exception: pass
+        if hasattr(w, "tag_configure"):
+            try: w.tag_configure("link", foreground=T.r(c_new))
+            except Exception: pass
+            try: w.tag_configure("release_title", foreground=T.r(c_new))
+            except Exception: pass
+        elif hasattr(w, "_textbox"):
+            try: w._textbox.tag_configure("link", foreground=T.r(c_new))
+            except Exception: pass
+            try: w._textbox.tag_configure("release_title", foreground=T.r(c_new))
+            except Exception: pass
+            
+        if w.__class__.__name__ == "Text":
+            try:
+                w.configure(bg=T.r(T.CONSOLE_BG), fg=T.r(T.CONSOLE_FG), insertbackground=T.r(T.FG))
+            except Exception:
+                pass
+            
+        if getattr(w, "_is_play_btn", False):
+            try:
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    if ui.get("busy"):
+                        w.configure(fg_color=T.RED, hover_color=T.RED, text_color=T.FG)
+                        w._img_norm = _create_kill_icon(16, T.FG, T.RED)
+                    else:
+                        w.configure(fg_color=T.THEME_ACCENT, hover_color=T.THEME_ACCENT, text_color=T.FG)
+                        w._img_norm = _create_play_icon(16, T.FG, T.THEME_ACCENT)
+                    w.configure(image=w._img_norm)
+            except Exception:
+                pass
+            
+        for child in w.winfo_children():
+            _sync_theme(child, is_beta)
+
     def _update_selected_chip():
         lab = mc_var.get()
         if not lab:
@@ -445,61 +582,7 @@ def gui():
         except Exception:
             pass
 
-        def _sync_theme(w):
-            if w == acct_dot:
-                return
-            c_new = T.GOLD if is_beta else T.GREEN
-            h_new = T.GOLD_HOV if is_beta else T.GREEN_HOV
-            c_old = T.GREEN if is_beta else T.GOLD
-            h_old = T.GREEN_HOV if is_beta else T.GOLD_HOV
-            
-            T.THEME_ACCENT = c_new
-            T.THEME_HOV = h_new
-            T.THEME_DIM = T.GOLD_DIM if is_beta else T.GREEN_DIM
-            
-            for attr in ("fg_color", "text_color", "progress_color"):
-                try:
-                    if w.cget(attr) == c_old:
-                        w.configure(**{attr: c_new})
-                except Exception:
-                    pass
-            try:
-                if w.cget("hover_color") == h_old:
-                    w.configure(hover_color=h_new)
-            except Exception:
-                pass
-            try:
-                if w.cget("segmented_button_selected_color") == c_old:
-                    w.configure(segmented_button_selected_color=c_new,
-                                segmented_button_selected_hover_color=h_new)
-            except Exception:
-                pass
-            if hasattr(w, "_segmented_button"):
-                try: w._segmented_button.configure(selected_color=c_new, selected_hover_color=h_new)
-                except Exception: pass
-            if hasattr(w, "tag_configure"):
-                try: w.tag_configure("link", foreground=c_new)
-                except Exception: pass
-                try: w.tag_configure("release_title", foreground=c_new)
-                except Exception: pass
-            elif hasattr(w, "_textbox"):
-                try: w._textbox.tag_configure("link", foreground=c_new)
-                except Exception: pass
-                try: w._textbox.tag_configure("release_title", foreground=c_new)
-                except Exception: pass
-                
-            if getattr(w, "_is_play_btn", False):
-                try:
-                    w.configure(fg_color=T.THEME_DIM, hover_color=T.THEME_ACCENT)
-                    w._img_norm = _create_play_icon(22, c_new)
-                    w._img_hov = _create_play_icon(22, T.THEME_DIM)
-                    w.configure(image=w._img_hov if (getattr(w, "_is_hovered", False) and not getattr(w, "_is_pressed", False)) else w._img_norm)
-                except Exception: pass
-                
-            for child in w.winfo_children():
-                _sync_theme(child)
-                
-        _sync_theme(root)
+        _sync_theme(root, is_beta)
 
     def open_picker():
         if _pick["win"] is not None:
@@ -659,7 +742,7 @@ def gui():
     ver_field.pack(anchor="w")
     ver_field.pack_propagate(False)
     ver_lbl = ctk.CTkLabel(ver_field, textvariable=mc_var, text_color=T.FG,
-                            font=font(16, "bold"), anchor="w")
+                            font=font(16), anchor="w")
     ver_lbl.pack(side="left", fill="x", expand=True, padx=(14, 0))
     ver_arrow = ctk.CTkLabel(ver_field, text="▾", text_color=T.SUB, font=font(16, "bold"))
     ver_arrow.pack(side="right", padx=(0, 12))
@@ -685,41 +768,26 @@ def gui():
     hbox = ctk.CTkFrame(rbox, fg_color="transparent")
     hbox.pack(fill="x")
 
-    play_btn = mkbtn(hbox, "", lambda: do_play(), kind="play",
-                      width=52, height=52, corner_radius=12)
+    play_btn = mkbtn(hbox, "  Play", lambda: do_play(), kind="play",
+                      width=110, height=52, corner_radius=12,
+                      font=font(16, "bold"), text_color=T.FG)
+    play_btn.configure(anchor="center")
     play_btn._is_play_btn = True
-    play_btn._img_norm = _create_play_icon(22, T.THEME_ACCENT)
-    play_btn._img_hov = _create_play_icon(22, T.THEME_DIM)
-    play_btn.configure(image=play_btn._img_norm, fg_color=T.THEME_DIM, hover_color=T.THEME_ACCENT)
-    
-    def _pe(e):
-        play_btn._is_hovered = True
-        if not getattr(play_btn, "_is_pressed", False):
-            play_btn.configure(image=play_btn._img_hov)
-    def _pl(e):
-        play_btn._is_hovered = False
-        play_btn.configure(image=play_btn._img_norm)
-    def _pd(e):
-        play_btn._is_pressed = True
-        play_btn.configure(image=play_btn._img_norm)
-    def _pu(e):
-        play_btn._is_pressed = False
-        if getattr(play_btn, "_is_hovered", False):
-            play_btn.configure(image=play_btn._img_hov)
-    play_btn.bind("<Enter>", _pe, add="+")
-    play_btn.bind("<Leave>", _pl, add="+")
-    play_btn.bind("<Button-1>", _pd, add="+")
-    play_btn.bind("<ButtonRelease-1>", _pu, add="+")
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        play_btn._img_norm = _create_play_icon(16, T.FG, T.THEME_ACCENT)
+        play_btn.configure(image=play_btn._img_norm, fg_color=T.THEME_ACCENT, hover_color=T.THEME_ACCENT)
     play_btn.pack(side="right")
     play_btn._tooltip = Tooltip(play_btn, "Play Game")
 
-    settings_btn = mkbtn(hbox, "⚙", lambda: toggle_settings(), kind="ghost",
-                          width=52, height=52, corner_radius=12, font=font(18))
+    settings_btn = mkbtn(hbox, "⛭", lambda: toggle_settings(), kind="ghost",
+                          width=52, height=52, corner_radius=12, font=font(36))
     settings_btn.pack(side="right", padx=(0, 8))
     Tooltip(settings_btn, "Settings")
 
-    det_btn = mkbtn(hbox, "📋", lambda: toggle_details(), kind="ghost",
-                     width=52, height=52, corner_radius=12, font=font(18))
+    det_btn = mkbtn(hbox, "Details", lambda: toggle_details(), kind="ghost",
+                     width=70, height=52, corner_radius=12, font=font(16))
     det_btn.pack(side="right", padx=(0, 8))
     Tooltip(det_btn, "Details")
 
@@ -733,9 +801,9 @@ def gui():
     ctk.CTkLabel(log_head, text="ACTIVITY LOG", text_color=T.MUTED,
                  font=font(10, "bold")).pack(side="left")
 
-    logbox = tk.Text(detwrap, height=10, bg=T.CONSOLE_BG, fg=T.CONSOLE_FG, bd=0,
+    logbox = tk.Text(detwrap, height=10, bg=T.r(T.CONSOLE_BG), fg=T.r(T.CONSOLE_FG), bd=0,
                       font=(MONO, 10), highlightthickness=0,
-                      padx=12, pady=10, insertbackground=T.FG, wrap="word")
+                      padx=12, pady=10, insertbackground=T.r(T.FG), wrap="word")
 
     def clear_log():
         logbox.delete("1.0", "end")
@@ -881,12 +949,15 @@ def gui():
             acct_btn.configure(text="Sign out", fg_color=T.CARD_2, hover_color=T.CARD_3, text_color=T.FG)
             acct_btn._mode = "out"
             acct_btn._confirm_out = False
+            acct_btn._confirm_cancel = False
         elif ph == "auth":
             acct_txt_lbl.configure(cursor="", text_color=T.FG)
             acct_dot.configure(text_color=T.GOLD)
             acct_txt.set("Sign-in pending…")
-            acct_btn._mode = "out"
+            acct_btn.configure(text="Cancel", fg_color=T.CARD_2, hover_color=T.CARD_3, text_color=T.FG)
+            acct_btn._mode = "cancel"
             acct_btn._confirm_out = False
+            acct_btn._confirm_cancel = False
         else:
             acct_txt_lbl.configure(cursor="", text_color=T.FG)
             acct_dot.configure(text_color=T.SUB)
@@ -894,9 +965,13 @@ def gui():
             acct_btn.configure(text="Sign in", fg_color=T.CARD_2, hover_color=T.CARD_3, text_color=T.FG)
             acct_btn._mode = "in"
             acct_btn._confirm_out = False
+            acct_btn._confirm_cancel = False
 
     def acct_click():
-        if getattr(acct_btn, "_mode", "in") == "out":
+        mode = getattr(acct_btn, "_mode", "in")
+        if mode == "auth_loading":
+            return
+        if mode == "out":
             if getattr(acct_btn, "_confirm_out", False):
                 na.stop()
                 try:
@@ -910,17 +985,33 @@ def gui():
             else:
                 acct_btn._confirm_out = True
                 acct_btn.configure(text="Sign out?", fg_color=T.RED, hover_color=T.RED_HOV, text_color="white")
+        elif mode == "cancel":
+            if getattr(acct_btn, "_confirm_cancel", False):
+                na.stop()
+                from .auth import msa_signed_in
+                acct_state("in" if msa_signed_in() else "out")
+                if ui.get("auth_dialog") and ui["auth_dialog"].winfo_exists():
+                    ui["auth_dialog"].destroy()
+            else:
+                acct_btn._confirm_cancel = True
+                acct_btn.configure(text="Cancel?", fg_color=T.RED, hover_color=T.RED_HOV, text_color="white")
         else:
+            acct_btn._mode = "auth_loading"
+            acct_btn.configure(text="Loading…")
             threading.Thread(target=lambda: na.start(on_auth, on_online),
                               daemon=True).start()
 
     def _cancel_signout(e):
+        cp = str(e.widget)
+        bp = str(acct_btn)
         if getattr(acct_btn, "_confirm_out", False):
-            cp = str(e.widget)
-            bp = str(acct_btn)
             if cp != bp and not cp.startswith(bp + "."):
                 acct_btn._confirm_out = False
                 acct_btn.configure(text="Sign out", fg_color=T.CARD_2, hover_color=T.CARD_3, text_color=T.FG)
+        if getattr(acct_btn, "_confirm_cancel", False):
+            if cp != bp and not cp.startswith(bp + "."):
+                acct_btn._confirm_cancel = False
+                acct_btn.configure(text="Cancel", fg_color=T.CARD_2, hover_color=T.CARD_3, text_color=T.FG)
     root.bind_all("<Button-1>", _cancel_signout, add="+")
 
     def on_auth(url, code):
@@ -928,6 +1019,8 @@ def gui():
 
     def on_online():
         root.after(0, lambda: acct_state("in"))
+        if ui.get("auth_dialog") and ui["auth_dialog"].winfo_exists():
+            root.after(0, ui["auth_dialog"].destroy)
         def _bg_fetch():
             from .auth import msa_load, msa_refresh, xbl_preauth, _account_cache_epoch
             from .config import DATA
@@ -944,35 +1037,100 @@ def gui():
         threading.Thread(target=_bg_fetch, daemon=True).start()
 
     def code_dialog(url, code):
-        d = dialog("Sign in to Microsoft", 380, 220)
-        ctk.CTkLabel(d, text="Sign in to your Microsoft account",
-                     font=font(15, "bold"), text_color=T.FG).pack(
-                         anchor="w", padx=26, pady=(24, 0))
-        ctk.CTkLabel(d, text="Open the link and enter this code:",
-                     text_color=T.SUB).pack(anchor="w", padx=26, pady=(6, 12))
-        cf = ctk.CTkFrame(d, fg_color=T.CARD_2, corner_radius=10)
-        cf.pack(fill="x", padx=26)
-        ctk.CTkLabel(cf, text=code, text_color=T.GOLD,
-                      font=ctk.CTkFont(family=MONO, size=22,
-                                       weight="bold")).pack(padx=18, pady=12)
+        url = f"https://login.live.com/oauth20_remoteconnect.srf?otc={code}"
+        d = dialog("Sign in to Microsoft", 380, 370)
+        ui["auth_dialog"] = d
+        def on_close():
+            na.stop()
+            from .auth import msa_signed_in
+            acct_state("in" if msa_signed_in() else "out")
+            d.destroy()
+        d.protocol("WM_DELETE_WINDOW", on_close)
+        d.bind("<Escape>", lambda e: on_close())
         row = ctk.CTkFrame(d, fg_color="transparent")
-        row.pack(fill="x", padx=26, pady=(14, 24))
-        mkbtn(row, "Open link", lambda: subprocess.Popen(
+        row.pack(anchor="center", pady=(24, 8))
+        mkbtn(row, "Sign In to your Microsoft account", lambda: subprocess.Popen(
             ["xdg-open", url], stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL), kind="primary", width=120,
-            height=38).pack(side="left")
+            stderr=subprocess.DEVNULL), kind="primary",
+            font=font(16, "bold"), height=42, width=280, text_color=T.FG).pack(side="left")
+
+        ctk.CTkLabel(d, text="Scan this QR or open the link and enter this code:",
+                     text_color=T.SUB).pack(anchor="center", pady=(8, 12))
+
+        qr_frame = ctk.CTkFrame(d, fg_color="transparent", width=150, height=150)
+        qr_frame.pack_propagate(False)
+        qr_frame.pack(anchor="center", pady=(0, 16))
+        
+        bg_color = d.cget("fg_color")
+        if isinstance(bg_color, tuple):
+            bg_color = d._apply_appearance_mode(bg_color)
+        qr_lbl = tk.Label(qr_frame, bg=bg_color, bd=0)
+        qr_lbl.place(relx=0.5, rely=0.5, anchor="center")
+
+        if icon_img is not None:
+            factors = [10, 9, 8, 7, 6, 7, 8, 9]
+            step_idx = 0
+            def animate_qr():
+                nonlocal step_idx
+                if getattr(qr_lbl, "_is_loaded", False) or not qr_lbl.winfo_exists():
+                    return
+                try:
+                    im = icon_img.subsample(factors[step_idx])
+                    qr_lbl.configure(image=im)
+                    qr_lbl.image = im
+                except Exception: pass
+                step_idx = (step_idx + 1) % len(factors)
+                qr_lbl.after(125, animate_qr)
+            animate_qr()
+
+        def _load_qr():
+            from .qrcodegen import QrCode
+            from PIL import Image
+            try:
+                qr = QrCode.encode_text(url, QrCode.Ecc.LOW)
+                border = 2
+                size = qr.get_size() + border * 2
+                img = Image.new("1", (size, size), 1)
+                pixels = img.load()
+                for y in range(qr.get_size()):
+                    for x in range(qr.get_size()):
+                        if qr.get_module(x, y):
+                            pixels[x + border, y + border] = 0
+                img = img.resize((150, 150), Image.Resampling.NEAREST).convert("RGB")
+                ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(150, 150))
+                def _apply_qr():
+                    if not qr_frame.winfo_exists():
+                        return
+                    qr_lbl._is_loaded = True
+                    qr_lbl.destroy()
+                    ctk.CTkLabel(qr_frame, text="", image=ctk_img).pack(expand=True, fill="both")
+                    qr_frame._img = ctk_img
+                root.after(200, _apply_qr)
+            except Exception:
+                root.after(0, lambda: qr_lbl.winfo_exists() and (setattr(qr_lbl, "_is_loaded", True), qr_lbl.configure(image="", text="(Unavailable)", fg="gray")))
+        threading.Thread(target=_load_qr, daemon=True).start()
+
+        code_row = ctk.CTkFrame(d, fg_color="transparent")
+        code_row.pack(anchor="center", pady=(8, 24))
+        
+        c_ent = ctk.CTkEntry(code_row, width=175, fg_color="transparent", border_width=0,
+                             text_color=T.BLUE, justify="center",
+                             font=ctk.CTkFont(family=MONO, size=32, weight="bold"))
+        c_ent.insert(0, code)
+        c_ent.configure(state="readonly")
+        c_ent.pack(side="left")
 
         copy_btn = None
 
         def copy_code():
             root.clipboard_clear()
             root.clipboard_append(code)
-            copy_btn.configure(text="Copied ✓")
-            root.after(1200, lambda: copy_btn.configure(text="Copy code"))
+            copy_btn.configure(text="✓")
+            root.after(1200, lambda: copy_btn.winfo_exists() and copy_btn.configure(text="🗎"))
 
-        copy_btn = mkbtn(row, "Copy code", copy_code, kind="ghost", width=120,
-                          height=38)
-        copy_btn.pack(side="left", padx=10)
+        copy_btn = mkbtn(code_row, "🗎", copy_code, kind="ghost", width=32,
+                          height=32, font=font(16), corner_radius=8)
+        copy_btn.pack(side="left", padx=(2, 0))
 
     # ==================================================================
     # Versions
@@ -1016,31 +1174,33 @@ def gui():
     # ==================================================================
     def busy(on):
         ui["busy"] = on
-        if on:
-            play_btn._img_norm = _create_kill_icon(22, T.RED)
-            play_btn._img_hov = _create_kill_icon(22, T.RED_DIM)
-            play_btn.configure(
-                image=play_btn._img_hov if (getattr(play_btn, "_is_hovered", False) and not getattr(play_btn, "_is_pressed", False)) else play_btn._img_norm,
-                fg_color=T.RED_DIM,
-                hover_color=T.RED,
-                command=lambda: kill_wine()
-            )
-            if hasattr(play_btn, "_tooltip"):
-                play_btn._tooltip.text = "Kill Game"
-        else:
-            is_beta = "BETA" in mc_var.get() if mc_var.get() else False
-            accent = T.GOLD if is_beta else T.GREEN
-            dim = T.GOLD_DIM if is_beta else T.GREEN_DIM
-            play_btn._img_norm = _create_play_icon(22, accent)
-            play_btn._img_hov = _create_play_icon(22, dim)
-            play_btn.configure(
-                image=play_btn._img_hov if (getattr(play_btn, "_is_hovered", False) and not getattr(play_btn, "_is_pressed", False)) else play_btn._img_norm,
-                fg_color=dim,
-                hover_color=accent,
-                command=lambda: do_play()
-            )
-            if hasattr(play_btn, "_tooltip"):
-                play_btn._tooltip.text = "Play"
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            if on:
+                play_btn._img_norm = _create_kill_icon(16, T.FG, T.RED)
+                play_btn.configure(
+                    text="  Kill",
+                    image=play_btn._img_norm,
+                    fg_color=T.RED,
+                    hover_color=T.RED,
+                    text_color=T.FG,
+                    command=lambda: kill_wine()
+                )
+                if hasattr(play_btn, "_tooltip"):
+                    play_btn._tooltip.text = "Kill Game"
+            else:
+                play_btn._img_norm = _create_play_icon(16, T.FG, T.THEME_ACCENT)
+                play_btn.configure(
+                    text="  Play",
+                    image=play_btn._img_norm,
+                    fg_color=T.THEME_ACCENT,
+                    hover_color=T.THEME_ACCENT,
+                    text_color=T.FG,
+                    command=lambda: do_play()
+                )
+                if hasattr(play_btn, "_tooltip"):
+                    play_btn._tooltip.text = "Play Game"
 
     def do_play():
         if ui["busy"]:
@@ -1118,7 +1278,7 @@ def gui():
         tabs.pack(fill="both", expand=True)
         
         def _mk_sf(parent):
-            sf = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+            sf = ctk.CTkScrollableFrame(parent, fg_color=T.CARD_2)
             def _check(*_):
                 try:
                     c = sf._parent_canvas
@@ -1138,6 +1298,20 @@ def gui():
         tab_tools = _mk_sf(tabs.add("Tools"))
 
         # ---- General --------------------------------------------------
+        theme_v = tk.BooleanVar(value=load_settings().get("light_theme", False))
+        
+        def save_theme():
+            s2 = load_settings()
+            s2["light_theme"] = theme_v.get()
+            save_settings(s2)
+            ctk.set_appearance_mode("Light" if theme_v.get() else "Dark")
+            _sync_theme(root)
+            
+        ctk.CTkSwitch(tab_general, text="Use light theme",
+                      variable=theme_v, command=save_theme,
+                      progress_color=T.THEME_ACCENT, font=font(13)
+                      ).pack(anchor="w", pady=8, padx=4)
+
         beta_v = tk.BooleanVar(value=load_settings().get("show_betas", False))
 
         def save_beta():
@@ -1425,14 +1599,16 @@ def gui():
             if name and name != tag_name:
                 title_text += f" \u2014 {name}"
 
-            widget.insert("end", title_text + "\n", "release_title")
+            url = rel.get("html_url")
+            tags = ("release_title", "link", f"url:{url}") if url else ("release_title",)
+            widget.insert("end", title_text + "\n", tags)
             widget.insert("end", date + "\n", "release_date")
 
             if body:
                 render_markdown_to_text(widget, body, wrap_width=wrap_width)
 
             if i < len(rels) - 1:
-                div_frame = tk.Frame(widget, bg=T.SUB, height=1, width=1, bd=0)
+                div_frame = ctk.CTkFrame(widget, fg_color=T.MUTED, height=2, width=1, corner_radius=0)
                 div_frame.pack_propagate(False)
                 widget.insert("end", "\n", "divider_tag")
                 widget.window_create("end", window=div_frame)
@@ -1450,8 +1626,10 @@ def gui():
             title = format_display_version(title, is_beta)
             date = (art.get("updated_at") or "").split("T")[0]
             body = art.get("body") or ""
+            url = art.get("html_url")
 
-            widget.insert("end", title + "\n", "release_title")
+            tags = ("release_title", "link", f"url:{url}") if url else ("release_title",)
+            widget.insert("end", title + "\n", tags)
             widget.insert("end", date + "\n", "release_date")
 
             if body:
@@ -1552,7 +1730,7 @@ def gui():
                 parser.feed(body)
 
             if i < len(articles) - 1:
-                div_frame = tk.Frame(widget, bg=T.SUB, height=1, width=1, bd=0)
+                div_frame = ctk.CTkFrame(widget, fg_color=T.MUTED, height=2, width=1, corner_radius=0)
                 div_frame.pack_propagate(False)
                 widget.insert("end", "\n", "divider_tag")
                 widget.window_create("end", window=div_frame)
@@ -1614,7 +1792,7 @@ def gui():
                 show_error("No releases found.")
                 return
 
-            tb = ctk.CTkTextbox(tab, fg_color="transparent", corner_radius=12,
+            tb = ctk.CTkTextbox(tab, fg_color=T.CARD_2, corner_radius=12,
                                 text_color=T.FG, font=font(11), wrap="word")
             tb._x_scrollbar.grid = lambda *a, **k: None
             tb._x_scrollbar.grid_forget()
@@ -1642,7 +1820,7 @@ def gui():
             dividers = []
             f_family = font().cget("family")
             widget.tag_configure("quote", font=(f_family, 11, "italic"),
-                                 background=T.CARD_2, foreground=T.SUB,
+                                 background=T.r(T.CARD_2), foreground=T.r(T.SUB),
                                  lmargin1=10, rmargin=10,
                                  spacing1=3, spacing3=3)
             widget.tag_configure("normal", font=(f_family, 11),
@@ -1655,16 +1833,16 @@ def gui():
             widget.tag_configure("h3", font=(f_family, 12, "bold"),
                                  spacing1=4, spacing3=2)
             widget.tag_configure("code", font=(MONO, 9),
-                                 background=T.CARD_2,
-                                 foreground=T.BROWN)
+                                 background=T.r(T.CARD_2),
+                                 foreground=T.r(T.BROWN))
             widget.tag_configure("code_block", font=(MONO, 9),
-                                 background=T.CARD_2, foreground=T.FG,
+                                 background=T.r(T.CARD_2), foreground=T.r(T.FG),
                                  lmargin1=10, rmargin=10,
                                  spacing1=3, spacing3=3)
             widget.tag_configure("bullet", font=(f_family, 11),
                                  lmargin1=14, lmargin2=24)
-            widget.tag_configure("link", underline=True,
-                                 foreground=T.THEME_ACCENT)
+            widget.tag_configure("link", foreground=T.r(T.THEME_ACCENT))
+            widget.tag_configure("link_hover", underline=True)
 
             def on_link_click(event):
                 idx = widget.index(f"@{event.x},{event.y}")
@@ -1677,18 +1855,31 @@ def gui():
                             stderr=subprocess.DEVNULL)
                         break
 
-            widget.tag_bind("link", "<Enter>",
-                            lambda e: widget.configure(cursor="hand2"))
-            widget.tag_bind("link", "<Leave>",
-                            lambda e: widget.configure(cursor="arrow"))
+            def on_link_enter(event):
+                widget.configure(cursor="hand2")
+                idx = widget.index(f"@{event.x},{event.y}")
+                for tag in widget.tag_names(idx):
+                    if tag.startswith("url:"):
+                        ranges = widget.tag_ranges(tag)
+                        if ranges:
+                            for i in range(0, len(ranges), 2):
+                                widget.tag_add("link_hover", ranges[i], ranges[i+1])
+                        break
+                        
+            def on_link_leave(event):
+                widget.configure(cursor="arrow")
+                widget.tag_remove("link_hover", "1.0", "end")
+
+            widget.tag_bind("link", "<Enter>", on_link_enter)
+            widget.tag_bind("link", "<Leave>", on_link_leave)
             widget.tag_bind("link", "<Button-1>", on_link_click)
 
             widget.tag_configure("release_title",
                                  font=(f_family, 15, "bold"),
-                                 foreground=T.THEME_ACCENT,
+                                 foreground=T.r(T.THEME_ACCENT),
                                  spacing1=8, spacing3=1)
             widget.tag_configure("release_date", font=(f_family, 11),
-                                 foreground=T.SUB,
+                                 foreground=T.r(T.SUB),
                                  spacing1=0, spacing3=4)
             widget.tag_configure("divider_tag", spacing1=4, spacing3=4)
 
@@ -1755,7 +1946,7 @@ def gui():
         from .util import mc_releases, gh_releases
         from .config import SELF_REPO
 
-        load_tab_changelog(tab_game, mc_releases, render_game_changelog)
+        load_tab_changelog(tab_game, lambda: mc_releases(fetch_all=False), render_game_changelog)
         load_tab_changelog(tab_launcher,
                            lambda: gh_releases(SELF_REPO),
                            render_launcher_changelog)
@@ -1772,22 +1963,28 @@ def gui():
         mkbtn(ui["changelog_head"], "← Back", toggle_changelog, kind="flat", width=76,
               height=28, font=font(12)).pack(side="right")
 
+        ui["last_tab"] = "Game"
+        def on_tab_change():
+            ui["last_tab"] = tabs.get()
+
         tabs = ctk.CTkTabview(
             outer, fg_color=T.CARD_2,
             segmented_button_fg_color=T.CARD_2,
             segmented_button_selected_color=T.THEME_ACCENT,
             segmented_button_selected_hover_color=T.THEME_HOV,
             segmented_button_unselected_color=T.CARD_2,
-            text_color=T.FG, corner_radius=12)
+            text_color=T.FG, corner_radius=12, command=on_tab_change)
         tabs.pack(fill="both", expand=True)
         tab_game = tabs.add("Game")
         tab_launcher = tabs.add("Launcher")
         
         def _force_refresh(tab_name):
+            if ui.get("last_tab") != tab_name:
+                return
             from .util import mc_releases, gh_releases
             from .config import SELF_REPO
             if tab_name == "Game":
-                load_tab_changelog(tab_game, lambda: mc_releases(ignore_cache=True), render_game_changelog)
+                load_tab_changelog(tab_game, lambda: mc_releases(fetch_all=False, ignore_cache=True), render_game_changelog)
             elif tab_name == "Launcher":
                 load_tab_changelog(tab_launcher, lambda: gh_releases(SELF_REPO, ignore_cache=True), render_launcher_changelog)
                 
@@ -1853,13 +2050,13 @@ def gui():
         threading.Thread(target=work, daemon=True).start()
 
     def show_update_banner(rel):
-        bn = ctk.CTkFrame(root, fg_color=T.GREEN_DIM, corner_radius=12,
-                           border_width=1, border_color=T.GREEN)
+        bn = ctk.CTkFrame(root, fg_color=T.BLUE_DIM, corner_radius=12,
+                           border_width=1, border_color=T.BLUE)
         ctk.CTkLabel(bn, text=f"⟳   Update available — v{rel['version']}   "
-                     f"(you have {VERSION})", text_color=T.GREEN_LIGHT,
+                     f"(you have {VERSION})", text_color=T.BLUE_LIGHT,
                      font=font(12, "bold")).pack(side="left", padx=18, pady=9)
         mkbtn(bn, "Later", bn.destroy, kind="flat", width=64, height=30,
-              text_color=T.GREEN_MUTED, hover_color=T.GREEN_DARK).pack(
+              text_color=T.BLUE_MUTED, hover_color=T.BLUE_DARK).pack(
                   side="right", padx=(0, 14), pady=7)
         mkbtn(bn, "Update now", lambda: run_update(rel, bn), kind="primary",
               width=112, height=30, font=font(12, "bold")).pack(
