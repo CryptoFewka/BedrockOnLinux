@@ -74,7 +74,7 @@ WINEGDK_PREBUILT_REPO = "Wyze3306/BedrockOnLinux"
 WINEGDK_BUILD_REV = "wow64-archs-native5"
 # SHA-256 of the reviewed, deterministic engine archive. An invalid value makes
 # the installer fail closed rather than accepting a differently packed engine.
-WINEGDK_ARCHIVE_SHA256 = "35a2ead372f51bd3fc330a2da91e2a0846aa03a80bb0c175f049bef719398fcf"
+WINEGDK_ARCHIVE_SHA256 = "4c0b8b0f147b38bf4e34cef68ecda35172fc1728b43bf604d3554ccc595c72af"
 # SHA-256 of the deterministic WineGDK prefix tarball (build intermediate, not a
 # runtime download). build-winegdk.yml asserts it, and build-engine.yml verifies
 # a reused prefix against it, so the reuse path fails fast against a committed
