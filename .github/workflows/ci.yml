@@ -3,19 +3,15 @@
 # with the rest of the pipeline: hosted runners, SHA-pinned actions, least
 # privilege.
 name: CI
-
 on:
   pull_request:
   push:
     branches: [main]
-
 permissions:
   contents: read
-
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-
 jobs:
   tests:
     runs-on: ubuntu-24.04
@@ -30,7 +26,6 @@ jobs:
           .venv/bin/pip install --quiet --disable-pip-version-check \
             pytest 'cryptography==43.0.3'
           .venv/bin/python -m pytest -q
-
   static:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -38,16 +33,13 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
-
       - name: Byte-compile the package
         run: python3 -m compileall -q bol
-
       - name: Shellcheck the scripts
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends shellcheck
           shellcheck -S warning scripts/*.sh
-
       - name: Lint the workflows (actionlint)
         run: |
           ver=1.7.7
@@ -57,15 +49,12 @@ jobs:
           echo "${sha}  actionlint.tar.gz" | sha256sum -c -
           tar -xzf actionlint.tar.gz actionlint
           ./actionlint -color
-
       - name: Lint Python (ruff, pyflakes rules)
         run: pipx run --spec 'ruff==0.14.3' ruff check --select F bol/ tests/
-
       - name: Audit the workflows (zizmor)
         env:
           GH_TOKEN: ${{ github.token }}
         run: pipx run --spec 'zizmor==1.5.2' zizmor --persona=regular .github/workflows/
-
   cryptbase:
     # Wine runtime test for the from-source cryptbase RNG stub: proves
     # SystemFunction036 returns varied random bytes and does not recurse to a
@@ -88,3 +77,68 @@ jobs:
                 wine wine64 gcc-mingw-w64-x86-64
               scripts/test-cryptbase.sh
             '
+  pins:
+    # Guards against exactly the class of bug in #54's aftermath: bol/config.py
+    # can commit a SHA-256 pin for a release asset that was never actually
+    # published (or was published with different bytes) on WINEGDK_PREBUILT_REPO.
+    # That leaves `main` referencing an engine/xcurl archive nothing can
+    # download, which only surfaces later as a setup-time failure for users.
+    # Catch it here, at PR/push time, instead.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Verify committed release pins resolve to a matching published asset
+        run: |
+          set -euo pipefail
+          cfg=bol/config.py
+          repo="$(grep -m1 '^WINEGDK_PREBUILT_REPO = ' "$cfg" | cut -d'"' -f2)"
+
+          check_pin() {
+            local label="$1" tag="$2" asset_glob="$3" pin="$4"
+            echo "== checking ${label} (tag: ${tag})"
+            rm -rf /tmp/pin-check; mkdir -p /tmp/pin-check
+            if ! gh release download "$tag" -R "$repo" \
+                -p "$asset_glob" -D /tmp/pin-check 2>/tmp/pin-check.err; then
+              echo "::error::${label}: no release/asset matching '${asset_glob}' found on ${repo} at tag '${tag}'." >&2
+              cat /tmp/pin-check.err >&2
+              return 1
+            fi
+            local f got
+            f="$(find /tmp/pin-check -type f -name "$asset_glob" -print -quit)"
+            if [ -z "$f" ]; then
+              echo "::error::${label}: download succeeded but no file matched '${asset_glob}'." >&2
+              return 1
+            fi
+            got="$(sha256sum "$f" | cut -d' ' -f1)"
+            if [ "$got" != "$pin" ]; then
+              echo "::error::${label}: published asset SHA-256 does not match the pin in ${cfg}." >&2
+              echo "  pin      : ${pin}" >&2
+              echo "  published: ${got}" >&2
+              echo "  A stale/rebuilt pin usually means build-engine.yml (or build-xcurl.yml) was never" >&2
+              echo "  run with publish:true against ${repo} after the pin changed." >&2
+              return 1
+            fi
+            echo "   ok — ${label} pin matches the published asset."
+          }
+
+          fail=0
+
+          eng_rev="$(grep -m1 '^WINEGDK_BUILD_REV = ' "$cfg" | cut -d'"' -f2)"
+          eng_pin="$(grep -m1 '^WINEGDK_ARCHIVE_SHA256 = ' "$cfg" | cut -d'"' -f2)"
+          check_pin "engine (WINEGDK_ARCHIVE_SHA256)" \
+            "engine-${eng_rev}" "GDK-Proton-xuser-${eng_rev}.tar.gz" "$eng_pin" || fail=1
+
+          xcurl_rev="$(grep -m1 '^OPENSSL_XCURL_REV = ' "$cfg" | cut -d'"' -f2)"
+          xcurl_pin="$(grep -m1 '^OPENSSL_XCURL_ARCHIVE_SHA256 = ' "$cfg" | cut -d'"' -f2)"
+          check_pin "OpenSSL-XCurl set (OPENSSL_XCURL_ARCHIVE_SHA256)" \
+            "xcurl-${xcurl_rev}" "openssl-xcurl-set-${xcurl_rev}.tar.gz" "$xcurl_pin" || fail=1
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::One or more release pins in bol/config.py do not resolve to a matching published asset on ${repo}." >&2
+            exit 1
+          fi
