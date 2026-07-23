@@ -105,10 +105,9 @@ def apply_custom_env(env, custom_env):
 
 
 def http_json(url, timeout=10):
+    # Public read-only endpoints (GitHub releases, Minecraft feedback); no
+    # credentials, so an ambient token can't leak to a non-GitHub host.
     headers = {"User-Agent": APP, "Accept": "application/vnd.github+json"}
-    token = os.environ.get("GITHUB_TOKEN")
-    if token:
-        headers["Authorization"] = f"token {token}"
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())

@@ -1996,8 +1996,8 @@ def gui():
             except Exception as e:
                 err_msg = str(e)
                 if "403" in err_msg:
-                    err_msg += ("\n(Rate limit reached. Try setting "
-                                "GITHUB_TOKEN environment variable.)")
+                    err_msg += ("\n(Rate limit reached. This is temporary; the "
+                                "last changelog stays cached. Try again later.)")
                 def _err():
                     tab._is_loading = False
                     show_error(err_msg)
