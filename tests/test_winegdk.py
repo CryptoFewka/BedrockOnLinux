@@ -212,8 +212,9 @@ class WineGDKInstallTests(unittest.TestCase):
     def test_remote_download_ignores_stale_release_metadata(self):
         fresh = self._archive(name="fresh.tar.gz", marker="fresh")
         asset = f"GDK-Proton-xuser-{self.REV}.tar.gz"
+        repo = winegdk.WINEGDK_PREBUILT_REPO
         stale_metadata = self.cache / (
-            "releases_Wyze3306_BedrockOnLinux_30.json")
+            f"releases_{repo.replace('/', '_')}_30.json")
         stale_metadata.parent.mkdir(parents=True)
         stale_metadata.write_text(
             '[{"tag_name":"engine-old","assets":[]}]',
@@ -231,7 +232,7 @@ class WineGDKInstallTests(unittest.TestCase):
 
         self.assertTrue(installed)
         download.assert_called_once_with(
-            "https://github.com/Wyze3306/BedrockOnLinux/releases/download/"
+            f"https://github.com/{repo}/releases/download/"
             f"engine-{self.REV}/{asset}",
             self.cache / asset,
             "Game engine",
