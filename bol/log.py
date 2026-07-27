@@ -6,10 +6,7 @@ import sys
 IS_TTY = sys.stdout.isatty()
 _LOG_SINK = None       # GUI hook: callable(str)
 
-# How the four log levels are *shown*. The internal "::/OK/!!/xx" tag stays the
-# protocol between _emit and the GUI sink; only the rendering changes: a clear
-# word + colour in the terminal (ANSI, TTY only) and in the GUI log box.
-#   tag: (label, ansi-label, ansi-msg, gui-label-colour, gui-msg-colour)
+# The leading tag is the protocol consumed by the GUI log sink.
 _LEVELS = {
     "::": ("info ", "\033[38;5;111m", "",               "#6ea8fe", "#aeb4bf"),
     "OK": ("ok   ", "\033[38;5;78m",  "",               "#5bc46a", "#aeb4bf"),
@@ -22,7 +19,7 @@ _ANSI_RESET = "\033[0m"
 def _emit(tag, m):
     if _LOG_SINK:
         try:
-            _LOG_SINK(f"{tag} {m}")        # GUI parses the tag, renders it nicely
+            _LOG_SINK(f"{tag} {m}")
         except Exception:
             pass
     lvl = _LEVELS.get(tag)
@@ -49,4 +46,6 @@ class BolError(Exception):
 
 def die(m):
     err(m)
-    raise BolError(m)
+    exc = BolError(m)
+    exc.reported = True
+    raise exc

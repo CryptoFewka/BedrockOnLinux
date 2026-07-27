@@ -85,7 +85,14 @@ jobs:
         run: |
           commit="$(grep -m1 '^WINEGDK_SOURCE_COMMIT = ' bol/config.py | cut -d'"' -f2)"
           short="${commit:0:12}"
-          out="winegdk-prefix-${short}.tar.gz"
+          source_manifest="$(grep -m1 '^WINEGDK_SOURCE_MANIFEST_SHA256 = ' bol/config.py | cut -d'"' -f2)"
+          manifest_short="${source_manifest:0:12}"
+          actual_manifest="$(sha256sum third_party/winegdk-native5/SOURCE-SHA256SUMS | cut -d' ' -f1)"
+          if [ "$actual_manifest" != "$source_manifest" ]; then
+            echo "::error::WineGDK source manifest does not match its committed identity." >&2
+            exit 1
+          fi
+          out="winegdk-prefix-${short}-${manifest_short}.tar.gz"
           # Deterministic tar + gzip -n so the prefix tarball is reproducible.
           # Includes the .bol-winegdk-* provenance dotfiles the packager requires.
           tar --sort=name --format=gnu --hard-dereference \
@@ -106,10 +113,12 @@ jobs:
             echo "sha256=$sha"
             echo "commit=$commit"
             echo "short=$short"
+            echo "manifest_short=$manifest_short"
           } >> "$GITHUB_OUTPUT"
           {
             echo "TARBALL=$out"
             echo "SHORT=$short"
+            echo "MANIFEST_SHORT=$manifest_short"
           } >> "$GITHUB_ENV"
           echo "built WineGDK prefix: $out  sha256=$sha"
 
@@ -133,8 +142,10 @@ jobs:
         if: ${{ inputs.publish }}
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          tag_name: winegdk-${{ env.SHORT }}
-          name: WineGDK prefix ${{ env.SHORT }}
+          tag_name: winegdk-${{ env.SHORT }}-${{ env.MANIFEST_SHORT }}
+          target_commitish: ${{ github.sha }}
+          name: WineGDK prefix ${{ env.SHORT }}-${{ env.MANIFEST_SHORT }}
+          make_latest: false
           body: >
             Reproducible WineGDK build (debian:bullseye container) from source
             commit ${{ steps.pack.outputs.commit }}. SHA-256

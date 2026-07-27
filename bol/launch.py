@@ -16,6 +16,8 @@ from .auth import (
     wine_apply_winegdk_prereqs,
     wine_reg_set_refresh_token,
     xbl_preauth,
+    xbl_preauth_diagnostic,
+    xbl_preauth_error_message,
 )
 from .config import CONTENT, DATA, HOME, LOGS, WINEGDK_BUILD_REV
 from .deps import ensure_login_deps
@@ -44,6 +46,15 @@ from .vkd3d import prepare_universal_vkd3d
 from .winegdk import ensure_winegdk
 
 
+_SONY_STEAM_INPUT_HIDRAW_IDS = ",".join((
+    "0x054C/0x05C4",  # DualShock 4
+    "0x054C/0x09CC",  # DualShock 4 v2
+    "0x054C/0x0BA0",  # DualShock 4 wireless adapter
+    "0x054C/0x0CE6",  # DualSense
+    "0x054C/0x0DF2",  # DualSense Edge
+))
+
+
 def _prepare_graphics_engine():
     """Activate the universal DGC pair without opening Vulkan in the launcher."""
     if custom_proton():
@@ -52,7 +63,6 @@ def _prepare_graphics_engine():
         variant, changed = prepare_universal_vkd3d(
             proton_path(), WINEGDK_BUILD_REV)
     except BolError as exc:
-        # The CLI catches BolError, so emit the actionable manifest error here.
         die(str(exc))
     info(f"Graphics command path: {variant}"
          + (" (activated)." if changed else " (already active)."))
@@ -67,6 +77,112 @@ def _require_vkd3d_config(env, option):
     if option not in options:
         options.append(option)
     env["VKD3D_CONFIG"] = ",".join(options)
+
+
+def _steam_input_available(environ=None):
+    """Whether Steam handed an actual virtual controller to this launch."""
+    source = os.environ if environ is None else environ
+    # Steam app IDs do not prove that Steam Input is enabled for the shortcut.
+    for name in ("SteamVirtualGamepadInfo_Proton",
+                 "SteamVirtualGamepadInfo"):
+        if str(source.get(name, "")).strip():
+            return True
+    return False
+
+
+def _is_steam_deck(environ=None, product_name_path=None):
+    """Detect Steam Deck without running a graphics or hardware probe."""
+    source = os.environ if environ is None else environ
+    if str(source.get("SteamDeck", "")).strip() == "1":
+        return True
+    product = (Path(product_name_path) if product_name_path is not None
+               else Path("/sys/devices/virtual/dmi/id/product_name"))
+    try:
+        return product.read_text(errors="ignore").strip().lower() in {
+            "jupiter", "galileo",
+        }
+    except OSError:
+        return False
+
+
+def _configure_runtime_compat(env, settings, backend, host_wayland,
+                              diagnostics=False, host_env=None,
+                              steam_deck=None):
+    """Apply launcher-owned Proton compatibility defaults.
+
+    Explicit values from the Advanced custom-environment field are applied
+    later and therefore remain the final authority.
+    """
+    source = os.environ if host_env is None else host_env
+    # Drop inherited compatibility flags; Advanced custom values are applied
+    # last and remain the supported override.
+    for name in (
+        "PROTON_ENABLE_WAYLAND",
+        "WINE_DISABLE_VULKAN_OPWR",
+        "PROTON_PREFER_SDL",
+        "PROTON_DISABLE_HIDRAW",
+        "PROTON_NO_STEAMINPUT",
+        "PROTON_NO_WM_DECORATION",
+        "PROTON_USE_WINED3D",
+        "PROTON_LOG",
+        "PROTON_LOG_DIR",
+    ):
+        env.pop(name, None)
+
+    if backend == "x11":
+        # Keep the stable X11/Xwayland path independent of global Wine settings.
+        env["PROTON_ENABLE_WAYLAND"] = "0"
+        if host_wayland:
+            # Avoid stale Xwayland frames after hiding and restoring the window.
+            env["WINE_DISABLE_VULKAN_OPWR"] = "1"
+
+    # GDK-Proton disables Steam Input under Wine-Wayland; HID filtering there
+    # would leave no usable controller.
+    if backend != "wayland" and _steam_input_available(source):
+        # Hide only Sony raw interfaces when Steam supplies its virtual pad.
+        env["PROTON_DISABLE_HIDRAW"] = _SONY_STEAM_INPUT_HIDRAW_IDS
+    else:
+        # SDL exposes Sony devices as gamepads when Steam Input is unavailable.
+        env["PROTON_PREFER_SDL"] = "1"
+
+    on_deck = _is_steam_deck(source) if steam_deck is None else steam_deck
+    if on_deck:
+        # Prevent Wine's decorated frame around fullscreen on Steam Deck.
+        env["PROTON_NO_WM_DECORATION"] = "1"
+
+    renderer = str(settings.get("renderer", "auto")).strip().lower()
+    if renderer in {"opengl", "wined3d", "legacy"}:
+        # Fallback for GPUs below modern DXVK's Vulkan requirement.
+        env["PROTON_USE_WINED3D"] = "1"
+
+    if diagnostics:
+        env["PROTON_LOG"] = "1"
+        env["PROTON_LOG_DIR"] = str(LOGS)
+        # These hot polling channels can starve the game with synchronous trace
+        # output; keep their warnings and errors without enabling trace.
+        env["WINEDEBUG"] = (
+            "+gdkc,trace-gdkc,+xgameruntime,"
+            "trace-xgameruntime,fixme-all"
+        )
+    else:
+        # Avoid Proton's heavyweight debug log during normal play.
+        env["WINEDEBUG"] = "-all"
+
+
+def _configure_graphics_cache(env, managed_engine):
+    """Keep managed-engine shader caches across Minecraft version changes."""
+    if not managed_engine:
+        return
+    cache = DATA / "graphics-cache"
+    cache.mkdir(parents=True, exist_ok=True, mode=0o700)
+    env["VKD3D_SHADER_CACHE_PATH"] = str(cache)
+    env["DXVK_SHADER_CACHE_PATH"] = str(cache)
+
+
+def _clear_previous_proton_logs():
+    """Keep post-mortem diagnosis scoped to the launch about to start."""
+    for path in (LOGS / "proton.log", *LOGS.glob("steam-*.log")):
+        path.unlink(missing_ok=True)
 
 
 def _prefix_stably_idle_after_wrapper(timeout=10.0, interval=0.1,
@@ -108,20 +224,16 @@ def _prepare_launch_engine():
     return _prepare_graphics_engine()
 
 
-def _launch_once():
+def _launch_once(lock_fds=()):
     s = load_settings()
     gd = s.get("game_dir")
     if not gd or not Path(gd, "Minecraft.Windows.exe").exists():
         die("No game — choose a Minecraft version first.")
     if not proton_path():
         die("GDK-Proton missing — run Install / Update.")
-    # Installing, hashing, and wiring the managed engine does not open a GPU.
-    # Do it before graphics validation so a corrected engine can migrate state
-    # left by the previous revision without bypassing kernel/display checks.
+    # Engine preparation is GPU-free and may repair state from an older build.
     _prepare_launch_engine()
-    # launch() holds the launch lock, and preparation just proved that no
-    # process owns the prefix. Retire only a same-boot marker whose wrapper
-    # completion was durably recorded; the full safety gate runs immediately.
+    # Only completed, idle wrappers can retire a current-boot marker.
     retire_idle_current_boot_marker()
     require_safe_graphics_session()
 
@@ -156,26 +268,26 @@ def _launch_once():
     access = (fresh or {}).get("access_token")
     ensure_login_deps()
     if not xbl_preauth(access or "", account_epoch):
-        die("Could not prepare a complete Xbox Live multiplayer session. "
-            "Check the Microsoft account/network connection and try again.")
+        detail = xbl_preauth_error_message()
+        diagnostic = xbl_preauth_diagnostic() or {}
+        stage = diagnostic.get("stage")
+        suffix = f" (stage: {stage})" if stage else ""
+        die(
+            "Could not prepare a complete Xbox Live multiplayer session"
+            + suffix + ". "
+            + (detail or
+               "Check the Microsoft account/network connection and try again.")
+        )
     exe = str(CONTENT / "Minecraft.Windows.exe")
     bump_stack_reserve(Path(exe))
     cmd, env = proton_umu_cmd(exe)
-    env["PROTON_LOG"] = "1"
-    env["PROTON_LOG_DIR"] = str(LOGS)
     # Required by the menu's indirect root-CBV updates (#27/#29/#30).
     _require_vkd3d_config(env, "force_raw_va_cbv")
     diag = (s.get("diagnostics", False) or os.environ.get("BOL_DIAG") == "1")
-    # Keep diagnostics focused on the native GDK contracts. Raw WinHTTP trace
-    # includes Authorization headers and must never be enabled automatically.
-    env["WINEDEBUG"] = (os.environ.get("WINEDEBUG")
-                        or ("trace+gdkc,trace+xgameruntime,fixme-all" if diag
-                            else "fixme-all"))
     xlog = os.environ.get("BOL_XCURL_LOG")
     if xlog == "1" or (xlog is None and diag):
         env["XCURL_LOG"] = "1"
-    # VR runtimes crash the non-VR game; Wine's AMD AGS builtin recurses until
-    # stack overflow. cryptbase keeps the native RNG stub with builtin fallback.
+    # Disable incompatible VR/AGS paths; retain native cryptbase with fallback.
     overrides = ["cryptbase=n,b", "vrclient=", "vrclient_x64=", "openvr_api=",
                  "wineopenxr=", "amd_ags_x64="]
     cur = os.environ.get("WINEDLLOVERRIDES", "")
@@ -202,7 +314,6 @@ def _launch_once():
         san = "".join(c.upper() if c.isalnum() else "_" for c in host)
         env["WINEGDK_XSTS_RP_" + san] = rp
         info(f"XSTS relying party override [{host}] = {rp}")
-    # Also protects non-GUI callers from a concurrent account change.
     if not account_epoch_is_current(account_epoch):
         die("The Microsoft account changed during launch. Minecraft was not "
             "started; click PLAY again with the current account.")
@@ -219,6 +330,10 @@ def _launch_once():
         backend = "x11"
     elif want_gamescope and not shutil.which("gamescope"):
         warn("BOL_GAMESCOPE is set but gamescope isn't installed — ignored.")
+    _configure_runtime_compat(
+        env, s, backend, bool(wl), diagnostics=diag,
+    )
+    _configure_graphics_cache(env, managed_engine=not custom_proton())
     disp = os.environ.get("DISPLAY")
     if backend == "wayland" and wl:
         env["PROTON_ENABLE_WAYLAND"] = "1"
@@ -262,6 +377,8 @@ def _launch_once():
         die("The Microsoft account changed before the game process started. "
             "Minecraft was not started; click PLAY again.")
     apply_custom_env(env, s.get("custom_env") or "")
+    # Prevent diagnosis from attributing stale Proton logs to this launch.
+    _clear_previous_proton_logs()
     info("Starting Minecraft … sign in with Microsoft in-game, then "
          "join your server from the Servers tab.")
     glog = open(LOGS / "minecraft.log", "w")
@@ -273,10 +390,18 @@ def _launch_once():
         # A hard reboot leaves this marker so the next launch fails closed.
         gpu_marker_token = arm_gpu_launch()
         try:
-            proc = subprocess.Popen(cmd, env=env, cwd=str(CONTENT), stdout=glog,
-                                    stderr=subprocess.STDOUT)
+            popen_options = {
+                "env": env,
+                "cwd": str(CONTENT),
+                "stdout": glog,
+                "stderr": subprocess.STDOUT,
+            }
+            if lock_fds:
+                # Keep both launch locks alive in UMU if the Python launcher
+                # is killed. UMU remains the game wrapper for the session.
+                popen_options["pass_fds"] = tuple(lock_fds)
+            proc = subprocess.Popen(cmd, **popen_options)
         except Exception:
-            # No process handle means the GPU launch never began.
             try:
                 if not disarm_gpu_launch(gpu_marker_token):
                     warn("The game process could not be started and its GPU "
@@ -360,5 +485,5 @@ def _launch_once():
 
 def launch():
     """Run exactly one guarded launch for each user action."""
-    with launch_lock():
-        return _launch_once()
+    with launch_lock() as lock_fds:
+        return _launch_once(lock_fds)

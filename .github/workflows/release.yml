@@ -71,6 +71,8 @@ jobs:
           xsha="$(grep -m1 '^OPENSSL_XCURL_ARCHIVE_SHA256 = ' $cfg | cut -d'"' -f2)"
           commit="$(grep -m1 '^WINEGDK_SOURCE_COMMIT = ' $cfg | cut -d'"' -f2)"
           wshort="${commit:0:12}"
+          wmanifest="$(grep -m1 '^WINEGDK_SOURCE_MANIFEST_SHA256 = ' "$cfg" | cut -d'"' -f2)"
+          wmshort="${wmanifest:0:12}"
           wpre="$(grep -m1 '^WINEGDK_PREFIX_SHA256 = ' $cfg | cut -d'"' -f2)"
           vtag="vkd3d-3.0.1-nv-dgc"
           # Reuse a release when it exists and (if a SHA is committed) its
@@ -90,7 +92,7 @@ jobs:
             fi
           }
           bx="$(needs_build "xcurl-${xrev}" "openssl-xcurl-set-${xrev}.tar.gz" "$xsha")"
-          bw="$(needs_build "winegdk-${wshort}" "winegdk-prefix-${wshort}.tar.gz" "$wpre")"
+          bw="$(needs_build "winegdk-${wshort}-${wmshort}" "winegdk-prefix-${wshort}-${wmshort}.tar.gz" "$wpre")"
           # vkd3d has no single committed tarball SHA (its wrapper is not the
           # integrity boundary; the DLL hashes in OUTPUT-SHA256SUMS are). So it
           # reuses on existence; build-engine verifies the DLLs against that

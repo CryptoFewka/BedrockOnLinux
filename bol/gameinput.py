@@ -5,8 +5,8 @@ import struct
 import zlib
 from pathlib import Path
 
-from .log import info, ok, warn
-from .prefix import require_prefix_idle
+from .log import BolError, info, ok, warn
+from .prefix import prefix_ready, require_prefix_idle
 from .wine_registry import reg_dword, reg_sz, update_prefix_registry
 
 def gameinput_redist_ok(prefix: Path):
@@ -101,19 +101,19 @@ def _cab_payload(cab: bytes):
     coff_files = u("<I", cab, 16)[0]
     cfolders, cfiles, flags = u("<HHH", cab, 26)
     o, cb_folder, cb_data = 36, 0, 0
-    if flags & 4:                       # per-CFDATA/CFFOLDER reserved areas
+    if flags & 4:
         cb_header, cb_folder, cb_data = u("<HBB", cab, o)
         o += 4 + cb_header
     folders = []
     for _ in range(cfolders):
-        coff, ndata, _t = u("<IHH", cab, o)
+        coff, ndata, _ = u("<IHH", cab, o)
         o += 8 + cb_folder
         folders.append((coff, ndata))
     files, p = [], coff_files
     for _ in range(cfiles):
-        cb, uoff, ifol = u("<IIH", cab, p)[0], u("<IIH", cab, p)[1], u("<IIH", cab, p)[2]
+        cb, uoff, ifol = u("<IIH", cab, p)
         p += 16
-        p = cab.index(b"\x00", p) + 1   # skip the NUL-terminated name
+        p = cab.index(b"\x00", p) + 1
         files.append((cb, uoff, ifol))
     fdata = []
     for coff, ndata in folders:
@@ -123,7 +123,7 @@ def _cab_payload(cab: bytes):
             q += 8 + cb_data
             blk = cab[q:q + cb_d]
             q += cb_d
-            if blk[:2] != b"CK":        # not MSZip — give up, caller falls back
+            if blk[:2] != b"CK":
                 return []
             d = zlib.decompressobj(-15, zdict=prev[-32768:] if prev else b"")
             out += d.decompress(blk[2:]) + d.flush()
@@ -149,22 +149,19 @@ def _extract_gameinput_redist(msi_path: Path, prefix: Path):
     are identified structurally (PE dll/exe + size rank), which matches the
     redist's stable shape; the MSI's own OriginalFilename fields are unreliable
     (GameInputBridge reports itself as GameInputRedist). Returns True on
-    success, False to let the caller fall back to running the MSI."""
+    success, or False for an unrecognised payload."""
     cab = _msi_embedded_cab(msi_path.read_bytes())
     pes = [(len(d), k, d) for _, d in _cab_payload(cab)
            for k in [_pe_kind(d)] if k]
     dlls = sorted([d for _, k, d in pes if k == "dll"], key=len, reverse=True)
     exes = sorted([d for _, k, d in pes if k == "exe"], key=len, reverse=True)
-    if not dlls or not exes:            # unrecognised payload → MSI fallback
+    if not dlls or not exes:
         return False
     x64 = prefix / "drive_c/Program Files/Microsoft GameInput/x64"
     x86 = prefix / "drive_c/Program Files/Microsoft GameInput/x86"
     sys32 = prefix / "drive_c/windows/system32"
     x64.mkdir(parents=True, exist_ok=True)
-    sys32.mkdir(parents=True, exist_ok=True)   # may be absent on a fresh prefix
-    # Largest dll = GameInputRedist.dll (exports GameInputCreate); next =
-    # GameInputBridge.dll; smallest = the x86 build. Largest exe = the
-    # service; next = the raw-input proxy.
+    # The redist has no reliable filenames; size order is its stable structure.
     (x64 / "GameInputRedist.dll").write_bytes(dlls[0])
     (sys32 / "GameInputRedist.dll").write_bytes(dlls[0])
     (x64 / "GameInputRedistService.exe").write_bytes(exes[0])
@@ -218,6 +215,13 @@ def install_gameinput(prefix: Path, game_dir: Path):
     RtlGenRandom custom action hangs msiexec for minutes on some hosts. An
     unrecognised payload fails closed with a warning; PLAY never starts an MSI,
     Wine Explorer, or a second graphics session as a fallback."""
+    prefix = Path(prefix)
+    if not prefix_ready(prefix):
+        raise BolError(
+            "Cannot install Microsoft GameInput: the Wine prefix is "
+            "incomplete (system.reg, user.reg, or system32 is missing). "
+            "Re-run 'Install / Update' to initialise it first."
+        )
     require_prefix_idle(prefix, "install Microsoft GameInput offline")
     if gameinput_redist_ok(prefix):
         _set_gameinput_registry(prefix)

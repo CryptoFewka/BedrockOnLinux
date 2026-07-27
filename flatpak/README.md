@@ -19,7 +19,8 @@ flatpak run io.github.wyze3306.BedrockOnLinux
 
 Test order: (1) build passes — the `python3` module aborts if tkinter didn't
 link; (2) the Tk window opens; (3) engine/game download lands in
-`~/.local/share/bedrock-on-linux`; (4) the game launches — the
+`~/.var/app/io.github.wyze3306.BedrockOnLinux/data/bedrock-on-linux`; (4) the
+UMU runtime stays below that same private directory; (5) the game launches — the
 pressure-vessel-inside-Flatpak step is the one most likely to need iteration.
 To debug: `flatpak run --devel --command=sh io.github.wyze3306.BedrockOnLinux`
 then `bedrock-on-linux play`.
@@ -75,11 +76,20 @@ Per <https://docs.flathub.org/docs/for-app-authors/submission>:
   the game runs through umu-launcher → pressure-vessel (Steam Linux Runtime),
   which spawns its sub-sandbox via the Flatpak portal and runs 32-bit Wine
   code; same permission set as Lutris, Bottles and Heroic.
-- `--filesystem=xdg-data/bedrock-on-linux:create`: the launcher's data dir
-  (engine, game files, Wine prefix), shared with non-Flatpak installs.
-- `--filesystem=xdg-data/umu:create`, `--filesystem=~/.steam:create`: dirs
-  umu-launcher/Proton expect for the Steam-compat layout.
 - `--share=network`: downloads + Microsoft/Xbox sign-in + multiplayer.
+- `--filesystem=~/.local/share/bedrock-on-linux:ro`: one-upgrade transition
+  access to the exact old data root. The explicit home-relative path leaves the
+  private XDG destination writable; the `xdg-data` alias must not be used here
+  because Flatpak maps it onto that destination. The app atomically copies the
+  old tree before any command can populate the destination and cannot continue
+  writing to the host folder. Remove this permission after the migration
+  window.
+
+The game, engine, prefix, account, UMU runtime and empty Proton Steam-compat
+directory all live under Flatpak's private XDG data directory. The narrowly
+scoped legacy permission above is read-only and transitional, not a storage
+location. The old tree remains as a recovery copy; conflicting populated trees
+are never merged automatically.
 
 The app ships no Minecraft content; users supply their own game files
 (launcher precedent on Flathub: `io.mrarm.mcpelauncher`).

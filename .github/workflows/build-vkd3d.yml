@@ -128,7 +128,9 @@ jobs:
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: vkd3d-3.0.1-nv-dgc
+          target_commitish: ${{ github.sha }}
           name: vkd3d-proton universal DGC 3.0.1
+          make_latest: false
           body: >
             Reproducible universal vkd3d-proton (EXT + restored NV DGC) build.
             SHA-256 ${{ steps.pack.outputs.sha256 }}.

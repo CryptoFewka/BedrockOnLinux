@@ -1,8 +1,8 @@
-# Universal vkd3d-proton payload for engines r11, r12 and native5
+# Universal vkd3d-proton payload for engines r11, r12 and native5 through native12
 
 BedrockOnLinux engine revisions `wow64-archs-r11`, `wow64-archs-r12` and
-`wow64-archs-native5` use a reviewed vkd3d-proton 3.0.1 build containing both
-Vulkan device-generated-command implementations.
+`wow64-archs-native5` through `wow64-archs-native12` use a reviewed vkd3d-proton 3.0.1
+build containing both Vulkan device-generated-command implementations.
 vkd3d-proton itself selects `VK_EXT_device_generated_commands` when the
 selected device fully supports it and falls back to
 `VK_NV_device_generated_commands` on older NVIDIA drivers.

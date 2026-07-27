@@ -36,7 +36,7 @@ on:
         default: release
   push:
     tags:
-      - "app-v*"
+      - "v[0-9]*"
 
 permissions:
   contents: read
@@ -184,6 +184,11 @@ jobs:
           CHANNEL_INPUT: ${{ inputs.channel }}
         run: |
           ver="$(grep -m1 '^VERSION = ' bol/config.py | cut -d'"' -f2)"
+          if [ "$GITHUB_EVENT_NAME" = "push" ] \
+              && [ "$GITHUB_REF_NAME" != "v${ver}" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match VERSION=$ver" >&2
+            exit 1
+          fi
           eng_rev="$(grep -m1 '^WINEGDK_BUILD_REV = ' bol/config.py | cut -d'"' -f2)"
           eng_sha="$(grep -m1 '^WINEGDK_ARCHIVE_SHA256 = ' bol/config.py | cut -d'"' -f2)"
           wg_commit="$(grep -m1 '^WINEGDK_SOURCE_COMMIT = ' bol/config.py | cut -d'"' -f2)"
@@ -200,7 +205,7 @@ jobs:
             name="BedrockOnLinux nightly ${ver} ($(date -u +%Y-%m-%d), ${GITHUB_SHA:0:7})"
             pre="true"
           else
-            tag="app-v${ver}"; name="BedrockOnLinux ${ver}"; pre="false"
+            tag="v${ver}"; name="BedrockOnLinux ${ver}"; pre="false"
           fi
           {
             echo "VER=$ver"
@@ -229,8 +234,10 @@ jobs:
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
           name: ${{ env.RELEASE_NAME }}
           prerelease: ${{ env.RELEASE_PRERELEASE }}
+          make_latest: ${{ env.RELEASE_PRERELEASE == 'false' }}
           body: |
             Application artifacts built from source, consuming this fork's
             attested, pinned engine and OpenSSL-XCurl set.

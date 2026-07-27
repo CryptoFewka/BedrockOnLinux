@@ -4,6 +4,7 @@
 import json
 import os
 import re
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -41,7 +42,6 @@ def msa_load():
 def msa_save(tok):
     MSA_DIR.mkdir(parents=True, exist_ok=True)
     p = MSA_DIR / "token.json"
-    import tempfile
     fd, tmp = tempfile.mkstemp(prefix=".token-", suffix=".tmp", dir=MSA_DIR)
     try:
         with os.fdopen(fd, "w") as stream:
@@ -112,25 +112,16 @@ def msa_refresh(refresh_token):
 class NativeAuth:
     """MSA device-code login for the no-ProxyPass path. We only obtain an
     OAuth refresh token; WineGDK's XUser reads it from the prefix registry
-    and performs the Xbox Live / XSTS exchange itself. GUI-compatible with
-    ProxyPass (`.auth`, `.start`, `.stop`, `.running`)."""
+    and performs the Xbox Live / XSTS exchange itself."""
 
     def __init__(self):
-        self.auth = None
-        self.online = False
-        self.proc = None
-        self.dest = None
         self._stop = False
-
-    def running(self):
-        return False
 
     def signed_in(self):
         return msa_signed_in()
 
-    def start(self, on_auth=None, on_online=None, dest=None):
+    def start(self, on_auth=None, on_online=None):
         if msa_signed_in():
-            self.online = True
             if on_online:
                 on_online()
             ok("Microsoft account already linked (in-game login)")
@@ -157,7 +148,6 @@ class NativeAuth:
                     f"{d.get('error_description') or d.get('error') or d}")
             url = d.get("verification_uri") or "https://www.microsoft.com/link"
             code = d.get("user_code")
-            self.auth = (url, code)
             if on_auth:
                 on_auth(url, code)
             info(f"Microsoft sign-in → {url} code {code}")
@@ -193,8 +183,6 @@ class NativeAuth:
                     if self._stop or _account_cache_epoch(
                             DATA / "winegdk-preauth") != account_epoch:
                         return
-                    self.auth = None
-                    self.online = True
                     if on_online:
                         on_online()
                     ok("Microsoft account linked (in-game login)")
@@ -217,10 +205,163 @@ class _HttpResp:
     def __init__(self, status_code, raw):
         self.status_code = status_code
         self._raw = raw
-        self.text = raw.decode("utf-8", "replace")
 
     def json(self):
         return json.loads(self._raw)
+
+
+_XBL_PREAUTH_DIAGNOSTIC = None
+_XBL_PREAUTH_DIAGNOSTIC_LOCK = threading.Lock()
+
+_XBL_PREAUTH_MESSAGES = {
+    "age": (
+        "Xbox Live requires age or family-account verification. Review the "
+        "account's birth date, family membership and Xbox privacy settings, "
+        "then sign out and sign in again."
+    ),
+    "account": (
+        "Xbox Live rejected this Microsoft account. Sign in on xbox.com, "
+        "finish creating or verifying the Xbox profile and accept any "
+        "requested terms, then sign out and sign in again."
+    ),
+    "network": (
+        "Xbox Live could not be reached. Check the Internet connection, DNS, "
+        "VPN or proxy and firewall, then try again."
+    ),
+    "local": (
+        "Xbox Live support is incomplete in this installation. Run Repair, "
+        "then try again."
+    ),
+    "session": (
+        "The Microsoft account changed while Xbox Live was being prepared. "
+        "Start the game again with the current account."
+    ),
+    "service": (
+        "Xbox Live returned an unexpected response. Try again later; if it "
+        "continues, enable diagnostics and include the pre-auth stage."
+    ),
+    "incomplete": (
+        "Xbox Live did not provide every token required for multiplayer. "
+        "Verify the Xbox profile and account settings, then try again."
+    ),
+}
+
+_XBL_PREAUTH_DIAGNOSTIC_PRIORITY = {
+    "incomplete": 10,
+    "service": 20,
+    "network": 30,
+    "local": 40,
+    "session": 40,
+    "account": 50,
+    "age": 60,
+}
+
+# These Xbox service errors have an explicit age/family-account resolution.
+# Keep the whitelist numeric: response bodies and their free-form messages can
+# contain credentials and must never be retained in launcher state or logs.
+_XBL_AGE_ERROR_CODES = {
+    2148916236,  # Adult verification is required.
+    2148916237,  # Adult verification is unavailable for this account.
+    2148916238,  # Child account must be added to a Microsoft family.
+}
+
+_XBL_ACCOUNT_ERROR_CODES = {
+    2148916233,  # The Microsoft account has no Xbox profile.
+    2148916234,
+    2148916235,  # Xbox Live is unavailable for the account/region.
+}
+
+
+def _clear_xbl_preauth_diagnostic():
+    global _XBL_PREAUTH_DIAGNOSTIC
+    with _XBL_PREAUTH_DIAGNOSTIC_LOCK:
+        _XBL_PREAUTH_DIAGNOSTIC = None
+
+
+def _record_xbl_preauth_diagnostic(
+        stage, category, http_status=None, error_code=None):
+    """Retain only whitelisted, non-secret details about a pre-auth failure."""
+
+    global _XBL_PREAUTH_DIAGNOSTIC
+    if (not isinstance(stage, str)
+            or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,47}", stage)):
+        stage = "unknown"
+    if category not in _XBL_PREAUTH_MESSAGES:
+        category = "service"
+
+    diagnostic = {
+        "stage": stage,
+        "category": category,
+        "message": _XBL_PREAUTH_MESSAGES[category],
+    }
+    if (isinstance(http_status, int) and not isinstance(http_status, bool)
+            and 100 <= http_status <= 599):
+        diagnostic["http_status"] = http_status
+    if (isinstance(error_code, int) and not isinstance(error_code, bool)
+            and 0 <= error_code <= 0xffffffff):
+        diagnostic["error_code"] = error_code
+
+    with _XBL_PREAUTH_DIAGNOSTIC_LOCK:
+        previous = _XBL_PREAUTH_DIAGNOSTIC
+        if (previous is None
+                or _XBL_PREAUTH_DIAGNOSTIC_PRIORITY[category]
+                > _XBL_PREAUTH_DIAGNOSTIC_PRIORITY[
+                    previous.get("category", "service")]):
+            _XBL_PREAUTH_DIAGNOSTIC = diagnostic
+
+
+def xbl_preauth_diagnostic():
+    """Return a copy of the last sanitized pre-auth failure, if any."""
+
+    with _XBL_PREAUTH_DIAGNOSTIC_LOCK:
+        if _XBL_PREAUTH_DIAGNOSTIC is None:
+            return None
+        return dict(_XBL_PREAUTH_DIAGNOSTIC)
+
+
+def xbl_preauth_error_message():
+    """Return an actionable, credential-free message for the last failure."""
+
+    diagnostic = xbl_preauth_diagnostic()
+    if diagnostic is None:
+        return None
+    return diagnostic["message"]
+
+
+def _xbl_response_error(response):
+    """Classify an HTTP failure without preserving its response body."""
+
+    status = getattr(response, "status_code", None)
+    error_code = None
+    try:
+        payload = response.json()
+    except (TypeError, ValueError, AttributeError):
+        payload = None
+    if isinstance(payload, dict):
+        lowered = {str(key).casefold(): value
+                   for key, value in payload.items()}
+        value = lowered.get("xerr")
+        if value is None:
+            value = lowered.get("xerrcode")
+        if isinstance(value, int) and not isinstance(value, bool):
+            error_code = value
+        elif isinstance(value, str) and re.fullmatch(
+                r"(?:[0-9]{1,10}|0x[0-9a-fA-F]{1,8})", value):
+            error_code = int(value, 16 if value.startswith("0x") else 10)
+        if error_code is not None and not 0 <= error_code <= 0xffffffff:
+            error_code = None
+
+    if error_code in _XBL_AGE_ERROR_CODES:
+        category = "age"
+    elif (error_code in _XBL_ACCOUNT_ERROR_CODES
+          or status in (400, 401, 403)):
+        category = "account"
+    elif status in (408, 425, 429) or (
+            isinstance(status, int) and status >= 500):
+        category = "network"
+    else:
+        category = "service"
+    return category, status, error_code
 
 
 _ONLINE_PREAUTH_REQUIREMENTS = {
@@ -243,6 +384,7 @@ _ONLINE_PREAUTH_REQUIREMENTS = {
 _WINEGDK_EXPIRY_EPOCH_FIELDS = {
     "user_token_expiry": "user_token_expiry_epoch",
     "xbl_token_expiry": "xbl_token_expiry_epoch",
+    "achievements_expiry": "achievements_expiry_epoch",
     "sisu_expiry": "sisu_expiry_epoch",
     "mp_expiry": "mp_expiry_epoch",
     "realms_expiry": "realms_expiry_epoch",
@@ -252,6 +394,16 @@ _WINEGDK_EXPIRY_EPOCH_FIELDS = {
 
 _XBOX_SUBMICROSECOND_FRACTION = re.compile(
     r"(\.\d{6})\d+(?=(?:Z|[+-]\d{2}:\d{2})?$)"
+)
+
+_ACHIEVEMENTS_FIELDS = (
+    "achievements_token",
+    "achievements_uhs",
+    "achievements_expiry",
+)
+_ACHIEVEMENTS_CACHE_FIELDS = (
+    *_ACHIEVEMENTS_FIELDS,
+    "achievements_expiry_epoch",
 )
 
 
@@ -343,6 +495,55 @@ def _xbl_gamertag_claims(claims):
     return result
 
 
+def _validated_achievements_fields(payload, now=None, min_ttl=60):
+    """Return a complete, canonical optional Achievements credential block."""
+    from datetime import timezone
+
+    if not isinstance(payload, dict):
+        return {}
+    token = payload.get("achievements_token")
+    uhs = payload.get("achievements_uhs")
+    expiry = payload.get("achievements_expiry")
+    if not isinstance(token, str) or not token.strip():
+        return {}
+    if (not isinstance(uhs, str)
+            or not re.fullmatch(r"[0-9]+", uhs, re.ASCII)
+            or len(uhs) > 20):
+        return {}
+    uhs_value = int(uhs, 10)
+    if not 1 <= uhs_value <= 0xffffffffffffffff:
+        return {}
+    if not isinstance(expiry, str) or not expiry.strip():
+        return {}
+    try:
+        stamp = _parse_xbox_expiry(expiry)
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        current = time.time() if now is None else now
+        if stamp.timestamp() <= current + min_ttl:
+            return {}
+    except (ValueError, OverflowError, OSError):
+        return {}
+    return {
+        "achievements_token": token,
+        "achievements_uhs": str(uhs_value),
+        "achievements_expiry": expiry,
+    }
+
+
+def _sanitize_optional_achievements(payload, now=None, min_ttl=60):
+    """Remove partial or stale Achievements credentials from a payload."""
+    if not isinstance(payload, dict):
+        return payload
+    sanitized = {
+        key: value for key, value in payload.items()
+        if key not in _ACHIEVEMENTS_CACHE_FIELDS
+    }
+    sanitized.update(_validated_achievements_fields(
+        payload, now=now, min_ttl=min_ttl))
+    return sanitized
+
+
 def _with_winegdk_expiry_epochs(payload):
     """Return a copy with WineGDK's decimal epoch expiry fields.
 
@@ -354,7 +555,7 @@ def _with_winegdk_expiry_epochs(payload):
 
     if not isinstance(payload, dict):
         return payload
-    enriched = dict(payload)
+    enriched = _sanitize_optional_achievements(payload)
     for iso_field, epoch_field in _WINEGDK_EXPIRY_EPOCH_FIELDS.items():
         raw = enriched.get(iso_field)
         try:
@@ -486,8 +687,6 @@ def account_epoch_is_current(expected_epoch):
 
 def _purge_account_preauth(msa_token_path=None):
     """Invalidate and remove account-bound XSTS data, preserving device keys."""
-    import tempfile
-
     cache = DATA / "winegdk-preauth"
     cache.mkdir(parents=True, exist_ok=True)
     try:
@@ -539,7 +738,6 @@ def _store_online_preauth(path, payload, expected_epoch=None):
     payload = _with_winegdk_expiry_epochs(payload)
     if _online_preauth_problems(payload):
         return False
-    import tempfile
     with _account_cache_lock(path.parent):
         current_epoch = _account_cache_epoch(path.parent)
         if current_epoch is None:
@@ -578,6 +776,7 @@ def xbl_preauth(msa_access_token, expected_account_epoch=None):
     device-only data.
     """
     import base64, uuid as _uuid
+    _clear_xbl_preauth_diagnostic()
     cache = DATA / "winegdk-preauth"
     cache.mkdir(parents=True, exist_ok=True)
     try:
@@ -588,20 +787,29 @@ def xbl_preauth(msa_access_token, expected_account_epoch=None):
     current_epoch = _account_cache_epoch(cache)
     account_epoch = (current_epoch if expected_account_epoch is None
                      else expected_account_epoch)
-    if current_epoch != account_epoch or account_epoch is None:
-        warn("xbl_preauth: the Microsoft account changed before Xbox "
-             "pre-auth started; refusing stale credentials.")
-        return False
     if account_epoch is None:
+        _record_xbl_preauth_diagnostic("account-cache", "account")
         warn("Xbox Live pre-auth: account-cache generation is invalid or "
              "unreadable; refusing cached credentials. Sign out and sign in "
              "again to rebuild it safely.")
+        return False
+    if current_epoch != account_epoch:
+        _record_xbl_preauth_diagnostic("account-cache", "session")
+        warn("xbl_preauth: the Microsoft account changed before Xbox "
+             "pre-auth started; refusing stale credentials.")
         return False
     cached = _load_online_preauth(out_path)
     cached_ready = (_cached_account_matches(cached, account_epoch)
                     and not _online_preauth_problems(cached))
 
-    def _fallback(message):
+    def _fallback(message, stage=None, category=None, response=None):
+        if response is not None:
+            category, status, error_code = _xbl_response_error(response)
+            _record_xbl_preauth_diagnostic(
+                stage or "unknown", category, status, error_code)
+        elif category is not None:
+            _record_xbl_preauth_diagnostic(
+                stage or "unknown", category)
         warn(message)
         current_epoch = _account_cache_epoch(cache)
         current_ready = (
@@ -624,6 +832,7 @@ def xbl_preauth(msa_access_token, expected_account_epoch=None):
                      "for WineGDK.")
             info("Xbox Live pre-auth: keeping the complete unexpired cached "
                  "online tokens.")
+            _clear_xbl_preauth_diagnostic()
             return True
         if cached_ready and current_epoch == account_epoch:
             warn("Xbox Live pre-auth: cached online tokens expired while the "
@@ -632,16 +841,17 @@ def xbl_preauth(msa_access_token, expected_account_epoch=None):
 
     if not msa_access_token:
         return _fallback("xbl_preauth: no fresh Microsoft access token; cannot "
-                         "refresh the Xbox multiplayer chain.")
+                         "refresh the Xbox multiplayer chain.",
+                         "microsoft-token", "account")
     try:
         from cryptography.hazmat.primitives.asymmetric import ec
         from cryptography.hazmat.primitives import hashes, serialization
-    except ImportError as e:
-        return _fallback(f"xbl_preauth: missing Python dep ({e}) — cannot "
-                         "refresh online tokens.")
+    except ImportError:
+        return _fallback("xbl_preauth: a required Python dependency is "
+                         "missing; cannot refresh online tokens.",
+                         "local-dependency", "local")
     key_path = cache / "device-key.pem"
-    # Reuse persisted EC P-256 key + UUID across launches so Xbox Live sees
-    # the same device on every session.
+    # Xbox Live expects a stable device identity across launches.
     if key_path.exists() and (cache / "device-id.txt").exists():
         try:
             with open(key_path, "rb") as f:
@@ -674,10 +884,9 @@ def xbl_preauth(msa_access_token, expected_account_epoch=None):
     #   ver(4) || \0 || ts(8) || \0 || method || \0 || path || \0 || auth || \0 || body || \0
     # SHA-256 of this is what gets signed (matches Wine-side
     # DeviceAuth_SignRequest in dlls/xgameruntime/.../DeviceAuth.c).
-    import time as _time
     from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
     def _sign_header(method, path, body_bytes):
-        now_ft = int((_time.time() + 11644473600) * 1e7)
+        now_ft = int((time.time() + 11644473600) * 1e7)
         ver = (1).to_bytes(4, "big")
         ts = now_ft.to_bytes(8, "big")
         hash_input = (ver + b"\0" + ts + b"\0"
@@ -720,12 +929,20 @@ def xbl_preauth(msa_access_token, expected_account_epoch=None):
                 "ProofKey": proof_key,
             },
         })
-    except Exception as e:
-        return _fallback(f"xbl_preauth: device.auth POST failed: {e}")
+    except Exception:
+        return _fallback("xbl_preauth: device.auth POST failed "
+                         "(network error).", "device-auth", "network")
     if r.status_code != 200:
-        return _fallback(f"xbl_preauth: device.auth HTTP {r.status_code}")
-    j = r.json()
-    device_token = j["Token"]
+        return _fallback(f"xbl_preauth: device.auth HTTP {r.status_code}",
+                         "device-auth", response=r)
+    try:
+        j = r.json()
+        device_token = j["Token"]
+        if not isinstance(device_token, str) or not device_token:
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        return _fallback("xbl_preauth: device.auth returned an invalid "
+                         "response.", "device-auth", "service")
 
     user_token = None
     user_token_expiry = None
@@ -740,19 +957,63 @@ def xbl_preauth(msa_access_token, expected_account_epoch=None):
                     "RpsTicket": "t=" + msa_access_token,
                 },
             })
-            if ru.status_code == 200:
-                uj = ru.json()
-                user_token = uj["Token"]
-                user_token_expiry = uj.get("NotAfter", "")
-            else:
+        except Exception:
+            _record_xbl_preauth_diagnostic("user-auth", "network")
+            warn("xbl_preauth: user.auth POST failed (network error).")
+        else:
+            if ru.status_code != 200:
+                category, status, error_code = _xbl_response_error(ru)
+                _record_xbl_preauth_diagnostic(
+                    "user-auth", category, status, error_code)
                 warn(f"xbl_preauth: user.auth HTTP {ru.status_code}")
-        except Exception as e:
-            warn(f"xbl_preauth: user.auth POST failed: {e}")
+            else:
+                try:
+                    uj = ru.json()
+                    user_token = uj["Token"]
+                    user_token_expiry = uj.get("NotAfter", "")
+                    if not isinstance(user_token, str) or not user_token:
+                        raise ValueError
+                except (KeyError, TypeError, ValueError):
+                    user_token = None
+                    user_token_expiry = None
+                    _record_xbl_preauth_diagnostic(
+                        "user-auth", "service")
+                    warn("xbl_preauth: user.auth returned an invalid "
+                         "response.")
 
-    # ---- 3a. sisu /authorize for http://xboxlive.com ----
-    # Returns the DisplayClaims (xid, gtg, agg, …) LoadDefaultUser needs to
-    # populate the XUser handle (its own xsts.auth call would RST under Wine).
-    def _sisu(rp):
+    def _xsts_user(rp, stage):
+        if not user_token:
+            return None
+        try:
+            r = _xbl_post("https://xsts.auth.xboxlive.com/xsts/authorize", {
+                "RelyingParty": rp,
+                "TokenType": "JWT",
+                "Properties": {
+                    "SandboxId": "RETAIL",
+                    "UserTokens": [user_token],
+                },
+            })
+        except Exception:
+            _record_xbl_preauth_diagnostic(stage, "network")
+            warn(f"xbl_preauth: {stage} failed (network error).")
+            return None
+        if r.status_code != 200:
+            category, status, error_code = _xbl_response_error(r)
+            _record_xbl_preauth_diagnostic(
+                stage, category, status, error_code)
+            warn(f"xbl_preauth: {stage} HTTP {r.status_code}")
+            return None
+        try:
+            payload = r.json()
+            if not isinstance(payload, dict):
+                raise ValueError
+            return payload
+        except (TypeError, ValueError):
+            _record_xbl_preauth_diagnostic(stage, "service")
+            warn(f"xbl_preauth: {stage} returned an invalid response.")
+            return None
+
+    def _sisu(rp, stage):
         if not msa_access_token: return None
         try:
             r = _xbl_post("https://sisu.xboxlive.com/authorize", {
@@ -767,15 +1028,41 @@ def xbl_preauth(msa_access_token, expected_account_epoch=None):
                 "AcceptOffers": True,
                 "ProofKey": proof_key,
             })
-            if r.status_code != 200:
-                warn(f"xbl_preauth: sisu({rp}) HTTP {r.status_code}")
-                return None
-            return r.json()
-        except Exception as e:
-            warn(f"xbl_preauth: sisu({rp}) failed: {e}")
+        except Exception:
+            _record_xbl_preauth_diagnostic(stage, "network")
+            warn(f"xbl_preauth: {stage} failed (network error).")
+            return None
+        if r.status_code != 200:
+            category, status, error_code = _xbl_response_error(r)
+            _record_xbl_preauth_diagnostic(
+                stage, category, status, error_code)
+            warn(f"xbl_preauth: {stage} HTTP {r.status_code}")
+            return None
+        try:
+            payload = r.json()
+            if not isinstance(payload, dict):
+                raise ValueError
+            return payload
+        except (TypeError, ValueError):
+            _record_xbl_preauth_diagnostic(stage, "service")
+            warn(f"xbl_preauth: {stage} returned an invalid response.")
             return None
 
-    xbl_sisu = _sisu("http://xboxlive.com") or {}
+    achievements_auth = _xsts_user(
+        "http://xboxlive.com", "xsts-achievements") or {}
+    achievements_uhs = None
+    try:
+        achievements_uhs = (
+            achievements_auth["DisplayClaims"]["xui"][0].get("uhs"))
+    except (KeyError, IndexError, TypeError):
+        pass
+    achievements_fields = _validated_achievements_fields({
+        "achievements_token": achievements_auth.get("Token"),
+        "achievements_uhs": achievements_uhs,
+        "achievements_expiry": achievements_auth.get("NotAfter", ""),
+    })
+
+    xbl_sisu = _sisu("http://xboxlive.com", "sisu-profile") or {}
     xbl_auth = xbl_sisu.get("AuthorizationToken", {}) if xbl_sisu else {}
     xbl_token = xbl_auth.get("Token")
     xbl_expiry = xbl_auth.get("NotAfter", "") if xbl_auth else ""
@@ -786,7 +1073,8 @@ def xbl_preauth(msa_access_token, expected_account_epoch=None):
         pass
     xbl_privileges_present, xbl_privileges = _xbl_privilege_claim(xbl_claims)
 
-    pf_sisu = _sisu("https://b980a380.minecraft.playfabapi.com/") or {}
+    pf_sisu = _sisu(
+        "https://b980a380.minecraft.playfabapi.com/", "sisu-playfab") or {}
     pf_auth = pf_sisu.get("AuthorizationToken", {}) if pf_sisu else {}
     sisu_rp = "https://b980a380.minecraft.playfabapi.com/" if pf_auth.get("Token") else None
     sisu_token = pf_auth.get("Token")
@@ -797,10 +1085,9 @@ def xbl_preauth(msa_access_token, expected_account_epoch=None):
     except (KeyError, IndexError, TypeError):
         pass
 
-    # ---- 3c. sisu /authorize for the multiplayer RP, used when joining a
-    # third-party server — without a pre-minted token the live SISU call RSTs
-    # and the join fails (pings still work).
-    mp_sisu = _sisu("https://multiplayer.minecraft.net/") or {}
+    # Joining requires this audience even when server pings already work.
+    mp_sisu = _sisu(
+        "https://multiplayer.minecraft.net/", "sisu-multiplayer") or {}
     mp_auth = mp_sisu.get("AuthorizationToken", {}) if mp_sisu else {}
     mp_rp = "https://multiplayer.minecraft.net/" if mp_auth.get("Token") else None
     mp_token = mp_auth.get("Token")
@@ -811,13 +1098,9 @@ def xbl_preauth(msa_access_token, expected_account_epoch=None):
     except (KeyError, IndexError, TypeError):
         pass
 
-    # ---- 3d. sisu /authorize for the Bedrock Realms RP.  The current game
-    # reaches Realms through *.realms.minecraft-services.net, but that service
-    # still validates an XSTS token whose audience is the canonical legacy
-    # Bedrock RP.  A generic http://xboxlive.com token reaches the edge but is
-    # rejected with HTTP 401.
+    # Realms still validates the canonical legacy Bedrock audience.
     realms_relying_party = "https://pocket.realms.minecraft.net/"
-    realms_sisu = _sisu(realms_relying_party) or {}
+    realms_sisu = _sisu(realms_relying_party, "sisu-realms") or {}
     realms_auth = (realms_sisu.get("AuthorizationToken", {})
                    if realms_sisu else {})
     realms_rp = realms_relying_party if realms_auth.get("Token") else None
@@ -829,13 +1112,9 @@ def xbl_preauth(msa_access_token, expected_account_epoch=None):
     except (KeyError, IndexError, TypeError):
         pass
 
-    # ---- 3e. sisu /authorize for the licensing RP, used by the in-game
-    # Marketplace — its catalog/entitlement edges (collections/purchase.
-    # mp.microsoft.com, inventory/licensing.xboxlive.com) only accept an XSTS
-    # token minted for http://licensing.xboxlive.com. Pre-mint it here so the
-    # store catalog loads instead of hanging on a live SISU call (which RSTs
-    # under Wine GnuTLS).
-    lic_sisu = _sisu("http://licensing.xboxlive.com") or {}
+    # Marketplace catalog and entitlement endpoints require this audience.
+    lic_sisu = _sisu(
+        "http://licensing.xboxlive.com", "sisu-licensing") or {}
     lic_auth = lic_sisu.get("AuthorizationToken", {}) if lic_sisu else {}
     lic_rp = "http://licensing.xboxlive.com" if lic_auth.get("Token") else None
     lic_token = lic_auth.get("Token")
@@ -893,8 +1172,9 @@ def xbl_preauth(msa_access_token, expected_account_epoch=None):
         "lic_token": lic_token,
         "lic_uhs": lic_uhs,
         "lic_expiry": lic_expiry,
-        "obtained": int(_time.time()),
+        "obtained": int(time.time()),
     }
+    out.update(achievements_fields)
     # Modern gamertag components are optional SISU claims.  Keep them
     # separate because GDK callers provide component-specific buffer sizes;
     # returning the classic tag for ModernSuffix can fail XblContext setup.
@@ -908,24 +1188,23 @@ def xbl_preauth(msa_access_token, expected_account_epoch=None):
     if problems:
         return _fallback("xbl_preauth: incomplete online chain ("
                          + ", ".join(problems) + "); refusing to replace "
-                         "device.json with a partial payload.")
-    # Atomic write: two launches (or a launch racing a stale one) both ran
-    # xbl_preauth and a plain write_text let their output interleave, leaving a
-    # corrupted xbl_xuid in device.json — which the game then loads and faults
-    # on. Write to a temp file in the same dir and rename, so a reader only ever
-    # sees a complete file and the last writer wins cleanly.
+                         "device.json with a partial payload.",
+                         "online-chain", "incomplete")
     if not _store_online_preauth(out_path, out,
                                  expected_epoch=account_epoch):
         return _fallback("xbl_preauth: account changed while refreshing; "
-                         "refusing to store or reuse the old online payload.")
+                         "refusing to store or reuse the old online payload.",
+                         "account-cache", "session")
     bits = ["device"]
     if user_token: bits.append("user")
     if xbl_token: bits.append("XBL")
+    if achievements_fields: bits.append("XSTS-achievements")
     if sisu_token: bits.append("SISU-pf")
     if mp_token: bits.append("SISU-mp")
     if realms_token: bits.append("SISU-realms")
     if lic_token: bits.append("SISU-lic")
     ok(f"Xbox Live pre-auth: {', '.join(bits)}")
+    _clear_xbl_preauth_diagnostic()
     return True
 
 
@@ -960,6 +1239,11 @@ def wine_apply_winegdk_prereqs():
     machine = [
         reg_dword(r"Software\Microsoft\Windows NT\CurrentVersion\OEM",
                   "ConsoleMode", 8),
+        # Upgraded prefixes may retain Wine's empty WinRT registration.
+        reg_sz(
+            r"Software\Microsoft\WindowsRuntime\ActivatableClassId"
+            r"\Microsoft.Windows.Storage.Pickers.FileOpenPicker",
+            "DllPath", r"C:\windows\system32\windows.storage.dll"),
     ]
     # Azure rejects Wine GnuTLS' TLS 1.3 handshake (7-byte fatal Alert →
     # 0x80090304); forcing TLS 1.2 via DefaultSecureProtocols lets the
@@ -980,16 +1264,8 @@ def wine_apply_winegdk_prereqs():
          "0"),
     ):
         user.append(reg_sz("Environment", name, val))
-    # Issue #26: in windowed mode the mouse cursor escapes the game window when
-    # the player looks around. Minecraft confines the cursor with ClipCursor
-    # during mouse-look, but under Wine that grab is unreliable for an
-    # individually-managed top-level window (the compositor/focus handshake can
-    # drop it), so the OS pointer drifts out — only visible when the game isn't
-    # fullscreen. Running inside a Wine virtual desktop gives Wine a single
-    # owning X window it fully controls, which makes ClipCursor confine to the
-    # game window reliably. Opt-in (setting `confine_cursor` / env
-    # BOL_CONFINE_CURSOR=1) because it changes windowing for the whole prefix.
-    # A persisted marker lets the common path revert cleanly on toggle-off.
+    # Wine's virtual desktop makes ClipCursor reliable in windowed mode.
+    # This remains opt-in because it changes windowing for the whole prefix.
     from .util import _screen_wh
     confine = (os.environ.get("BOL_CONFINE_CURSOR", "").lower()
                in ("1", "yes", "on", "true")

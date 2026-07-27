@@ -35,11 +35,9 @@ finish-args:
   - --share=ipc
   # engine/game downloads, Microsoft sign-in, multiplayer
   - --share=network
-  # the launcher's data dir (shared with non-Flatpak installs) and the
-  # Steam-compat dirs umu/Proton expect
-  - --filesystem=xdg-data/bedrock-on-linux:create
-  - --filesystem=xdg-data/umu:create
-  - --filesystem=~/.steam:create
+  # Read-only access to the pre-XDG location for one-time migration. Using the
+  # xdg-data alias here would shadow the private XDG destination read-only.
+  - --filesystem=~/.local/share/bedrock-on-linux:ro
   # umu/pressure-vessel spawns its Steam Linux Runtime sub-sandbox through the
   # Flatpak portal; Wine needs ptrace (devel) and 32-bit code (multiarch)
   - --talk-name=org.freedesktop.Flatpak
@@ -150,9 +148,9 @@ modules:
         url: https://files.pythonhosted.org/packages/df/b2/87e62e8c3e2f4b32e5fe99e0b86d576da1312593b39f47d8ceef365e95ed/packaging-26.2-py3-none-any.whl
         sha256: 5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e
 
-  # python-xlib (+ its six dep): lets bol.x11 read the primary monitor's size
-  # straight from the X server's RandR extension instead of parsing `xrandr`
-  # CLI text. Optional (bol.x11 falls back to the xrandr CLI without it),
+  # python-xlib (+ its six dep): lets bol.x11 read monitor geometry straight
+  # from the X server's RandR extension instead of parsing `xrandr` CLI text.
+  # Optional (bol.x11 falls back to the xrandr CLI without it),
   # but vendored the same way since the runtime has no pip.
   - name: python3-xlib
     buildsystem: simple

@@ -8,5 +8,6 @@ This is a plain package with no import-time side effects: the entry points are
 """
 # SPDX-License-Identifier: MIT
 from .config import VERSION
+from . import relocation as relocation
 
 __version__ = VERSION

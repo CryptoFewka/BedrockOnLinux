@@ -54,7 +54,7 @@ def _pack_subfolder(manifest):
         return "behavior_packs"
     if types & {"world_template"}:
         return "world_templates"
-    return "resource_packs"          # resources (and the safe default)
+    return "resource_packs"
 
 
 def _install_pack_tree(pack_root: Path, base: Path, fallback_name: str):
@@ -78,8 +78,10 @@ def _install_pack_tree(pack_root: Path, base: Path, fallback_name: str):
 
 
 def import_content(src, prefix=None):
-    """Import a .mcpack/.mcaddon/.mcworld/.mctemplate into the game. Returns a
-    list of human-readable result strings."""
+    """Import a .mcpack/.mcaddon/.mcworld/.mctemplate/.mcskin into the game.
+
+    Returns a list of human-readable result strings.
+    """
     src = Path(src).expanduser()
     if not src.is_file():
         die(f"File not found: {src}")
@@ -102,8 +104,6 @@ def import_content(src, prefix=None):
         ok(f"Imported {kind} → {dest.name}")
         return results
 
-    # .mcpack (single pack) or .mcaddon (one or more packs): extract to a temp
-    # dir, then move every folder that has a manifest.json to its right home.
     tmp = base / ".bol-import-tmp"
     shutil.rmtree(tmp, ignore_errors=True)
     tmp.mkdir(parents=True, exist_ok=True)
@@ -112,7 +112,6 @@ def import_content(src, prefix=None):
             z.extractall(tmp)
         manifests = sorted(tmp.rglob("manifest.json"),
                            key=lambda p: len(p.parts))
-        # Skip nested manifests (a pack inside an already-claimed pack dir).
         claimed, roots = [], []
         for mf in manifests:
             r = mf.parent
@@ -134,7 +133,8 @@ def import_content(src, prefix=None):
 
 def cmd_import(paths):
     if not paths:
-        die("Usage: bedrock-on-linux import <file.mcpack|.mcworld|.mcaddon> …")
+        die("Usage: bedrock-on-linux import "
+            "<file.mcpack|.mcworld|.mcaddon|.mctemplate|.mcskin> …")
     if _mc_running():
         warn("Minecraft appears to be running — close it before importing so "
              "the game picks up new content on next launch.")

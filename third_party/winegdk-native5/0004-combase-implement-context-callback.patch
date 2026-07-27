@@ -1,0 +1,977 @@
+From: BedrockOnLinux contributors
+Subject: [PATCH] combase: implement cross-apartment context callbacks
+
+Backport Wine's IContextCallback implementation and its required COM
+interfaces from upstream commits 4caf188c, fc6ecfff, ad19f069, a3b1793d,
+c77dc7cc, d2c35cca and 87555ec5.  This lets C++/WinRT resume an asynchronous
+file-picker operation on its captured apartment instead of failing with
+E_NOTIMPL.  RoFailFastWithErrorContext remains untouched.
+
+diff --git a/dlls/combase/combase.c b/dlls/combase/combase.c
+index 34a9a42dc2a7992f026caa8df8929845f0a0fc95..d308101f005e64cd62602caabf8e9eecd4f1af21 100644
+--- a/dlls/combase/combase.c
++++ b/dlls/combase/combase.c
+@@ -22,14 +22,17 @@
+ #define WIN32_NO_STATUS
+ #define USE_COM_CONTEXT_DEF
+ #include "objbase.h"
++#include "comsvcs.h"
+ #include "ctxtcall.h"
+ #include "oleauto.h"
+ #include "dde.h"
+ #include "winternl.h"
+ 
++#include "dcom.h"
+ #include "combase_private.h"
+ 
+ #include "wine/debug.h"
++#include "wine/exception.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(ole);
+ 
+@@ -396,39 +399,6 @@ HRESULT WINAPI InternalTlsAllocData(struct tlsdata **data)
+     return S_OK;
+ }
+ 
+-static void com_cleanup_tlsdata(void)
+-{
+-    struct tlsdata *tlsdata = NtCurrentTeb()->ReservedForOle;
+-    struct init_spy *cursor, *cursor2;
+-
+-    if (!tlsdata)
+-        return;
+-
+-    if (tlsdata->apt)
+-        apartment_release(tlsdata->apt);
+-    if (tlsdata->implicit_mta_cookie)
+-        apartment_decrement_mta_usage(tlsdata->implicit_mta_cookie);
+-
+-    if (tlsdata->errorinfo)
+-        IErrorInfo_Release(tlsdata->errorinfo);
+-    if (tlsdata->state)
+-        IUnknown_Release(tlsdata->state);
+-
+-    LIST_FOR_EACH_ENTRY_SAFE(cursor, cursor2, &tlsdata->spies, struct init_spy, entry)
+-    {
+-        list_remove(&cursor->entry);
+-        if (cursor->spy)
+-            IInitializeSpy_Release(cursor->spy);
+-        free(cursor);
+-    }
+-
+-    if (tlsdata->context_token)
+-        IObjContext_Release(tlsdata->context_token);
+-
+-    free(tlsdata);
+-    NtCurrentTeb()->ReservedForOle = NULL;
+-}
+-
+ struct global_options
+ {
+     IGlobalOptions IGlobalOptions_iface;
+@@ -2437,13 +2407,25 @@ HRESULT WINAPI CoRegisterPSClsid(REFIID riid, REFCLSID rclsid)
+     return S_OK;
+ }
+ 
+-struct thread_context
++static CRITICAL_SECTION context_cs;
++static CRITICAL_SECTION_DEBUG context_cs_debug =
++{
++    0, 0, &context_cs,
++    { &context_cs_debug.ProcessLocksList, &context_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": context_cs") }
++};
++static CRITICAL_SECTION context_cs = { &context_cs_debug, -1, 0, 0, 0, 0 };
++
++
++static struct thread_context
+ {
+     IComThreadingInfo IComThreadingInfo_iface;
+     IContextCallback IContextCallback_iface;
+     IObjContext IObjContext_iface;
+-    LONG refcount;
+-};
++    LONG ref;
++    LONG reported_ref;
++    OXID oxid;
++} *mta_context;
+ 
+ static inline struct thread_context *impl_from_IComThreadingInfo(IComThreadingInfo *iface)
+ {
+@@ -2493,22 +2475,36 @@ static HRESULT WINAPI thread_context_info_QueryInterface(IComThreadingInfo *ifac
+ static ULONG WINAPI thread_context_info_AddRef(IComThreadingInfo *iface)
+ {
+     struct thread_context *context = impl_from_IComThreadingInfo(iface);
+-    return InterlockedIncrement(&context->refcount);
++    InterlockedIncrement(&context->ref);
++    return InterlockedIncrement(&context->reported_ref);
+ }
+ 
+-static ULONG WINAPI thread_context_info_Release(IComThreadingInfo *iface)
++static void context_token_release(IObjContext *iface)
+ {
+-    struct thread_context *context = impl_from_IComThreadingInfo(iface);
++    struct thread_context *context = impl_from_IObjContext(iface);
+ 
+-    /* Context instance is initially created with CoGetContextToken() with refcount set to 0,
+-       releasing context while refcount is at 0 destroys it. */
+-    if (!context->refcount)
++    if (!InterlockedDecrement(&context->ref))
+     {
++        EnterCriticalSection(&context_cs);
++        if (context->ref)
++        {
++            LeaveCriticalSection(&context_cs);
++            return;
++        }
++        if (context == mta_context) mta_context = NULL;
++        LeaveCriticalSection(&context_cs);
++
+         free(context);
+-        return 0;
+     }
++}
+ 
+-    return InterlockedDecrement(&context->refcount);
++static ULONG WINAPI thread_context_info_Release(IComThreadingInfo *iface)
++{
++    struct thread_context *context = impl_from_IComThreadingInfo(iface);
++    ULONG ret = InterlockedDecrement(&context->reported_ref);
++
++    context_token_release(&context->IObjContext_iface);
++    return ret;
+ }
+ 
+ static HRESULT WINAPI thread_context_info_GetCurrentApartmentType(IComThreadingInfo *iface, APTTYPE *apttype)
+@@ -2554,9 +2550,17 @@ static HRESULT WINAPI thread_context_info_GetCurrentLogicalThreadId(IComThreadin
+ 
+ static HRESULT WINAPI thread_context_info_SetCurrentLogicalThreadId(IComThreadingInfo *iface, REFGUID logical_thread_id)
+ {
+-    FIXME("%s stub\n", debugstr_guid(logical_thread_id));
++    struct tlsdata *tlsdata;
++    HRESULT hr;
+ 
+-    return E_NOTIMPL;
++    TRACE("%s\n", debugstr_guid(logical_thread_id));
++
++    if (FAILED(hr = com_get_tlsdata(&tlsdata)))
++        return hr;
++
++    tlsdata->causality_id = *logical_thread_id;
++    tlsdata->flags |= OLETLS_UUIDINITIALIZED;
++    return S_OK;
+ }
+ 
+ static const IComThreadingInfoVtbl thread_context_info_vtbl =
+@@ -2591,9 +2595,93 @@ static ULONG WINAPI thread_context_callback_Release(IContextCallback *iface)
+ static HRESULT WINAPI thread_context_callback_ContextCallback(IContextCallback *iface,
+         PFNCONTEXTCALL callback, ComCallData *param, REFIID riid, int method, IUnknown *punk)
+ {
+-    FIXME("%p, %p, %p, %s, %d, %p\n", iface, callback, param, debugstr_guid(riid), method, punk);
++    struct thread_context *context = impl_from_IContextCallback(iface);
++    IObjContext *current_context;
++    XAptCallback apt_callback;
++    struct apartment *apt;
++    STDOBJREF stdobjref;
++    OXID_INFO oxid_info;
++    IRundown *rundown;
++    HRESULT hr;
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %p, %p, %s, %d, %p\n", iface, callback, param, debugstr_guid(riid), method, punk);
++
++    if (!callback)
++        return E_INVALIDARG;
++
++    hr = CoGetContextToken((ULONG_PTR *)&current_context);
++    if (FAILED(hr))
++        return hr;
++
++    if (!(apt = apartment_get_current_or_mta()))
++    {
++        ERR("apartment not initialised\n");
++        return CO_E_NOTINITIALIZED;
++    }
++    rpc_start_remoting(apt);
++
++    if (&context->IObjContext_iface == current_context)
++    {
++        IComThreadingInfo *cti = NULL;
++        GUID thread_id;
++
++        apartment_release(apt);
++
++        if (IsEqualIID(riid, &IID_IEnterActivityWithNoLock))
++        {
++            cti = &context->IComThreadingInfo_iface;
++            if (FAILED((hr = IComThreadingInfo_GetCurrentLogicalThreadId(cti, &thread_id))))
++                return hr;
++            if (FAILED((hr = IComThreadingInfo_SetCurrentLogicalThreadId(cti, riid))))
++                return hr;
++        }
++
++        __TRY
++        {
++            hr = callback(param);
++        }
++        __EXCEPT_ALL
++        {
++            hr = RPC_E_SERVERFAULT;
++        }
++        __ENDTRY
++
++        if (cti)
++            IComThreadingInfo_SetCurrentLogicalThreadId(cti, &thread_id);
++
++        TRACE("callback returned %lx\n", hr);
++        return hr;
++    }
++
++    hr = rpc_resolve_oxid(context->oxid, &oxid_info);
++    if (SUCCEEDED(hr))
++    {
++        stdobjref.flags = SORFP_NOLIFETIMEMGMT | SORF_NOPING;
++        stdobjref.cPublicRefs = 1;
++        stdobjref.oxid = context->oxid;
++        stdobjref.oid = -1;
++        stdobjref.ipid = oxid_info.ipidRemUnknown;
++        hr = unmarshal_object(&stdobjref, apt, MSHCTX_INPROC, NULL, &IID_IRundown, &oxid_info, (void**)&rundown);
++        apartment_release(apt);
++    }
++    if (FAILED(hr))
++        return hr;
++
++    apt_callback.pfnCallback = (ULONG_PTR)callback;
++    apt_callback.pParam = (ULONG_PTR)param;
++    apt_callback.pServerCtx = (ULONG_PTR)&context->IObjContext_iface;
++    apt_callback.pUnk = (ULONG_PTR)punk;
++    apt_callback.iid = *riid;
++    apt_callback.iMethod = method;
++    get_process_secret(&apt_callback.guidProcessSecret);
++    if (IsEqualIID(riid, &IID_ICallbackWithNoReentrancyToApplicationSTA))
++        hr = IRundown_DoNonreentrantCallback(rundown, &apt_callback);
++    else
++        hr = IRundown_DoCallback(rundown, &apt_callback);
++    IRundown_Release(rundown);
++
++    TRACE("callback returned %lx\n", hr);
++    return hr;
+ }
+ 
+ static const IContextCallbackVtbl thread_context_callback_vtbl =
+@@ -2709,21 +2797,44 @@ static const IObjContextVtbl thread_object_context_vtbl =
+ HRESULT WINAPI CoGetContextToken(ULONG_PTR *token)
+ {
+     struct tlsdata *tlsdata;
++    struct apartment *apt;
+     HRESULT hr;
+ 
+     TRACE("%p\n", token);
+ 
+-    if (!InternalIsProcessInitialized())
++    if (FAILED(hr = com_get_tlsdata(&tlsdata)))
++        return hr;
++
++    if (!token)
++        return E_POINTER;
++
++    if (!(apt = apartment_get_current_or_mta()))
+     {
+         ERR("apartment not initialised\n");
+         return CO_E_NOTINITIALIZED;
+     }
+ 
+-    if (FAILED(hr = com_get_tlsdata(&tlsdata)))
+-        return hr;
++    if (tlsdata->context_token)
++    {
++        struct thread_context *context = impl_from_IObjContext(tlsdata->context_token);
++        if ((apt->multi_threaded && context != mta_context) ||
++            (!apt->multi_threaded && context == mta_context))
++        {
++            context_token_release(tlsdata->context_token);
++            tlsdata->context_token = NULL;
++        }
++    }
+ 
+-    if (!token)
+-        return E_POINTER;
++    if (!tlsdata->context_token && apt->multi_threaded && mta_context)
++    {
++        EnterCriticalSection(&context_cs);
++        if (mta_context)
++        {
++            tlsdata->context_token = &mta_context->IObjContext_iface;
++            InterlockedIncrement(&mta_context->ref);
++        }
++        LeaveCriticalSection(&context_cs);
++    }
+ 
+     if (!tlsdata->context_token)
+     {
+@@ -2731,14 +2842,31 @@ HRESULT WINAPI CoGetContextToken(ULONG_PTR *token)
+ 
+         context = calloc(1, sizeof(*context));
+         if (!context)
++        {
++            apartment_release(apt);
+             return E_OUTOFMEMORY;
++        }
+ 
+         context->IComThreadingInfo_iface.lpVtbl = &thread_context_info_vtbl;
+         context->IContextCallback_iface.lpVtbl = &thread_context_callback_vtbl;
+         context->IObjContext_iface.lpVtbl = &thread_object_context_vtbl;
+-        /* Context token does not take a reference, it's always zero until the
+-           interface is explicitly requested with CoGetObjectContext(). */
+-        context->refcount = 0;
++        context->ref = 1;
++        context->reported_ref = 0;
++        context->oxid = apt->oxid;
++
++        if (apt->multi_threaded)
++        {
++            EnterCriticalSection(&context_cs);
++            if (!mta_context)
++                mta_context = context;
++            else
++            {
++                context_token_release(&context->IObjContext_iface);
++                context = mta_context;
++                InterlockedIncrement(&context->ref);
++            }
++            LeaveCriticalSection(&context_cs);
++        }
+ 
+         tlsdata->context_token = &context->IObjContext_iface;
+     }
+@@ -2746,6 +2874,7 @@ HRESULT WINAPI CoGetContextToken(ULONG_PTR *token)
+     *token = (ULONG_PTR)tlsdata->context_token;
+     TRACE("context_token %p\n", tlsdata->context_token);
+ 
++    apartment_release(apt);
+     return S_OK;
+ }
+ 
+@@ -2763,7 +2892,7 @@ HRESULT WINAPI CoGetCurrentLogicalThreadId(GUID *id)
+     if (FAILED(hr = com_get_tlsdata(&tlsdata)))
+         return hr;
+ 
+-    if (IsEqualGUID(&tlsdata->causality_id, &GUID_NULL))
++    if (!(tlsdata->flags & OLETLS_UUIDINITIALIZED))
+     {
+         CoCreateGuid(&tlsdata->causality_id);
+         tlsdata->flags |= OLETLS_UUIDINITIALIZED;
+@@ -3426,6 +3555,39 @@ BOOL WINAPI CoIsOle1Class(REFCLSID clsid)
+     return FALSE;
+ }
+ 
++static void com_cleanup_tlsdata(void)
++{
++    struct tlsdata *tlsdata = NtCurrentTeb()->ReservedForOle;
++    struct init_spy *cursor, *cursor2;
++
++    if (!tlsdata)
++        return;
++
++    if (tlsdata->apt)
++        apartment_release(tlsdata->apt);
++    if (tlsdata->implicit_mta_cookie)
++        apartment_decrement_mta_usage(tlsdata->implicit_mta_cookie);
++
++    if (tlsdata->errorinfo)
++        IErrorInfo_Release(tlsdata->errorinfo);
++    if (tlsdata->state)
++        IUnknown_Release(tlsdata->state);
++
++    LIST_FOR_EACH_ENTRY_SAFE(cursor, cursor2, &tlsdata->spies, struct init_spy, entry)
++    {
++        list_remove(&cursor->entry);
++        if (cursor->spy)
++            IInitializeSpy_Release(cursor->spy);
++        free(cursor);
++    }
++
++    if (tlsdata->context_token)
++        context_token_release(tlsdata->context_token);
++
++    free(tlsdata);
++    NtCurrentTeb()->ReservedForOle = NULL;
++}
++
+ /***********************************************************************
+  *            DllMain     (combase.@)
+  */
+diff --git a/dlls/combase/combase_private.h b/dlls/combase/combase_private.h
+index ca79356e8eb37751d536192fd9430d7f62a751d0..76393650f3a9839fb381f3ccb7b3cc7b204970ca 100644
+--- a/dlls/combase/combase_private.h
++++ b/dlls/combase/combase_private.h
+@@ -174,8 +174,14 @@ void apartment_revoke_all_classes(const struct apartment *apt);
+ struct apartment * apartment_findfromoxid(OXID oxid);
+ struct apartment * apartment_findfromtid(DWORD tid);
+ 
++/* private flag indicating that the caller does not want to notify the stub
++ * when the proxy disconnects or is destroyed */
++#define SORFP_NOLIFETIMEMGMT SORF_OXRES2
++
+ HRESULT marshal_object(struct apartment *apt, STDOBJREF *stdobjref, REFIID riid, IUnknown *object,
+         DWORD dest_context, void *dest_context_data, MSHLFLAGS mshlflags);
++HRESULT unmarshal_object(const STDOBJREF *stdobjref, struct apartment *apt, MSHCTX dest_context,
++        void *dest_context_data, REFIID riid, const OXID_INFO *oxid_info, void **object);
+ 
+ /* Stub Manager */
+ 
+@@ -261,3 +267,4 @@ HRESULT ipid_get_dispatch_params(const IPID *ipid, struct apartment **stub_apt,
+         IID *iid, IUnknown **iface);
+ HRESULT ipid_get_dest_context(const IPID *ipid, MSHCTX *dest_context, void **dest_context_data);
+ HRESULT start_apartment_remote_unknown(struct apartment *apt);
++void get_process_secret(GUID *process_secret);
+diff --git a/dlls/combase/dcom.idl b/dlls/combase/dcom.idl
+index 56e3152456c40681ee5ca38ba60a90eeeeeef3b0..84b7ab346ecf52da5864f1354f865ce1c8de6e2b 100644
+--- a/dlls/combase/dcom.idl
++++ b/dlls/combase/dcom.idl
+@@ -21,6 +21,7 @@
+ 
+ #pragma makedep header
+ 
++#include "hstring.idl"
+ #include "wine/orpc.idl"
+ 
+ [
+@@ -60,3 +61,74 @@ interface IRemUnknown : IUnknown
+         [in] unsigned short cInterfaceRefs,
+         [in, size_is(cInterfaceRefs)] REMINTERFACEREF *InterfaceRefs);
+ }
++
++[
++    object,
++    uuid(00000142-0000-0000-C000-000000000046)
++]
++interface IRemUnknown2 : IRemUnknown
++{
++    typedef [unique] IRemUnknown2 *LPREMUNKNOWN2;
++
++    HRESULT RemQueryInterface2(
++        [in] REFIPID ripid,
++        [in] unsigned short cIids,
++        [in, size_is(cIids)] IID *iids,
++        [out, size_is(cIids)] HRESULT *phr,
++        [out, size_is(cIids)] MInterfacePointer **ppMIF);
++}
++
++[
++    object,
++    uuid(0000013C-0000-0000-C000-000000000046)
++]
++interface IRemUnknownN : IRemUnknown2
++{
++    const DWORD IRUF_CONVERTTOWEAK = 0x01;
++    const DWORD IRUF_CONVERTTOSTRONG = 0x02;
++    const DWORD IRUF_DISCONNECTIFLASTSTRONG = 0x04;
++
++    typedef struct tagXAptCallback
++    {
++        DWORD64 pfnCallback;
++        DWORD64 pParam;
++        DWORD64 pServerCtx;
++        DWORD64 pUnk;
++        GUID iid;
++        INT iMethod;
++        GUID guidProcessSecret;
++    } XAptCallback;
++
++    HRESULT AcknowledgeMarshalingSets(
++        [in] WORD cMarshalingSets,
++        [in, size_is(cMarshalingSets)] DWORD64 *pMarshalingSets);
++
++    HRESULT RemChangeRef(
++        [in] DWORD flags,
++        [in] WORD cInterfaceRefs,
++        [in, size_is(cInterfaceRefs)] REMINTERFACEREF InterfaceRefs[]);
++
++    HRESULT DoCallback(
++        [in] XAptCallback *pCallbackData);
++
++    HRESULT DoNonreentrantCallback(
++        [in] XAptCallback *pCallbackData);
++
++    HRESULT GetInterfaceNameFromIPID(
++        [in] REFIPID ripid,
++        [out] HSTRING *interfaceName);
++}
++
++[
++    object,
++    uuid(00000134-0000-0000-C000-000000000046),
++]
++interface IRundown : IRemUnknownN
++{
++    const DWORD MAX_OID_RUNDOWNS_PER_CALL = 100;
++
++    HRESULT RundownOid(
++        [in, range(1, MAX_OID_RUNDOWNS_PER_CALL)] DWORD cOid,
++        [in, size_is(cOid)] OID aOid[],
++        [out, size_is(cOid)] BYTE aRundownStatus[]);
++}
+diff --git a/dlls/combase/marshal.c b/dlls/combase/marshal.c
+index f638604f5a337188465f43a4b0f9df5330104514..6e3d35ce580d3fcd94b481944378a731d9589152 100644
+--- a/dlls/combase/marshal.c
++++ b/dlls/combase/marshal.c
+@@ -36,19 +36,11 @@ HRESULT WINAPI RPC_CreateClientChannel(const OXID *oxid, const IPID *ipid,
+                                 DWORD dest_context, void *dest_context_data,
+                                 IRpcChannelBuffer **chan, struct apartment *apt);
+ 
+-static HRESULT unmarshal_object(const STDOBJREF *stdobjref, struct apartment *apt,
+-                                MSHCTX dest_context, void *dest_context_data,
+-                                REFIID riid, const OXID_INFO *oxid_info,
+-                                void **object);
+-
+ /* number of refs given out for normal marshaling */
+ #define NORMALEXTREFS 5
+ 
+ /* private flag indicating that the object was marshaled as table-weak */
+ #define SORFP_TABLEWEAK SORF_OXRES1
+-/* private flag indicating that the caller does not want to notify the stub
+- * when the proxy disconnects or is destroyed */
+-#define SORFP_NOLIFETIMEMGMT SORF_OXRES2
+ 
+ /* imported interface proxy */
+ struct ifproxy
+@@ -1873,7 +1865,7 @@ static HRESULT proxy_manager_get_remunknown(struct proxy_manager * This, IRemUnk
+ 
+         /* do the unmarshal */
+         hr = unmarshal_object(&stdobjref, apt, This->dest_context,
+-                              This->dest_context_data, &IID_IRemUnknown,
++                              This->dest_context_data, &IID_IRundown,
+                               &This->oxid_info, (void**)remunk);
+         if (hr == S_OK && called_in_original_apt)
+         {
+@@ -2095,7 +2087,7 @@ static HRESULT WINAPI StdMarshalImpl_MarshalInterface(IMarshal *iface, IStream *
+ /* helper for StdMarshalImpl_UnmarshalInterface - does the unmarshaling with
+  * no questions asked about the rules surrounding same-apartment unmarshals
+  * and table marshaling */
+-static HRESULT unmarshal_object(const STDOBJREF *stdobjref, struct apartment *apt, MSHCTX dest_context,
++HRESULT unmarshal_object(const STDOBJREF *stdobjref, struct apartment *apt, MSHCTX dest_context,
+         void *dest_context_data, REFIID riid, const OXID_INFO *oxid_info, void **object)
+ {
+     struct proxy_manager *proxy_manager = NULL;
+diff --git a/dlls/combase/stubmanager.c b/dlls/combase/stubmanager.c
+index 566f92c8a752a14ea7e43ceec9e7c51d5142d6cf..4756e334f9f9283d93cdac1ebc920d3169e0af51 100644
+--- a/dlls/combase/stubmanager.c
++++ b/dlls/combase/stubmanager.c
+@@ -32,7 +32,9 @@
+ #include "windef.h"
+ #include "winbase.h"
+ #include "winuser.h"
++#define USE_COM_CONTEXT_DEF
+ #include "objbase.h"
++#include "comsvcs.h"
+ #include "rpc.h"
+ 
+ #include "wine/debug.h"
+@@ -638,50 +640,36 @@ BOOL stub_manager_is_table_marshaled(struct stub_manager *m, const IPID *ipid)
+ 
+ /*****************************************************************************
+  *
+- * IRemUnknown implementation
++ * IRundown / IRemUnknown implementation
+  *
+  *
+  * Note: this object is not related to the lifetime of a stub_manager, but it
+  * interacts with stub managers.
+  */
+ 
+-typedef struct rem_unknown
++typedef struct
+ {
+-    IRemUnknown IRemUnknown_iface;
++    IRundown IRundown_iface;
+     LONG refs;
+-} RemUnknown;
++} Rundown;
+ 
+-static const IRemUnknownVtbl RemUnknown_Vtbl;
+-
+-static inline RemUnknown *impl_from_IRemUnknown(IRemUnknown *iface)
+-{
+-    return CONTAINING_RECORD(iface, RemUnknown, IRemUnknown_iface);
+-}
+-
+-/* construct an IRemUnknown object with one outstanding reference */
+-static HRESULT RemUnknown_Construct(IRemUnknown **ppRemUnknown)
++static inline Rundown *impl_from_IRundown(IRundown *iface)
+ {
+-    RemUnknown *object = malloc(sizeof(*object));
+-
+-    if (!object)
+-        return E_OUTOFMEMORY;
+-
+-    object->IRemUnknown_iface.lpVtbl = &RemUnknown_Vtbl;
+-    object->refs = 1;
+-
+-    *ppRemUnknown = &object->IRemUnknown_iface;
+-    return S_OK;
++    return CONTAINING_RECORD(iface, Rundown, IRundown_iface);
+ }
+ 
+-static HRESULT WINAPI RemUnknown_QueryInterface(IRemUnknown *iface, REFIID riid, void **ppv)
++static HRESULT WINAPI Rundown_QueryInterface(IRundown *iface, REFIID riid, void **ppv)
+ {
+     TRACE("%p, %s, %p\n", iface, debugstr_guid(riid), ppv);
+ 
+     if (IsEqualIID(riid, &IID_IUnknown) ||
+-        IsEqualIID(riid, &IID_IRemUnknown))
++        IsEqualIID(riid, &IID_IRemUnknown) ||
++        IsEqualIID(riid, &IID_IRemUnknown2) ||
++        IsEqualIID(riid, &IID_IRemUnknownN) ||
++        IsEqualIID(riid, &IID_IRundown))
+     {
+         *ppv = iface;
+-        IRemUnknown_AddRef(iface);
++        IRundown_AddRef(iface);
+         return S_OK;
+     }
+ 
+@@ -692,31 +680,31 @@ static HRESULT WINAPI RemUnknown_QueryInterface(IRemUnknown *iface, REFIID riid,
+     return E_NOINTERFACE;
+ }
+ 
+-static ULONG WINAPI RemUnknown_AddRef(IRemUnknown *iface)
++static ULONG WINAPI Rundown_AddRef(IRundown *iface)
+ {
+     ULONG refs;
+-    RemUnknown *remunk = impl_from_IRemUnknown(iface);
++    Rundown *rundown = impl_from_IRundown(iface);
+ 
+-    refs = InterlockedIncrement(&remunk->refs);
++    refs = InterlockedIncrement(&rundown->refs);
+ 
+     TRACE("%p before: %ld\n", iface, refs-1);
+     return refs;
+ }
+ 
+-static ULONG WINAPI RemUnknown_Release(IRemUnknown *iface)
++static ULONG WINAPI Rundown_Release(IRundown *iface)
+ {
+     ULONG refs;
+-    RemUnknown *remunk = impl_from_IRemUnknown(iface);
++    Rundown *rundown = impl_from_IRundown(iface);
+ 
+-    refs = InterlockedDecrement(&remunk->refs);
++    refs = InterlockedDecrement(&rundown->refs);
+     if (!refs)
+-        free(remunk);
++        free(rundown);
+ 
+     TRACE("%p after: %ld\n", iface, refs);
+     return refs;
+ }
+ 
+-static HRESULT WINAPI RemUnknown_RemQueryInterface(IRemUnknown *iface,
++static HRESULT WINAPI Rundown_RemQueryInterface(IRundown *iface,
+     REFIPID ripid, ULONG cRefs, USHORT cIids, IID *iids /* [size_is(cIids)] */,
+     REMQIRESULT **ppQIResults /* [size_is(,cIids)] */)
+ {
+@@ -758,7 +746,7 @@ static HRESULT WINAPI RemUnknown_RemQueryInterface(IRemUnknown *iface,
+         return S_FALSE; /* we got some interfaces */
+ }
+ 
+-static HRESULT WINAPI RemUnknown_RemAddRef(IRemUnknown *iface,
++static HRESULT WINAPI Rundown_RemAddRef(IRundown *iface,
+     USHORT cInterfaceRefs,
+     REMINTERFACEREF* InterfaceRefs /* [size_is(cInterfaceRefs)] */,
+     HRESULT *pResults /* [size_is(cInterfaceRefs)] */)
+@@ -791,7 +779,7 @@ static HRESULT WINAPI RemUnknown_RemAddRef(IRemUnknown *iface,
+     return hr;
+ }
+ 
+-static HRESULT WINAPI RemUnknown_RemRelease(IRemUnknown *iface,
++static HRESULT WINAPI Rundown_RemRelease(IRundown *iface,
+     USHORT cInterfaceRefs,
+     REMINTERFACEREF* InterfaceRefs /* [size_is(cInterfaceRefs)] */)
+ {
+@@ -824,35 +812,160 @@ static HRESULT WINAPI RemUnknown_RemRelease(IRemUnknown *iface,
+     return hr;
+ }
+ 
+-static const IRemUnknownVtbl RemUnknown_Vtbl =
++static HRESULT WINAPI Rundown_RemQueryInterface2(IRundown *iface, REFIPID ripid,
++        unsigned short cIids, IID *iids, HRESULT *phr, MInterfacePointer **ppMIF)
++{
++    FIXME("%p, %p, %hu, %p, %p, %p\n", iface, ripid, cIids, iids, phr, ppMIF);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI Rundown_AcknowledgeMarshalingSets(IRundown *iface,
++        WORD cMarshalingSets, DWORD64 *pMarshalingSets)
++{
++    FIXME("%p, %hu, %p\n", iface, cMarshalingSets, pMarshalingSets);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI Rundown_RemChangeRef(IRundown *iface, DWORD flags,
++        WORD cInterfaceRefs, REMINTERFACEREF InterfaceRefs[])
++{
++    FIXME("%p, %lu, %hu, %p\n", iface, flags, cInterfaceRefs, InterfaceRefs);
++    return E_NOTIMPL;
++}
++
++static BOOL WINAPI init_process_secret(PINIT_ONCE init_once, void *param, void **ctx)
++{
++    GUID *secret = param;
++    return SUCCEEDED(UuidCreate(secret));
++}
++
++void get_process_secret(GUID *process_secret)
++{
++    static INIT_ONCE init_once = INIT_ONCE_STATIC_INIT;
++    static GUID secret;
++
++    InitOnceExecuteOnce(&init_once, init_process_secret, &secret, NULL);
++    *process_secret = secret;
++}
++
++static HRESULT WINAPI Rundown_DoCallback(IRundown *iface, XAptCallback *pCallbackData)
++{
++    HRESULT (WINAPI *callback)(void *) = (void*)(ULONG_PTR)pCallbackData->pfnCallback;
++    void *param = (void *)(ULONG_PTR)pCallbackData->pParam;
++    IComThreadingInfo *cti = NULL;
++    GUID thread_id, secret;
++    IObjContext *context;
++    HRESULT hr;
++
++    TRACE("%p, %p\n", iface, pCallbackData);
++
++    get_process_secret(&secret);
++    if (!IsEqualIID(&secret, &pCallbackData->guidProcessSecret))
++        return E_FAIL;
++    if (FAILED((hr = CoGetContextToken((ULONG_PTR *)&context))))
++        return hr;
++    if (pCallbackData->pServerCtx != (ULONG_PTR)context)
++    {
++        ERR("context token doesn't match\n");
++        return E_FAIL;
++    }
++
++    if (IsEqualIID(&IID_IEnterActivityWithNoLock, &pCallbackData->iid))
++    {
++        hr = IObjContext_QueryInterface(context, &IID_IComThreadingInfo, (void **)&cti);
++        if (FAILED(hr))
++            return hr;
++        hr = IComThreadingInfo_GetCurrentLogicalThreadId(cti, &thread_id);
++        if (SUCCEEDED(hr))
++            hr = IComThreadingInfo_SetCurrentLogicalThreadId(cti, &IID_IEnterActivityWithNoLock);
++        if (FAILED(hr))
++        {
++            IComThreadingInfo_Release(cti);
++            return hr;
++        }
++    }
++
++    hr = callback(param);
++
++    if (cti)
++    {
++        IComThreadingInfo_SetCurrentLogicalThreadId(cti, &thread_id);
++        IComThreadingInfo_Release(cti);
++    }
++    return hr;
++}
++
++static HRESULT WINAPI Rundown_DoNonreentrantCallback(IRundown *iface, XAptCallback *pCallbackData)
++{
++    FIXME("%p, %p\n", iface, pCallbackData);
++    return IRundown_DoCallback(iface, pCallbackData);
++}
++
++static HRESULT WINAPI Rundown_GetInterfaceNameFromIPID(IRundown *iface,
++        REFIPID ripid, HSTRING *interfaceName)
++{
++    FIXME("%p, %p %p\n", iface, ripid, interfaceName);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI Rundown_RundownOid(IRundown *iface,
++        DWORD cOid, OID aOid[], BYTE aRundownStatus[])
+ {
+-    RemUnknown_QueryInterface,
+-    RemUnknown_AddRef,
+-    RemUnknown_Release,
+-    RemUnknown_RemQueryInterface,
+-    RemUnknown_RemAddRef,
+-    RemUnknown_RemRelease
++    FIXME("%p, %lu, %p %p\n", iface, cOid, aOid, aRundownStatus);
++    return E_NOTIMPL;
++}
++
++static const IRundownVtbl Rundown_Vtbl =
++{
++    Rundown_QueryInterface,
++    Rundown_AddRef,
++    Rundown_Release,
++    Rundown_RemQueryInterface,
++    Rundown_RemAddRef,
++    Rundown_RemRelease,
++    Rundown_RemQueryInterface2,
++    Rundown_AcknowledgeMarshalingSets,
++    Rundown_RemChangeRef,
++    Rundown_DoCallback,
++    Rundown_DoNonreentrantCallback,
++    Rundown_GetInterfaceNameFromIPID,
++    Rundown_RundownOid
+ };
+ 
++/* construct an IRundown object with one outstanding reference */
++static HRESULT Rundown_Construct(IRundown **rundown)
++{
++    Rundown *object = malloc(sizeof(*object));
++
++    if (!object)
++        return E_OUTOFMEMORY;
++
++    object->IRundown_iface.lpVtbl = &Rundown_Vtbl;
++    object->refs = 1;
++
++    *rundown = &object->IRundown_iface;
++    return S_OK;
++}
++
+ /* starts the IRemUnknown listener for the current apartment */
+ HRESULT start_apartment_remote_unknown(struct apartment *apt)
+ {
+-    IRemUnknown *pRemUnknown;
++    IRundown *pRundown;
+     HRESULT hr = S_OK;
+ 
+     EnterCriticalSection(&apt->cs);
+     if (!apt->remunk_exported)
+     {
+-        /* create the IRemUnknown object */
+-        hr = RemUnknown_Construct(&pRemUnknown);
++        /* create the IRundown object */
++        hr = Rundown_Construct(&pRundown);
+         if (hr == S_OK)
+         {
+             STDOBJREF stdobjref; /* dummy - not used */
+             /* register it with the stub manager */
+-            hr = marshal_object(apt, &stdobjref, &IID_IRemUnknown, (IUnknown *)pRemUnknown,
++            hr = marshal_object(apt, &stdobjref, &IID_IRundown, (IUnknown *)pRundown,
+                     MSHCTX_DIFFERENTMACHINE, NULL, MSHLFLAGS_NORMAL|MSHLFLAGSP_REMUNKNOWN);
+             /* release our reference to the object as the stub manager will manage the life cycle for us */
+-            IRemUnknown_Release(pRemUnknown);
++            IRundown_Release(pRundown);
+             if (hr == S_OK)
+                 apt->remunk_exported = TRUE;
+         }
+diff --git a/dlls/ole32/dcom.idl b/dlls/ole32/dcom.idl
+index 05c0513362f58fc052b280f05f1890ee0ecc4b90..7004b8e80d0e62121cf375c84d8b02e7820ce84a 100644
+--- a/dlls/ole32/dcom.idl
++++ b/dlls/ole32/dcom.idl
+@@ -22,6 +22,7 @@
+ #pragma makedep proxy
+ #pragma makedep register
+ 
++#include "hstring.idl"
+ #include "wine/orpc.idl"
+ 
+ [
+@@ -82,6 +83,61 @@ interface IRemUnknown2 : IRemUnknown
+     [out, size_is(cIids)] MInterfacePointer **ppMIF);
+ }
+ 
++[
++  object,
++  uuid(0000013C-0000-0000-C000-000000000046)
++]
++interface IRemUnknownN : IRemUnknown2
++{
++  const DWORD IRUF_CONVERTTOWEAK = 0x01;
++  const DWORD IRUF_CONVERTTOSTRONG = 0x02;
++  const DWORD IRUF_DISCONNECTIFLASTSTRONG = 0x04;
++
++  typedef struct tagXAptCallback
++  {
++    DWORD64 pfnCallback;
++    DWORD64 pParam;
++    DWORD64 pServerCtx;
++    DWORD64 pUnk;
++    GUID iid;
++    INT iMethod;
++    GUID guidProcessSecret;
++  } XAptCallback;
++
++  HRESULT AcknowledgeMarshalingSets(
++    [in] WORD cMarshalingSets,
++    [in, size_is(cMarshalingSets)] DWORD64 *pMarshalingSets);
++
++  HRESULT RemChangeRef(
++    [in] DWORD flags,
++    [in] WORD cInterfaceRefs,
++    [in, size_is(cInterfaceRefs)] REMINTERFACEREF InterfaceRefs[]);
++
++  HRESULT DoCallback(
++    [in] XAptCallback *pCallbackData);
++
++  HRESULT DoNonreentrantCallback(
++    [in] XAptCallback *pCallbackData);
++
++  HRESULT GetInterfaceNameFromIPID(
++    [in] REFIPID ripid,
++    [out] HSTRING *interfaceName);
++}
++
++[
++  object,
++  uuid(00000134-0000-0000-C000-000000000046),
++]
++interface IRundown : IRemUnknownN
++{
++  const DWORD MAX_OID_RUNDOWNS_PER_CALL = 100;
++
++  HRESULT RundownOid(
++    [in, range(1, MAX_OID_RUNDOWNS_PER_CALL)] DWORD cOid,
++    [in, size_is(cOid)] OID aOid[],
++    [out, size_is(cOid)] BYTE aRundownStatus[]);
++}
++
+ [
+   uuid(99fcfec4-5260-101b-bbcb-00aa0021347a),
+   pointer_default(unique)
+diff --git a/include/comsvcs.idl b/include/comsvcs.idl
+index 902c78b05c8409de97d4b35e948586475925eb5e..614b9ee43f3fbca6e43424f65d329fd6338302c8 100644
+--- a/include/comsvcs.idl
++++ b/include/comsvcs.idl
+@@ -23,6 +23,8 @@ import "oaidl.idl";
+ #define threading(model)
+ #endif
+ 
++cpp_quote("EXTERN_C const GUID IID_IEnterActivityWithNoLock;")
++
+ typedef DWORD_PTR INSTID;
+ typedef DWORD_PTR RESID;
+ typedef DWORD     RESOURCERATING;
+diff --git a/include/objidlbase.idl b/include/objidlbase.idl
+index 9a4eed4acb3cea4926b0322ce6342ca7b83738b5..8eb6b3b627c5d6f8389ae3b7bbb8d3e74550be02 100644
+--- a/include/objidlbase.idl
++++ b/include/objidlbase.idl
+@@ -23,6 +23,8 @@ import "unknwn.idl";
+ cpp_quote("#ifndef _OBJIDLBASE_")
+ cpp_quote("#define _OBJIDLBASE_")
+ 
++cpp_quote ("EXTERN_C const GUID IID_ICallbackWithNoReentrancyToApplicationSTA;")
++
+ interface IStream;
+ interface IEnumString;
+ 
+diff --git a/libs/uuid/uuid.c b/libs/uuid/uuid.c
+index ce97520eee057b3a98e3c9ff40ee6f514da178de..88bbc57780f0d01550b119061a4070366ed8f0aa 100644
+--- a/libs/uuid/uuid.c
++++ b/libs/uuid/uuid.c
+@@ -103,6 +103,8 @@ DEFINE_GUID(GUID_NULL,0,0,0,0,0,0,0,0,0,0,0);
+ DEFINE_GUID(IID_ISFHelper,                0x1fe68efb,0x1874,0x9812,0x56,0xdc,0x00,0x00,0x00,0x00,0x00,0x00);
+ DEFINE_GUID(IID_IProxyManager,            0x00000008,0x0000,0x0000,0xc0,0x00,0x00,0x00,0x00,0x00,0x00,0x46);
+ DEFINE_GUID(IID_IBindStatusCallbackHolder,0x79eac9cc,0xbaf9,0x11ce,0x8c,0x82,0x00,0xaa,0x00,0x4b,0xa9,0x0b);
++DEFINE_GUID(IID_IEnterActivityWithNoLock, 0xd7174f82,0x36b8,0x4aa8,0x80,0x0a,0xe9,0x63,0xab,0x2d,0xfa,0xb9);
++DEFINE_GUID(IID_ICallbackWithNoReentrancyToApplicationSTA, 0x0a299774,0x3e4e,0xfc42,0x1d,0x9d,0x72,0xce,0xe1,0x05,0xca,0x57);
+ 
+ DEFINE_GUID(FMTID_SummaryInformation,0xF29F85E0,0x4FF9,0x1068,0xAB,0x91,0x08,0x00,0x2B,0x27,0xB3,0xD9);
+ DEFINE_GUID(FMTID_DocSummaryInformation,0xD5CDD502,0x2E9C,0x101B,0x93,0x97,0x08,0x00,0x2B,0x2C,0xF9,0xAE);

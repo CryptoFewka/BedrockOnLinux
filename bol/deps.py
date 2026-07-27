@@ -89,14 +89,13 @@ def ensure_login_deps(install=True):
     return missing
 
 
-# The GUI toolkit: customtkinter (modern rounded widgets on top of Tk; pulls
-# darkdetect + packaging). It is BUNDLED in the AppImage / Flatpak / .deb, so
-# this is a no-op there; only the portable .pyz (or a bare host) pip-installs it
-# on first GUI launch.
+# The packaged builds bundle these; a portable .pyz or bare checkout installs
+# them on first GUI launch.
 GUI_DEPS = {
     "customtkinter": "customtkinter==5.2.2",
     "darkdetect": "darkdetect==0.8.0",
     "packaging": "packaging==26.2",
+    "Xlib": "python-xlib==0.33",
 }
 GUI_INSTALL_REQUIREMENTS = tuple(GUI_DEPS.values())
 
@@ -120,14 +119,3 @@ def ensure_gui_deps(install=True):
              f"('pip install --user {' '.join(GUI_INSTALL_REQUIREMENTS)}'). "
              "The AppImage and Flatpak already bundle this Python toolkit.")
     return missing
-
-
-# python-xlib (+ its six dependency): lets bol.x11 query the primary monitor
-# through RandR directly instead of parsing `xrandr` CLI text. Bundled in the
-# AppImage/Flatpak/.deb like the GUI toolkit, but optional: bol.x11 falls
-# back to the xrandr CLI when it's missing, so nothing here is pip-installed
-# on demand.
-X11_DEPS = {
-    "Xlib": "python-xlib==0.33",
-    "six": "six==1.17.0",
-}

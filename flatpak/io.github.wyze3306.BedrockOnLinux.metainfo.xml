@@ -70,6 +70,70 @@
   </content_rating>
 
   <releases>
+    <release version="2.1.1" date="2026-07-26">
+      <description>
+        <p>Fixes custom-skin selection, the in-game Achievements catalog and
+           Flatpak startup with safe data migration.</p>
+        <ul>
+          <li>completes the single-file picker on Minecraft&apos;s calling
+              apartment, avoiding a failing cross-apartment callback;</li>
+          <li>keeps the native picker attached to the game window in fullscreen
+              and Gamescope sessions;</li>
+          <li>removes thin top and left borders from WineX11 fullscreen
+              rendering and restores touchpad or mouse-wheel scrolling
+              throughout the settings tabs;</li>
+          <li>keeps newly created isolated profiles beside the active managed
+              profile without changing direct <code>BOL_HOME</code>
+              data-root overrides;</li>
+          <li>keeps Flatpak&apos;s private data directory writable while
+              migrating the previous data root read-only, fixing startup on
+              Bazzite, CachyOS and other Flatpak hosts;</li>
+          <li>loads Minecraft&apos;s Windows Achievements catalog with a
+              dedicated user-only XSTS token while preserving the packaged
+              Windows title, SCID and platform;</li>
+          <li>repairs an invalid managed-prefix <code>user32.dll</code> before
+              launch and keeps the engine on its pure-WoW64 path for minimal
+              Linux distributions;</li>
+          <li>keeps graphics caches across game updates and prevents Advanced
+              diagnostics from tracing hot GDK polling channels;</li>
+          <li>ships the fixes in the reproducible, attested
+              <code>wow64-archs-native12</code> managed engine.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="2.1.0" date="2026-07-25">
+      <description>
+        <p>Improves startup reliability across Linux desktops, LAN diagnostics
+           and controller integration, and adds safer multi-profile and client
+           workflows.</p>
+        <ul>
+          <li>handles X11, XWayland, Hyprland, Steam Game Mode, Steam Deck and
+              multi-monitor dialogs automatically, including scaled and
+              scrollable themed dialogs, global native-Wayland overrides and
+              XWayland presentation recovery;</li>
+          <li>fixes Minecraft&apos;s in-game world and custom-skin picker with a
+              pinned native WineGDK implementation;</li>
+          <li>migrates application data safely to the active XDG layout and
+              keeps native, AppImage, Debian and Flatpak storage consistent;</li>
+          <li>adds same-tag game-build refresh, LAN diagnostics and actionable
+              guidance for discovery, version mismatches and full-world errors,
+              without requiring environment variables;</li>
+          <li>adds graphical GPU-crash acknowledgement, safer renderer
+              diagnostics, automatic cleanup of completed launch markers and a
+              guarded legacy compatibility renderer;</li>
+          <li>configures SDL or Steam Input automatically for DualSense and
+              DualSense Edge controllers;</li>
+          <li>adds isolated local Xbox profiles with shared large downloads
+              protected by setup and launch locks;</li>
+          <li>repairs partial Wine prefixes and fixes Wine boot failures with a
+              native cryptbase random-number implementation;</li>
+          <li>hardens external client DLL injection and reports immediate game
+              crashes instead of claiming a false success;</li>
+          <li>strengthens downloads, archive imports, engine provenance,
+              network diagnostics and release packaging.</li>
+        </ul>
+      </description>
+    </release>
     <release version="2.0.0" date="2026-07-17">
       <description>
         <p>Adds native Xbox services, working Friends and Realms, stable world

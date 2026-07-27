@@ -161,6 +161,91 @@ class GraphicsSafetyTests(unittest.TestCase):
             journal_runner=self.clean_journal,
         ))
 
+    def test_nested_gamescope_zero_provider_is_allowed(self):
+        def xrandr(*_args, **_kwargs):
+            return result("Providers: number : 0\n")
+
+        environments = (
+            {"DISPLAY": ":0", "XDG_SESSION_TYPE": "x11",
+             "GAMESCOPE_WAYLAND_DISPLAY": "gamescope-0"},
+            {"DISPLAY": ":0", "XDG_SESSION_TYPE": "x11",
+             "XDG_CURRENT_DESKTOP": "gamescope"},
+            {"DISPLAY": ":0", "XDG_SESSION_TYPE": "x11",
+             "DESKTOP_SESSION": "gamescope-session"},
+        )
+        for env in environments:
+            with self.subTest(env=env), mock.patch.object(
+                    gpu_safety, "_nvidia_device_with_mesa_glx",
+                    side_effect=AssertionError(
+                        "nested Gamescope must not inspect direct-Xorg GLX")):
+                self.assertIsNone(gpu_safety.graphics_safety_problem(
+                    env,
+                    xrandr_runner=xrandr,
+                    journal_runner=self.clean_journal,
+                ))
+
+    def test_generic_steam_flags_do_not_bypass_zero_provider_block(self):
+        def xrandr(*_args, **_kwargs):
+            return result("Providers: number : 0\n")
+
+        env = {
+            "DISPLAY": ":0",
+            "XDG_SESSION_TYPE": "x11",
+            "SteamDeck": "1",
+            "SteamGamepadUI": "1",
+        }
+        with mock.patch.object(gpu_safety, "_nvidia_device_with_mesa_glx",
+                               return_value=False):
+            problem = gpu_safety.graphics_safety_problem(
+                env,
+                xrandr_runner=xrandr,
+                journal_runner=self.clean_journal,
+            )
+        self.assertIn("zero RandR GPU providers", problem)
+
+    def test_gamescope_only_exempts_a_parsed_zero_provider_result(self):
+        def failed(*_args, **_kwargs):
+            return result(returncode=1)
+
+        with mock.patch.object(gpu_safety, "_xorg_software_fallback",
+                               return_value=False):
+            problem = gpu_safety.graphics_safety_problem(
+                {"DISPLAY": ":0", "XDG_SESSION_TYPE": "x11",
+                 "GAMESCOPE_WAYLAND_DISPLAY": "gamescope-0"},
+                xrandr_runner=failed,
+                journal_runner=self.clean_journal,
+            )
+        self.assertIn("could not verify any X11 hardware provider", problem)
+
+    def test_gamescope_does_not_hide_current_kernel_fault(self):
+        def journal(*_args, **_kwargs):
+            return result("amdgpu 0000:03:00.0: GPU reset begin!\n")
+
+        problem = gpu_safety.graphics_safety_problem(
+            {"DISPLAY": ":0", "XDG_SESSION_TYPE": "x11",
+             "GAMESCOPE_WAYLAND_DISPLAY": "gamescope-0"},
+            journal_runner=journal,
+        )
+        self.assertIn("during this boot", problem)
+
+    def test_gamescope_does_not_hide_interrupted_launch_marker(self):
+        self.marker.write_text(json.dumps({
+            "version": gpu_safety._STATE_VERSION,
+            "engine_rev": "wow64-archs-r12",
+            "phase": "running",
+            "token": "1" * 32,
+            "boot_id": "boot-before-power-loss",
+            "launcher_pid": 424242,
+            "created": 1,
+        }))
+
+        problem = gpu_safety.graphics_safety_problem(
+            {"DISPLAY": ":0", "XDG_SESSION_TYPE": "x11",
+             "GAMESCOPE_WAYLAND_DISPLAY": "gamescope-0"},
+            journal_runner=self.clean_journal,
+        )
+        self.assertIn("did not return cleanly", problem)
+
     def test_current_kernel_gpu_oops_is_blocked(self):
         def journal(*_args, **_kwargs):
             return result(
@@ -217,6 +302,7 @@ class GraphicsSafetyTests(unittest.TestCase):
         self.ack.write_text(json.dumps({
             "version": gpu_safety._STATE_VERSION,
             "boot_id": "boot-now", "acknowledged": 1,
+            "previous_boot_fault": True,
         }))
 
         def current_fault(args, **_kwargs):
@@ -230,6 +316,7 @@ class GraphicsSafetyTests(unittest.TestCase):
         self.ack.write_text(json.dumps({
             "version": gpu_safety._STATE_VERSION,
             "boot_id": "boot-now", "acknowledged": 1,
+            "previous_boot_fault": True,
         }))
         calls = []
 
@@ -241,6 +328,25 @@ class GraphicsSafetyTests(unittest.TestCase):
             {"XDG_SESSION_TYPE": "wayland"}, journal_runner=journal))
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][calls[0].index("-b") + 1], "0")
+
+    def test_marker_only_ack_does_not_hide_previous_boot_driver_fault(self):
+        self.ack.write_text(json.dumps({
+            "version": gpu_safety._STATE_VERSION,
+            "boot_id": "boot-now",
+            "acknowledged": 1,
+            "marker": True,
+            "previous_boot_fault": False,
+        }))
+
+        def journal(args, **_kwargs):
+            boot = args[args.index("-b") + 1]
+            if boot == "0":
+                return result()
+            return result("amdgpu: GPU reset begin!\n")
+
+        problem = gpu_safety.graphics_safety_problem(
+            {"XDG_SESSION_TYPE": "wayland"}, journal_runner=journal)
+        self.assertIn("before the last reboot", problem)
 
     def test_hard_reboot_marker_blocks_next_launch(self):
         self.marker.write_text(json.dumps({
@@ -349,13 +455,24 @@ class GraphicsSafetyTests(unittest.TestCase):
             "launcher_pid": 424242,
             "created": 1,
         }))
-        self.assertTrue(gpu_safety.acknowledge_gpu_safety_incident())
+        status = gpu_safety.acknowledge_gpu_safety_incident(
+            journal_runner=self.clean_journal)
+        self.assertTrue(status.can_acknowledge)
+        self.assertTrue(status.marker_present)
+        self.assertFalse(status.previous_boot_fault)
         self.assertFalse(self.marker.exists())
         self.assertEqual(stat.S_IMODE(self.ack.stat().st_mode), 0o600)
-        self.assertEqual(json.loads(self.ack.read_text())["boot_id"], "boot-now")
+        acknowledgement = json.loads(self.ack.read_text())
+        self.assertEqual(acknowledgement["boot_id"], "boot-now")
+        self.assertTrue(acknowledgement["marker"])
+        self.assertFalse(acknowledgement["previous_boot_fault"])
 
     def test_acknowledgement_never_bypasses_current_x11_failure(self):
-        self.assertFalse(gpu_safety.acknowledge_gpu_safety_incident())
+        with self.assertRaisesRegex(
+                gpu_safety.BolError, "No previous-boot GPU safety incident"):
+            gpu_safety.acknowledge_gpu_safety_incident(
+                journal_runner=self.clean_journal)
+        self.assertFalse(self.ack.exists())
 
         def xrandr(*_args, **_kwargs):
             return result("Providers: number : 0\n")
@@ -381,6 +498,110 @@ class GraphicsSafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(gpu_safety.BolError, "still active"):
             gpu_safety.acknowledge_gpu_safety_incident()
         self.assertTrue(self.marker.exists())
+        self.assertFalse(self.ack.exists())
+
+    def test_dead_current_boot_marker_requires_reboot_before_acknowledgement(self):
+        self.marker.write_text(json.dumps({
+            "version": gpu_safety._STATE_VERSION,
+            "engine_rev": "wow64-archs-r12",
+            "phase": "running",
+            "token": "1" * 32,
+            "boot_id": "boot-now",
+            "launcher_pid": 424242,
+            "created": 1,
+        }))
+        status = gpu_safety.gpu_safety_acknowledgement_status(
+            journal_runner=self.clean_journal)
+        self.assertEqual(status.code, "current-boot-launch")
+        self.assertFalse(status.can_acknowledge)
+        with self.assertRaisesRegex(gpu_safety.BolError,
+                                    "during this boot"):
+            gpu_safety.acknowledge_gpu_safety_incident(
+                journal_runner=self.clean_journal)
+        self.assertTrue(self.marker.exists())
+        self.assertFalse(self.ack.exists())
+
+    def test_unreadable_marker_cannot_be_acknowledged(self):
+        self.marker.write_text("{torn")
+        status = gpu_safety.gpu_safety_acknowledgement_status(
+            journal_runner=self.clean_journal)
+        self.assertEqual(status.code, "unreadable-marker")
+        self.assertFalse(status.can_acknowledge)
+        with self.assertRaisesRegex(gpu_safety.BolError,
+                                    "cannot prove"):
+            gpu_safety.acknowledge_gpu_safety_incident(
+                journal_runner=self.clean_journal)
+        self.assertTrue(self.marker.exists())
+        self.assertFalse(self.ack.exists())
+
+    def test_current_kernel_fault_prevents_old_marker_acknowledgement(self):
+        self.marker.write_text(json.dumps({
+            "version": gpu_safety._STATE_VERSION,
+            "engine_rev": "wow64-archs-r12",
+            "phase": "running",
+            "token": "1" * 32,
+            "boot_id": "boot-before-power-loss",
+            "launcher_pid": 424242,
+            "created": 1,
+        }))
+
+        def current_fault(*_args, **_kwargs):
+            return result("amdgpu: GPU reset begin!\n")
+
+        status = gpu_safety.gpu_safety_acknowledgement_status(
+            journal_runner=current_fault)
+        self.assertEqual(status.code, "current-boot-fault")
+        self.assertFalse(status.can_acknowledge)
+        with self.assertRaisesRegex(gpu_safety.BolError,
+                                    "fatal fault during this boot"):
+            gpu_safety.acknowledge_gpu_safety_incident(
+                journal_runner=current_fault)
+        self.assertTrue(self.marker.exists())
+        self.assertFalse(self.ack.exists())
+
+    def test_previous_boot_kernel_fault_is_acknowledgeable_without_marker(self):
+        def previous_fault(args, **_kwargs):
+            boot = args[args.index("-b") + 1]
+            return (result() if boot == "0"
+                    else result("NVRM: GPU has fallen off the bus\n"))
+
+        status = gpu_safety.gpu_safety_acknowledgement_status(
+            journal_runner=previous_fault)
+        self.assertTrue(status.can_acknowledge)
+        self.assertFalse(status.marker_present)
+        self.assertTrue(status.previous_boot_fault)
+        acknowledged = gpu_safety.acknowledge_gpu_safety_incident(
+            journal_runner=previous_fault)
+        self.assertEqual(acknowledged.code, "previous-boot-incident")
+        payload = json.loads(self.ack.read_text())
+        self.assertFalse(payload["marker"])
+        self.assertTrue(payload["previous_boot_fault"])
+
+    def test_already_acknowledged_fault_cannot_rewrite_ack_state(self):
+        def previous_fault(args, **_kwargs):
+            boot = args[args.index("-b") + 1]
+            return (result() if boot == "0"
+                    else result("NVRM: GPU has fallen off the bus\n"))
+
+        gpu_safety.acknowledge_gpu_safety_incident(
+            journal_runner=previous_fault)
+        with mock.patch.object(gpu_safety, "_write_state_atomic") as write:
+            with self.assertRaisesRegex(
+                    gpu_safety.BolError,
+                    "No previous-boot GPU safety incident"):
+                gpu_safety.acknowledge_gpu_safety_incident(
+                    journal_runner=previous_fault)
+        write.assert_not_called()
+
+    def test_no_incident_never_creates_acknowledgement(self):
+        status = gpu_safety.gpu_safety_acknowledgement_status(
+            journal_runner=self.clean_journal)
+        self.assertEqual(status.code, "none")
+        self.assertFalse(status.can_acknowledge)
+        with self.assertRaisesRegex(
+                gpu_safety.BolError, "No previous-boot GPU safety incident"):
+            gpu_safety.acknowledge_gpu_safety_incident(
+                journal_runner=self.clean_journal)
         self.assertFalse(self.ack.exists())
 
     def test_old_boot_legacy_marker_requires_explicit_acknowledgement(self):

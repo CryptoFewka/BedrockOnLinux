@@ -13,9 +13,31 @@ from .games import list_mc_versions
 from .gamesetup import do_setup
 from .gui import gui
 from .launch import launch
-from .log import BolError, IS_TTY, die, info, ok, warn
+from .log import BolError, IS_TTY, die, err, info, ok, warn
+from .network import diagnose_network
 from .prefix import reset_prefix
+from .profiles import (
+    create_profile,
+    list_profiles,
+    profile_launch_command,
+    require_profile_shortcuts_supported,
+    write_profile_shortcut,
+)
 from .update import check_for_update, self_update, update_kind
+
+
+def _run_network_diagnostics(host_ip=None):
+    """Run and display the read-only connectivity checks."""
+    healthy, checks = diagnose_network(host_ip)
+    for check in checks:
+        state = "OK" if check.ok is True else (
+            "ÉCHEC" if check.ok is False else "INFO"
+        )
+        print(
+            f"  {check.kind:14} {check.target}: {state} — {check.detail}"
+        )
+    return healthy
+
 
 def main():
     p = argparse.ArgumentParser(prog=APP, description=f"{PRETTY} {VERSION}")
@@ -32,7 +54,8 @@ def main():
     lv.add_argument("--beta", action="store_true")
     sub.add_parser("login", help="sign in to a Microsoft account")
     ip = sub.add_parser("import",
-                        help="import .mcpack/.mcaddon/.mcworld/.mctemplate")
+                        help=("import .mcpack/.mcaddon/.mcworld/.mctemplate/"
+                              ".mcskin"))
     ip.add_argument("files", nargs="+", metavar="FILE",
                     help="content file(s) to import")
     sub.add_parser("repair", help="reset the Wine prefix")
@@ -43,12 +66,36 @@ def main():
         help=("after repairing the graphics driver and rebooting, clear the "
               "interrupted-launch safety block"),
     )
+    dp.add_argument(
+        "--network",
+        action="store_true",
+        help="run read-only Xbox/Minecraft connectivity checks",
+    )
+    dp.add_argument(
+        "--host",
+        metavar="IP",
+        help="also inspect the route to a LAN host IP (implies --network)",
+    )
+    pp = sub.add_parser(
+        "profiles",
+        help="create or list isolated Xbox account profiles",
+    )
+    profiles_sub = pp.add_subparsers(dest="profiles_cmd")
+    profiles_create = profiles_sub.add_parser(
+        "create",
+        help="create an isolated profile and desktop shortcut",
+    )
+    profiles_create.add_argument("name", metavar="NAME")
+    profiles_sub.add_parser("list", help="list isolated profiles")
     sub.add_parser("update", help="check for and install launcher updates")
 
     sub.add_parser("changelog", help="display the launcher's release changelog history")
 
     a = p.parse_args()
     try:
+        # Migration must precede every write to the new XDG root.
+        from .util import _ensure_xdg_storage
+        _ensure_xdg_storage()
         if a.cmd == "setup":
             mc = None
             if a.mc:
@@ -73,7 +120,33 @@ def main():
                 if not na.signed_in():
                     sys.exit(1)
         elif a.cmd == "doctor":
-            sys.exit(0 if doctor(a.acknowledge_gpu_crash) else 1)
+            system_healthy = doctor(a.acknowledge_gpu_crash)
+            network_healthy = True
+            if a.network or a.host:
+                network_healthy = _run_network_diagnostics(a.host)
+            sys.exit(0 if system_healthy and network_healthy else 1)
+        elif a.cmd == "profiles":
+            if a.profiles_cmd == "create":
+                require_profile_shortcuts_supported()
+                profile = create_profile(a.name)
+                shortcut = write_profile_shortcut(
+                    a.name,
+                    profile_dir=profile,
+                )
+                ok(f"Profile: {profile}")
+                ok(f"Desktop shortcut: {shortcut}")
+                print("Steam command: " + profile_launch_command(profile))
+            elif a.profiles_cmd == "list":
+                profiles = list_profiles()
+                if not profiles:
+                    info("No isolated profiles.")
+                for profile in profiles:
+                    print(
+                        f"  {profile['name']} ({profile['slug']}): "
+                        f"{profile['path']}"
+                    )
+            else:
+                pp.print_help()
         elif a.cmd == "update":
             rel = check_for_update()
             if not rel:
@@ -116,5 +189,7 @@ def main():
                 gui()
             else:
                 p.print_help()
-    except BolError:
+    except BolError as exc:
+        if not getattr(exc, "reported", False):
+            err(str(exc))
         sys.exit(1)

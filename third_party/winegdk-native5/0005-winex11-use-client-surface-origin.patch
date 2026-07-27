@@ -1,0 +1,40 @@
+From: BedrockOnLinux contributors
+Subject: [PATCH] winex11: keep client surface geometry in client coordinates
+
+Do not offset the X11 client surface by the difference between the Win32
+client and visible rectangles. That difference represents host-window
+non-client geometry and can place a fullscreen render surface inside its
+parent instead of at the client origin.
+
+This is a narrow semantic backport of the client-surface geometry behavior
+introduced by upstream Wine commit b868cd31d6b
+("win32u: Move client surface rect computation out of the drivers."). The
+complete upstream refactor is not backported because it depends on broader
+client-surface API changes.
+
+diff --git a/dlls/winex11.drv/init.c b/dlls/winex11.drv/init.c
+index 09ef2bf8664..d0875cfc735 100644
+--- a/dlls/winex11.drv/init.c
++++ b/dlls/winex11.drv/init.c
+@@ -317,7 +317,6 @@ static void client_surface_update_geometry( HWND hwnd, struct x11drv_client_surf
+     UINT dpi = NtUserGetDpiForWindow( hwnd ); /* use window DPI here, DPI scaling is handled through offscreen presentation */
+     HWND origin = hwnd, toplevel = NtUserGetAncestor( hwnd, GA_ROOT );
+     XWindowChanges changes = surface->changes;
+-    struct x11drv_win_data *data;
+     int mask = 0;
+     RECT rect;
+ 
+@@ -325,13 +324,6 @@ static void client_surface_update_geometry( HWND hwnd, struct x11drv_client_surf
+     else if (!NtUserGetClientRect( hwnd, &rect, dpi )) return;
+     else NtUserMapWindowPoints( origin, toplevel, (POINT *)&rect, 2, dpi );
+ 
+-    if ((data = get_win_data( toplevel )))
+-    {
+-        OffsetRect( &rect, data->rects.client.left - data->rects.visible.left,
+-                    data->rects.client.top - data->rects.visible.top );
+-        release_win_data( data );
+-    }
+-
+     changes.x = rect.left;
+     changes.y = rect.top;
+     changes.width  = min( max( 1, rect.right - rect.left ), 65535 );

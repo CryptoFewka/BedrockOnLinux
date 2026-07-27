@@ -19,6 +19,9 @@ def _digest(data):
 
 class EngineFixture:
     BUILD_REV = "test-r9"
+    WINEGDK_SOURCE_MANIFEST = (
+        vkd3d.REQUIRED_WINEGDK_SOURCE_MANIFEST_PATH
+    )
     WINEGDK_PROVENANCE = (
         "files/share/bedrock-on-linux/licenses-and-provenance/winegdk/"
         ".bol-winegdk-build.env"
@@ -33,6 +36,17 @@ class EngineFixture:
     )
 
     def make_engine(self):
+        source_manifest_data = (
+            "critical:" + self.WINEGDK_SOURCE_MANIFEST
+        ).encode("utf-8")
+        source_pin = mock.patch.object(
+            vkd3d,
+            "WINEGDK_SOURCE_MANIFEST_SHA256",
+            _digest(source_manifest_data),
+        )
+        source_pin.start()
+        self.addCleanup(source_pin.stop)
+
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name) / "engine"
@@ -53,6 +67,7 @@ class EngineFixture:
             self.variant_contents[variant] = contents
 
         critical_paths = tuple(vkd3d.REQUIRED_CRITICAL_FILE_PATHS) + (
+            self.WINEGDK_SOURCE_MANIFEST,
             self.WINEGDK_PROVENANCE,
             self.VKD3D_PROVENANCE,
             self.GDK_PROTON_PROVENANCE,
@@ -90,6 +105,8 @@ class EngineFixture:
                 "winegdk": {
                     "commit": vkd3d.WINEGDK_SOURCE_COMMIT,
                     "distribution_files": {
+                        self.WINEGDK_SOURCE_MANIFEST:
+                            critical_files[self.WINEGDK_SOURCE_MANIFEST],
                         self.WINEGDK_PROVENANCE:
                             critical_files[self.WINEGDK_PROVENANCE],
                     },
@@ -165,7 +182,8 @@ class ManifestValidationTests(EngineFixture, unittest.TestCase):
         self.assertEqual(
             set(result.critical_files),
             set(vkd3d.REQUIRED_CRITICAL_FILE_PATHS) |
-            {self.WINEGDK_PROVENANCE, self.VKD3D_PROVENANCE,
+            {self.WINEGDK_SOURCE_MANIFEST, self.WINEGDK_PROVENANCE,
+             self.VKD3D_PROVENANCE,
              self.GDK_PROTON_PROVENANCE})
         self.assertEqual(set(result.variants), set(vkd3d.VARIANTS))
         self.assertEqual(len(result.variants[vkd3d.EXT_DGC]), 4)
@@ -206,6 +224,26 @@ class ManifestValidationTests(EngineFixture, unittest.TestCase):
         self.write_manifest(manifest)
         with self.assertRaisesRegex(
                 BolError, "distribution_files must be a non-empty object"):
+            vkd3d.validate_engine_manifest(root, self.BUILD_REV)
+
+    def test_winegdk_source_manifest_identity_is_pinned(self):
+        root = self.make_engine()
+        manifest = self.read_manifest()
+        manifest["provenance"]["winegdk"]["distribution_files"][
+            self.WINEGDK_SOURCE_MANIFEST
+        ] = "80a3d59d35ab642ec1f2546aa6ad2c180785f0e577f30d8eccdda2066d80c72e"
+        self.write_manifest(manifest)
+        with self.assertRaisesRegex(BolError, "source-manifest mismatch"):
+            vkd3d.validate_engine_manifest(root, self.BUILD_REV)
+
+    def test_winegdk_source_manifest_identity_is_required(self):
+        root = self.make_engine()
+        manifest = self.read_manifest()
+        del manifest["provenance"]["winegdk"]["distribution_files"][
+            self.WINEGDK_SOURCE_MANIFEST
+        ]
+        self.write_manifest(manifest)
+        with self.assertRaisesRegex(BolError, "source-manifest mismatch"):
             vkd3d.validate_engine_manifest(root, self.BUILD_REV)
 
     def test_critical_file_rejects_unsafe_additional_path(self):
@@ -296,10 +334,14 @@ class ManifestValidationTests(EngineFixture, unittest.TestCase):
                 BolError, "missing or escapes the engine"):
             vkd3d.validate_engine_manifest(root, self.BUILD_REV)
 
-    def test_file_picker_runtime_is_mandatory_for_both_architectures(self):
+    def test_file_picker_runtimes_are_mandatory_for_both_architectures(self):
         paths = (
             "files/lib/wine/x86_64-windows/windows.storage.dll",
             "files/lib/wine/i386-windows/windows.storage.dll",
+            ("files/lib/wine/x86_64-windows/"
+             "windows.storage.applicationdata.dll"),
+            ("files/lib/wine/i386-windows/"
+             "windows.storage.applicationdata.dll"),
         )
         for relative in paths:
             with self.subTest(relative=relative):
@@ -308,8 +350,17 @@ class ManifestValidationTests(EngineFixture, unittest.TestCase):
                 root.joinpath(*Path(relative).parts).unlink()
                 with self.assertRaisesRegex(
                         BolError,
-                        r"missing or escapes.*windows[.]storage[.]dll"):
+                        r"missing or escapes.*windows[.]storage"):
                     vkd3d.validate_engine_manifest(root, self.BUILD_REV)
+
+    def test_managed_user32_source_is_mandatory(self):
+        relative = "files/lib/wine/x86_64-windows/user32.dll"
+        self.assertIn(relative, vkd3d.REQUIRED_CRITICAL_FILE_PATHS)
+        root = self.make_engine()
+        root.joinpath(*Path(relative).parts).unlink()
+        with self.assertRaisesRegex(
+                BolError, r"missing or escapes.*user32[.]dll"):
+            vkd3d.validate_engine_manifest(root, self.BUILD_REV)
 
     def test_pinned_revision_rejects_unreviewed_native_threading(self):
         root = self.make_engine()

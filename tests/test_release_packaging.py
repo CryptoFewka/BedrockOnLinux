@@ -495,6 +495,7 @@ class EnginePackagingComplianceTests(unittest.TestCase):
             ".bol-winegdk-package-versions.tsv",
             "online-patches-after-user-ready.patch",
             "0001-winegdk-native5-Xbox-and-file-picker-runtime.patch",
+            "0002-windows.storage-use-legacy-single-file-dialog.patch",
             "SOURCE-SHA256SUMS",
             "xgameruntime.dll.threading",
             "windows.storage.dll",

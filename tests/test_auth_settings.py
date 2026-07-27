@@ -11,6 +11,61 @@ from unittest import mock
 from bol import auth
 
 
+_UPGRADED_SYSTEM_REG = b"""WINE REGISTRY Version 2
+;; All keys relative to REGISTRY\\Machine
+
+#arch=win64
+
+[Software\\\\Microsoft\\\\WindowsRuntime\\\\ActivatableClassId\\\\Microsoft.Windows.Storage.Pickers.FileOpenPicker] 1
+#time=1
+
+"""
+
+_UPGRADED_USER_REG = b"""WINE REGISTRY Version 2
+;; All keys relative to REGISTRY\\User\\S-1-5-21-0-0-0-1000
+
+#arch=win64
+
+[Environment] 1
+#time=1
+
+"""
+
+
+class WineGdkPrerequisiteTests(unittest.TestCase):
+    def test_file_picker_registration_repairs_upgraded_prefix_idempotently(self):
+        with tempfile.TemporaryDirectory() as td:
+            prefix = Path(td) / "pfx"
+            prefix.mkdir()
+            (prefix / "system.reg").write_bytes(_UPGRADED_SYSTEM_REG)
+            (prefix / "user.reg").write_bytes(_UPGRADED_USER_REG)
+
+            with mock.patch.object(auth, "active_prefix",
+                                   return_value=prefix), \
+                    mock.patch.object(auth, "load_settings",
+                                      return_value={}), \
+                    mock.patch.object(auth, "ok"), \
+                    mock.patch("bol.prefix.require_prefix_idle"):
+                auth.wine_apply_winegdk_prereqs()
+                system_once = (prefix / "system.reg").read_bytes()
+                user_once = (prefix / "user.reg").read_bytes()
+                auth.wine_apply_winegdk_prereqs()
+
+            system = (prefix / "system.reg").read_text()
+            self.assertIn(
+                r"[Software\\Microsoft\\WindowsRuntime\\ActivatableClassId"
+                r"\\Microsoft.Windows.Storage.Pickers.FileOpenPicker]",
+                system,
+            )
+            self.assertIn(
+                r'"DllPath"="C:\\windows\\system32\\windows.storage.dll"',
+                system,
+            )
+            self.assertEqual(system.count('"DllPath"='), 1)
+            self.assertEqual((prefix / "system.reg").read_bytes(), system_once)
+            self.assertEqual((prefix / "user.reg").read_bytes(), user_once)
+
+
 
 
 class OnlinePreauthPayloadTests(unittest.TestCase):
@@ -23,6 +78,9 @@ class OnlinePreauthPayloadTests(unittest.TestCase):
             "user_token_expiry": expiry,
             "xbl_token": "xbl",
             "xbl_token_expiry": expiry,
+            "achievements_token": "achievements",
+            "achievements_uhs": "42",
+            "achievements_expiry": expiry,
             "xbl_xuid": "1234",
             "sisu_token": "playfab",
             "sisu_rp": "https://example.playfabapi.com/",
@@ -113,6 +171,79 @@ class OnlinePreauthPayloadTests(unittest.TestCase):
         payload["mp_token"] = None
         self.assertIn("missing mp_token",
                       auth._online_preauth_problems(payload))
+
+    def test_partial_achievements_credentials_are_omitted(self):
+        for field in auth._ACHIEVEMENTS_FIELDS:
+            with self.subTest(field=field):
+                payload = self.payload()
+                payload.pop(field)
+                with tempfile.TemporaryDirectory() as td:
+                    path = Path(td) / "device.json"
+                    self.assertTrue(auth._store_online_preauth(path, payload))
+                    stored = json.loads(path.read_text())
+                for optional in auth._ACHIEVEMENTS_CACHE_FIELDS:
+                    self.assertNotIn(optional, stored)
+                self.assertEqual(auth._online_preauth_problems(stored), [])
+
+    def test_invalid_or_expired_achievements_credentials_are_omitted(self):
+        cases = (
+            {"achievements_token": ""},
+            {"achievements_token": "   "},
+            {"achievements_token": 123},
+            {"achievements_expiry": "not-a-timestamp"},
+            {"achievements_expiry": "2000-01-01T00:00:00Z"},
+        )
+        for updates in cases:
+            with self.subTest(updates=updates):
+                payload = self.payload()
+                payload.update(updates)
+                payload["achievements_expiry_epoch"] = "stale"
+                with tempfile.TemporaryDirectory() as td:
+                    path = Path(td) / "device.json"
+                    self.assertTrue(auth._store_online_preauth(path, payload))
+                    stored = json.loads(path.read_text())
+                for field in auth._ACHIEVEMENTS_CACHE_FIELDS:
+                    self.assertNotIn(field, stored)
+                self.assertEqual(auth._online_preauth_problems(stored), [])
+
+    def test_achievements_uhs_is_strict_decimal_uint64(self):
+        invalid_values = (
+            "not-decimal",
+            "+42",
+            "-42",
+            " 42",
+            "42 ",
+            "42junk",
+            "４２",
+            "0",
+            str(1 << 64),
+            42,
+        )
+        for value in invalid_values:
+            with self.subTest(value=value):
+                payload = self.payload()
+                payload["achievements_uhs"] = value
+                with tempfile.TemporaryDirectory() as td:
+                    path = Path(td) / "device.json"
+                    self.assertTrue(auth._store_online_preauth(path, payload))
+                    stored = json.loads(path.read_text())
+                for field in auth._ACHIEVEMENTS_CACHE_FIELDS:
+                    self.assertNotIn(field, stored)
+
+    def test_achievements_uhs_is_canonicalized(self):
+        for value, expected in (
+                ("00000042", "42"),
+                (str((1 << 64) - 1), str((1 << 64) - 1))):
+            with self.subTest(value=value):
+                payload = self.payload()
+                payload["achievements_uhs"] = value
+                with tempfile.TemporaryDirectory() as td:
+                    path = Path(td) / "device.json"
+                    self.assertTrue(auth._store_online_preauth(path, payload))
+                    stored = json.loads(path.read_text())
+                self.assertEqual(stored["achievements_uhs"], expected)
+                self.assertRegex(
+                    stored["achievements_expiry_epoch"], r"^[0-9]+$")
 
     def test_missing_realms_token_is_rejected(self):
         payload = self.payload()
@@ -211,6 +342,46 @@ class OnlinePreauthPayloadTests(unittest.TestCase):
             for epoch_field in auth._WINEGDK_EXPIRY_EPOCH_FIELDS.values():
                 self.assertRegex(stored[epoch_field], r"^[0-9]+$")
 
+    def test_missing_access_token_reuses_cache_without_achievements(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cache = root / "winegdk-preauth"
+            cache.mkdir()
+            payload = self.payload()
+            for field in auth._ACHIEVEMENTS_CACHE_FIELDS:
+                payload.pop(field, None)
+            path = cache / "device.json"
+            path.write_text(json.dumps(payload))
+
+            with mock.patch.object(auth, "DATA", root), \
+                    mock.patch.object(auth, "warn"), \
+                    mock.patch.object(auth, "info"):
+                self.assertTrue(auth.xbl_preauth(""))
+
+            stored = json.loads(path.read_text())
+            for field in auth._ACHIEVEMENTS_CACHE_FIELDS:
+                self.assertNotIn(field, stored)
+            self.assertEqual(auth._online_preauth_problems(stored), [])
+
+    def test_missing_access_token_removes_invalid_achievements_cache(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cache = root / "winegdk-preauth"
+            cache.mkdir()
+            payload = auth._with_winegdk_expiry_epochs(self.payload())
+            payload["achievements_uhs"] = "42junk"
+            path = cache / "device.json"
+            path.write_text(json.dumps(payload))
+
+            with mock.patch.object(auth, "DATA", root), \
+                    mock.patch.object(auth, "warn"), \
+                    mock.patch.object(auth, "info"):
+                self.assertTrue(auth.xbl_preauth(""))
+
+            stored = json.loads(path.read_text())
+            for field in auth._ACHIEVEMENTS_CACHE_FIELDS:
+                self.assertNotIn(field, stored)
+
     def test_missing_access_token_does_not_accept_partial_cache(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -305,7 +476,7 @@ class OnlinePreauthPayloadTests(unittest.TestCase):
                     mock.patch.object(auth, "info"):
                 self.assertFalse(auth.xbl_preauth("fresh-access-token"))
 
-    def test_successful_refresh_mints_exact_realms_audience(self):
+    def test_achievements_use_user_only_xsts_and_services_keep_sisu(self):
         expiry = "2999-01-01T00:00:00.1234567Z"
         epoch = "e" * 32
         requests = []
@@ -336,10 +507,14 @@ class OnlinePreauthPayloadTests(unittest.TestCase):
                 },
             }
 
+        def xsts_authorization(label, uhs="42", claims=None):
+            return authorization(label, uhs, claims)["AuthorizationToken"]
+
         responses = iter([
             {"Token": "device", "NotAfter": expiry},
             {"Token": "user", "NotAfter": expiry},
-            authorization("xbl", claims={
+            xsts_authorization("achievements", uhs="00042"),
+            authorization("xbl", uhs="84", claims={
                 "xid": "1234", "gtg": "Player", "agg": "Adult",
             }),
             authorization("playfab"),
@@ -350,7 +525,7 @@ class OnlinePreauthPayloadTests(unittest.TestCase):
 
         def urlopen(request, timeout):
             self.assertEqual(timeout, 15)
-            requests.append(json.loads(request.data))
+            requests.append((request.full_url, json.loads(request.data)))
             return Response(next(responses))
 
         with tempfile.TemporaryDirectory() as td:
@@ -366,10 +541,11 @@ class OnlinePreauthPayloadTests(unittest.TestCase):
                 self.assertTrue(auth.xbl_preauth("fresh-access-token", epoch))
 
             self.assertEqual(
-                [request["RelyingParty"] for request in requests],
+                [request["RelyingParty"] for _, request in requests],
                 [
                     "http://auth.xboxlive.com",
                     "http://auth.xboxlive.com",
+                    "http://xboxlive.com",
                     "http://xboxlive.com",
                     "https://b980a380.minecraft.playfabapi.com/",
                     "https://multiplayer.minecraft.net/",
@@ -377,11 +553,104 @@ class OnlinePreauthPayloadTests(unittest.TestCase):
                     "http://licensing.xboxlive.com",
                 ],
             )
+            self.assertEqual(
+                requests[2],
+                (
+                    "https://xsts.auth.xboxlive.com/xsts/authorize",
+                    {
+                        "RelyingParty": "http://xboxlive.com",
+                        "TokenType": "JWT",
+                        "Properties": {
+                            "SandboxId": "RETAIL",
+                            "UserTokens": ["user"],
+                        },
+                    },
+                ),
+            )
+            for url, request in requests[3:]:
+                self.assertEqual(
+                    url, "https://sisu.xboxlive.com/authorize")
+                self.assertEqual(request["AppId"], "0000000048183522")
+                self.assertEqual(
+                    request["AccessToken"], "t=fresh-access-token")
             stored = json.loads((cache / "device.json").read_text())
+            self.assertEqual(stored["xbl_token"], "xbl")
+            self.assertEqual(stored["xbl_uhs"], "84")
+            self.assertEqual(stored["achievements_token"], "achievements")
+            self.assertEqual(stored["achievements_uhs"], "42")
+            self.assertRegex(
+                stored["achievements_expiry_epoch"], r"^[0-9]+$")
             self.assertEqual(stored["realms_rp"],
                              "https://pocket.realms.minecraft.net/")
             self.assertEqual(stored["realms_token"], "realms")
             self.assertRegex(stored["realms_expiry_epoch"], r"^[0-9]+$")
+
+    def test_achievements_xsts_failure_does_not_block_core_preauth(self):
+        expiry = "2999-01-01T00:00:00Z"
+        epoch = "f" * 32
+
+        class Response:
+            def __init__(self, status, payload):
+                self.status = status
+                self.payload = json.dumps(payload).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return self.payload
+
+        def authorization(label, claims=None):
+            xui = {"uhs": "84"}
+            if claims:
+                xui.update(claims)
+            return {
+                "AuthorizationToken": {
+                    "Token": label,
+                    "NotAfter": expiry,
+                    "DisplayClaims": {"xui": [xui]},
+                },
+            }
+
+        responses = iter([
+            Response(200, {"Token": "device", "NotAfter": expiry}),
+            Response(200, {"Token": "user", "NotAfter": expiry}),
+            Response(503, {"error": "temporarily unavailable"}),
+            Response(200, authorization("xbl", {
+                "xid": "1234", "gtg": "Player", "agg": "Adult",
+            })),
+            Response(200, authorization("playfab")),
+            Response(200, authorization("multiplayer")),
+            Response(200, authorization("realms")),
+            Response(200, authorization("license")),
+        ])
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cache = root / "winegdk-preauth"
+            cache.mkdir()
+            (cache / ".account-epoch").write_text(epoch + "\n")
+            with mock.patch.object(auth, "DATA", root), \
+                    mock.patch("urllib.request.urlopen",
+                               side_effect=lambda *_args, **_kwargs:
+                               next(responses)) as urlopen, \
+                    mock.patch.object(auth, "warn"), \
+                    mock.patch.object(auth, "info"), \
+                    mock.patch.object(auth, "ok"):
+                self.assertTrue(auth.xbl_preauth(
+                    "fresh-access-token", epoch))
+
+            self.assertEqual(urlopen.call_count, 8)
+            stored = json.loads((cache / "device.json").read_text())
+            for field in auth._ACHIEVEMENTS_CACHE_FIELDS:
+                self.assertNotIn(field, stored)
+            self.assertEqual(stored["xbl_token"], "xbl")
+            self.assertEqual(stored["mp_token"], "multiplayer")
+            self.assertEqual(stored["realms_token"], "realms")
+            self.assertIsNone(auth.xbl_preauth_diagnostic())
 
 
 class NativeAuthCancellationTests(unittest.TestCase):
@@ -424,7 +693,6 @@ class NativeAuthCancellationTests(unittest.TestCase):
                 native._flow(None, online, epoch)
 
             self.assertFalse((msa / "token.json").exists())
-            self.assertFalse(native.online)
             online.assert_not_called()
             self.assertNotEqual(
                 (cache / ".account-epoch").read_text().strip(), epoch)
@@ -455,7 +723,6 @@ class NativeAuthCancellationTests(unittest.TestCase):
                 native._flow(None, None, epoch)
 
             self.assertFalse((msa / "token.json").exists())
-            self.assertFalse(native.online)
 
 
 if __name__ == "__main__":

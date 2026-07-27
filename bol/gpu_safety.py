@@ -17,17 +17,37 @@ import stat
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional
 
-from .config import APP, DATA, WINEGDK_BUILD_REV
+from .config import APP, GAMES, WINEGDK_BUILD_REV
 from .log import BolError, die, warn
 
 
-GPU_LAUNCH_MARKER = DATA / ".gpu-launch-in-progress.json"
-GPU_SAFETY_ACK = DATA / ".gpu-safety-ack.json"
+try:
+    # ``games`` is shared by isolated profiles. Following that link back to
+    # its parent keeps the interlock global to every profile while preserving
+    # the normal and relocated main-data roots.
+    _GPU_STATE_ROOT = GAMES.resolve(strict=False).parent
+except (OSError, RuntimeError) as exc:
+    raise BolError(
+        f"Cannot locate the shared GPU-safety state directory: {exc}"
+    ) from exc
+
+GPU_LAUNCH_MARKER = _GPU_STATE_ROOT / ".gpu-launch-in-progress.json"
+GPU_SAFETY_ACK = _GPU_STATE_ROOT / ".gpu-safety-ack.json"
 _STATE_VERSION = 2
 _LEGACY_MARKER_VERSION = 1
+
+
+@dataclass(frozen=True)
+class GpuSafetyAcknowledgementStatus:
+    code: str
+    can_acknowledge: bool
+    message: str
+    marker_present: bool = False
+    previous_boot_fault: bool = False
 
 
 def _truthy(value: Optional[str]) -> bool:
@@ -39,6 +59,28 @@ def _x11_session(env: Mapping[str, str]) -> bool:
     if session:
         return session == "x11"
     return bool(env.get("DISPLAY")) and not bool(env.get("WAYLAND_DISPLAY"))
+
+
+def _nested_gamescope_session(env: Mapping[str, str]) -> bool:
+    """True only for an explicitly identified nested Gamescope session.
+
+    Gamescope's Xwayland server legitimately reports zero RandR providers even
+    while the compositor is presenting through a healthy DRM/Vulkan device.
+    Generic Steam or Steam Deck flags are deliberately insufficient: they can
+    also be present on an ordinary direct-Xorg desktop, where zero providers
+    remains a useful failure signal.
+    """
+
+    if (env.get("GAMESCOPE_WAYLAND_DISPLAY") or "").strip():
+        return True
+    for key in ("XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP",
+                "DESKTOP_SESSION"):
+        value = (env.get(key) or "").strip().lower()
+        parts = re.split(r"[:;,\s]+", value)
+        if any(part == "gamescope" or part.startswith("gamescope-")
+               for part in parts):
+            return True
+    return False
 
 
 def _xrandr_provider_count(env: Mapping[str, str], runner=None) -> Optional[int]:
@@ -140,7 +182,7 @@ def interrupted_launch_problem(path: Optional[Path] = None) -> Optional[str]:
 
     Presence is authoritative even if the JSON was torn by a power loss.  This
     is deliberately conservative: a stale marker is removed only by the
-    explicit doctor acknowledgement after the driver has been repaired.
+    explicit doctor acknowledgement after a reboot and inspection.
     """
 
     marker = Path(path) if path is not None else GPU_LAUNCH_MARKER
@@ -193,8 +235,9 @@ def interrupted_launch_problem(path: Optional[Path] = None) -> Optional[str]:
     when = "during this boot" if same_boot else "before the last reboot/power loss"
     return (
         f"the previous Minecraft GPU session did not return cleanly {when}; "
-        "do not retry until the host graphics driver is repaired, then run "
-        f"'{command}' to acknowledge the incident"
+        "inspect why the session or machine stopped and reboot before retrying; "
+        f"if no current graphics fault remains, run '{command}' to acknowledge "
+        "the interrupted launch"
     )
 
 
@@ -219,8 +262,9 @@ def arm_gpu_launch(path: Optional[Path] = None) -> str:
     except FileExistsError as exc:
         raise BolError(
             "A previous Minecraft GPU launch is still marked interrupted. "
-            f"After repairing the driver and rebooting, run '{APP} doctor "
-            "--acknowledge-gpu-crash'."
+            "After inspecting the interrupted session and rebooting, run "
+            f"'{APP} doctor --acknowledge-gpu-crash' if no current graphics "
+            "fault remains."
         ) from exc
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -322,34 +366,62 @@ def retire_idle_current_boot_marker(path: Optional[Path] = None) -> bool:
     return True
 
 
+def _acknowledgement_marker_scope(marker: Path) -> str:
+    """Classify a marker as none/previous/current/active/unknown."""
+
+    try:
+        marker.lstat()
+    except FileNotFoundError:
+        return "none"
+    except OSError:
+        return "unknown"
+    state = _read_state(marker)
+    boot = _boot_id()
+    marker_boot = state.get("boot_id") if state else None
+    if not boot or not isinstance(marker_boot, str) or not marker_boot:
+        return "unknown"
+    if marker_boot != boot:
+        return "previous"
+    if _pid_alive(state.get("launcher_pid")):
+        return "active"
+    return "current"
+
+
 def acknowledge_gpu_safety_incident(
         marker_path: Optional[Path] = None,
-        ack_path: Optional[Path] = None) -> bool:
-    """Explicitly acknowledge a repaired interrupted launch.
+        ack_path: Optional[Path] = None,
+        journal_runner=None) -> GpuSafetyAcknowledgementStatus:
+    """Acknowledge one verified previous-boot incident, never a blank state.
 
     The caller must serialize this with PLAY (the doctor command uses the same
-    launch lock). The acknowledgement suppresses only a fault from the
-    *previous* boot during the current boot after that explicit confirmation.
-    A current-boot GPU fault always remains blocking.
+    launch lock). Eligibility is re-evaluated immediately before the durable
+    write, so a current-boot launch marker or kernel fault cannot be cleared.
     """
 
     marker = Path(marker_path) if marker_path is not None else GPU_LAUNCH_MARKER
     ack = Path(ack_path) if ack_path is not None else GPU_SAFETY_ACK
-    state = _read_state(marker)
-    if (state and state.get("boot_id") == _boot_id()
-            and _pid_alive(state.get("launcher_pid"))):
-        raise BolError("The marked Minecraft launch is still active; stop it "
-                       "before acknowledging a GPU safety incident.")
+    status = gpu_safety_acknowledgement_status(marker, journal_runner)
+    if not status.can_acknowledge:
+        raise BolError(status.message)
     _write_state_atomic(ack, {
         "version": _STATE_VERSION,
         "boot_id": _boot_id(),
         "acknowledged": int(time.time()),
+        "marker": status.marker_present,
+        "previous_boot_fault": status.previous_boot_fault,
     })
-    existed = marker.exists() or marker.is_symlink()
-    if existed:
-        marker.unlink(missing_ok=True)
+    if status.marker_present:
+        try:
+            marker.unlink()
+        except OSError:
+            # Leaving the marker in place remains fail-closed. The caller can
+            # report the filesystem error instead of pretending it was clear.
+            raise BolError(
+                "The previous-boot GPU incident was acknowledged, but its "
+                "interrupted-launch marker could not be removed."
+            )
         _sync_parent(marker)
-    return existed
+    return status
 
 
 def _previous_boot_fault_acknowledged(path: Optional[Path] = None) -> bool:
@@ -357,7 +429,8 @@ def _previous_boot_fault_acknowledged(path: Optional[Path] = None) -> bool:
     state = _read_state(ack)
     boot = _boot_id()
     return bool(boot and state and state.get("version") == _STATE_VERSION
-                and state.get("boot_id") == boot)
+                and state.get("boot_id") == boot
+                and state.get("previous_boot_fault") is True)
 
 
 def _xorg_software_fallback() -> bool:
@@ -481,6 +554,80 @@ def _kernel_driver_fault_scope(runner=None) -> Optional[str]:
     return None
 
 
+def gpu_safety_acknowledgement_status(
+        marker_path: Optional[Path] = None,
+        journal_runner=None) -> GpuSafetyAcknowledgementStatus:
+    """Return whether an explicit previous-boot acknowledgement is valid.
+
+    This read-only helper is suitable for deciding whether a GUI should offer
+    an acknowledgement action. The mutating function always rechecks it under
+    the launch lock, so callers must not treat a previously returned value as
+    authorization to delete state.
+    """
+
+    marker = Path(marker_path) if marker_path is not None else GPU_LAUNCH_MARKER
+    marker_scope = _acknowledgement_marker_scope(marker)
+    if marker_scope == "active":
+        return GpuSafetyAcknowledgementStatus(
+            "active-launch", False,
+            "The marked Minecraft launch is still active; stop it before "
+            "acknowledging a GPU safety incident.",
+            marker_present=True,
+        )
+    if marker_scope == "current":
+        return GpuSafetyAcknowledgementStatus(
+            "current-boot-launch", False,
+            "The interrupted Minecraft launch happened during this boot. "
+            "Inspect the graphics driver and reboot before acknowledging it.",
+            marker_present=True,
+        )
+    if marker_scope == "unknown":
+        return GpuSafetyAcknowledgementStatus(
+            "unreadable-marker", False,
+            "The interrupted-launch marker cannot prove that it belongs to a "
+            "previous boot; it cannot be acknowledged safely.",
+            marker_present=True,
+        )
+
+    fault_scope = _kernel_driver_fault_scope(journal_runner)
+    if fault_scope == "current":
+        return GpuSafetyAcknowledgementStatus(
+            "current-boot-fault", False,
+            "The graphics driver reported a fatal fault during this boot. "
+            "Reboot before acknowledging any previous incident.",
+            marker_present=marker_scope == "previous",
+        )
+
+    previous_marker = marker_scope == "previous"
+    previous_fault = fault_scope == "previous"
+    if previous_marker or previous_fault:
+        if not _boot_id():
+            return GpuSafetyAcknowledgementStatus(
+                "boot-id-unavailable", False,
+                "The current boot cannot be identified, so a previous GPU "
+                "incident cannot be acknowledged safely.",
+                marker_present=previous_marker,
+                previous_boot_fault=previous_fault,
+            )
+        details = []
+        if previous_marker:
+            details.append("an interrupted Minecraft launch")
+        if previous_fault:
+            details.append("a fatal graphics-driver event")
+        return GpuSafetyAcknowledgementStatus(
+            "previous-boot-incident", True,
+            "Previous-boot GPU incident available to acknowledge: "
+            + " and ".join(details) + ".",
+            marker_present=previous_marker,
+            previous_boot_fault=previous_fault,
+        )
+
+    return GpuSafetyAcknowledgementStatus(
+        "none", False,
+        "No previous-boot GPU safety incident is available to acknowledge.",
+    )
+
+
 def graphics_safety_problem(
         environ: Optional[Mapping[str, str]] = None,
         xrandr_runner=None,
@@ -509,6 +656,8 @@ def graphics_safety_problem(
     if _x11_session(env):
         providers = _xrandr_provider_count(env, xrandr_runner)
         if providers == 0:
+            if _nested_gamescope_session(env):
+                return None
             problem = (
                 "the X11 session exposes zero RandR GPU providers and is "
                 "running on a fallback framebuffer/software renderer"

@@ -313,7 +313,7 @@ def _install_cryptbase_in_prefix(pfx=None):
     not the game dir, and the OpenSSL XCurl aborts at its first TLS RNG call
     without it. Backs up any existing cryptbase once; idempotent."""
     src = OPENSSL_XCURL_SET / "cryptbase.dll"
-    if not src.exists():
+    if not src.is_file() or src.is_symlink():
         # OpenSSL XCurl set unavailable (download failed, or the rev's asset
         # isn't published yet). Without ANY cryptbase, GDK-Proton's advapi32
         # forward of SystemFunction036 (RtlGenRandom) stays unresolved and the
@@ -326,30 +326,50 @@ def _install_cryptbase_in_prefix(pfx=None):
         from .proton import proton_path
         pp = proton_path()
         builtin = (pp / "files/lib/wine/x86_64-windows/cryptbase.dll") if pp else None
-        if not (builtin and builtin.exists()):
-            return
+        if not (builtin and builtin.is_file() and not builtin.is_symlink()):
+            return False
         src = builtin
     pfx = pfx or active_prefix()
     sys32 = pfx / "drive_c/windows/system32"
     if not sys32.is_dir():
         warn(f"prefix system32 not found at {sys32} — cryptbase stub not "
              "installed (native PlayFab login may fail).")
-        return
+        return False
     dst = sys32 / "cryptbase.dll"
     try:
-        import hashlib
-        if dst.exists() and hashlib.sha1(dst.read_bytes()).digest() == \
-                hashlib.sha1(src.read_bytes()).digest():
-            return
+        source_hash = hashlib.sha256(src.read_bytes()).digest()
+        if dst.is_file() and not dst.is_symlink() and \
+                hashlib.sha256(dst.read_bytes()).digest() == source_hash:
+            return True
         # An existing prefix cryptbase may be a non-functional placeholder —
         # replace it, keeping a one-time backup.
         bak = sys32 / "cryptbase.dll.bol-orig"
-        if dst.exists() and not bak.exists():
-            shutil.copy2(dst, bak)
-        shutil.copy2(src, dst)
+        if (dst.exists() or dst.is_symlink()) and not (
+                bak.exists() or bak.is_symlink()):
+            if dst.is_symlink():
+                bak.symlink_to(os.readlink(dst))
+            elif dst.is_file():
+                shutil.copy2(dst, bak, follow_symlinks=False)
+            else:
+                warn(f"cryptbase install failed: {dst} is not a regular file")
+                return False
+        fd, staged_name = tempfile.mkstemp(
+            prefix=".cryptbase.dll-", dir=sys32)
+        os.close(fd)
+        staged = Path(staged_name)
+        try:
+            shutil.copy2(src, staged, follow_symlinks=False)
+            if hashlib.sha256(staged.read_bytes()).digest() != source_hash:
+                raise BolError(
+                    "cryptbase copy failed integrity checking")
+            os.replace(staged, dst)
+        finally:
+            staged.unlink(missing_ok=True)
         ok("cryptbase RNG stub installed in prefix system32")
+        return True
     except Exception as e:
         warn(f"cryptbase install failed: {e}")
+        return False
 
 
 def _patch_lhc_xcurl_gate(game_dir: Path):
@@ -451,5 +471,5 @@ def hide_signin_button(game_dir):
         if n:
             ss.write_text(new, encoding="utf-8")
             ok("Hid the broken in-game Sign-in button.")
-    except Exception as e:                       # noqa: BLE001 — cosmetic, never fatal
+    except Exception as e:
         warn(f"hide_signin_button: {e}")

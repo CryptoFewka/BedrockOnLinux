@@ -7,29 +7,64 @@ import sys
 from . import deps
 from .config import PRETTY, VERSION
 from .gpu_safety import (
+    GpuSafetyAcknowledgementStatus,
     acknowledge_gpu_safety_incident,
     graphics_safety_problem,
+    gpu_safety_acknowledgement_status,
 )
-from .log import info, ok, warn
+from .log import BolError, info, ok, warn
+
+
+def gpu_crash_acknowledgement_status():
+    """Return structured acknowledgement state for CLI or GUI callers."""
+
+    # Import lazily to keep the ordinary doctor lightweight and avoid making
+    # GPU safety state depend on the Wine/UMU modules at import time.
+    from .prefix import active_prefix, prefix_processes
+
+    running = prefix_processes(active_prefix())
+    if running:
+        return GpuSafetyAcknowledgementStatus(
+            "active-prefix", False,
+            "BedrockOnLinux still has "
+            f"{len(running)} Wine/UMU process(es). Force-stop them before "
+            "acknowledging GPU safety.",
+        )
+    return gpu_safety_acknowledgement_status()
 
 
 def _acknowledge_gpu_crash():
     """Clear an interrupted-launch block only while PLAY is fully idle."""
 
-    # Import lazily to keep the ordinary doctor lightweight and avoid making
-    # GPU safety state depend on the Wine/UMU modules at import time.
     from .prefix import active_prefix, launch_lock, prefix_processes
 
-    with launch_lock():
-        running = prefix_processes(active_prefix())
-        if running:
-            warn("Cannot acknowledge GPU safety while BedrockOnLinux still has "
-                 f"{len(running)} Wine/UMU process(es). Force-stop them first.")
-            return False
-        had_marker = acknowledge_gpu_safety_incident()
+    try:
+        with launch_lock():
+            running = prefix_processes(active_prefix())
+            if running:
+                warn(
+                    "Cannot acknowledge GPU safety while BedrockOnLinux still "
+                    f"has {len(running)} Wine/UMU process(es). Force-stop them "
+                    "first."
+                )
+                return False
+            status = acknowledge_gpu_safety_incident()
+    except BolError as exc:
+        warn(str(exc))
+        return False
+    details = []
+    if status.marker_present:
+        details.append("interrupted-launch marker cleared")
+    if status.previous_boot_fault:
+        details.append("previous-boot driver fault acknowledged")
     warn("GPU safety incident explicitly acknowledged for the current boot"
-         + ("; interrupted-launch marker cleared." if had_marker else "."))
+         + ("; " + ", ".join(details) + "." if details else "."))
     return True
+
+
+def acknowledge_gpu_crash():
+    """Public UI/CLI entry point for the guarded acknowledgement action."""
+    return _acknowledge_gpu_crash()
 
 
 def doctor(acknowledge_gpu_crash=False):

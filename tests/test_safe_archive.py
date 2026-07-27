@@ -170,6 +170,19 @@ class NetworkArchiveIntegrationTests(unittest.TestCase):
                 member.size = len(payload)
                 archive.addfile(member, io.BytesIO(payload))
 
+    @staticmethod
+    def _write_umu_archive(path, launcher=b"umu launcher"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(path, "w") as archive:
+            directory = tarfile.TarInfo("umu/")
+            directory.type = tarfile.DIRTYPE
+            directory.mode = 0o755
+            archive.addfile(directory)
+            member = tarfile.TarInfo("umu/umu-run")
+            member.mode = 0o755
+            member.size = len(launcher)
+            archive.addfile(member, io.BytesIO(launcher))
+
     def test_bad_umu_update_keeps_existing_launcher_and_cleans_staging(self):
         cache = self.base / "cache"
         umu_dir = self.base / "umu"
@@ -191,6 +204,61 @@ class NetworkArchiveIntegrationTests(unittest.TestCase):
 
         self.assertEqual(launcher.read_bytes(), b"known-good launcher")
         self.assertFalse((self.base / "outside.txt").exists())
+        self.assertEqual(list(umu_dir.parent.glob(".umu-extract-*")), [])
+        self.assertEqual(list(umu_dir.glob(".umu-run-*")), [])
+
+    def test_umu_archive_hash_mismatch_is_rejected_after_download(self):
+        cache = self.base / "cache"
+        umu_dir = self.base / "umu"
+        umu_dir.mkdir()
+        launcher = umu_dir / "umu-run"
+        launcher.write_bytes(b"known-good launcher")
+        package = cache / "umu-launcher.tar"
+        package.parent.mkdir()
+        package.write_bytes(b"stale archive")
+
+        def bad_download(_url, destination, _label):
+            Path(destination).write_bytes(b"wrong downloaded archive")
+
+        with mock.patch.object(prefix, "CACHE", cache), \
+                mock.patch.object(prefix, "UMU_DIR", umu_dir), \
+                mock.patch.object(prefix, "UMU_ASSET", package.name), \
+                mock.patch.object(
+                    prefix, "UMU_ARCHIVE_SHA256", "0" * 64
+                ), \
+                mock.patch.object(
+                    prefix, "download", side_effect=bad_download
+                ):
+            with self.assertRaisesRegex(
+                    ValueError, "archive SHA-256 mismatch"):
+                prefix.ensure_umu(force=True)
+
+        self.assertEqual(launcher.read_bytes(), b"known-good launcher")
+        self.assertFalse(package.exists())
+
+    def test_umu_inner_launcher_hash_mismatch_keeps_existing_launcher(self):
+        cache = self.base / "cache"
+        umu_dir = self.base / "umu"
+        umu_dir.mkdir()
+        launcher = umu_dir / "umu-run"
+        launcher.write_bytes(b"known-good launcher")
+        package = cache / "umu-launcher.tar"
+        self._write_umu_archive(package, b"unexpected inner launcher")
+        package_hash = hashlib.sha256(package.read_bytes()).hexdigest()
+
+        with mock.patch.object(prefix, "CACHE", cache), \
+                mock.patch.object(prefix, "UMU_DIR", umu_dir), \
+                mock.patch.object(prefix, "UMU_ASSET", package.name), \
+                mock.patch.object(
+                    prefix, "UMU_ARCHIVE_SHA256", package_hash
+                ), \
+                mock.patch.object(prefix, "UMU_RUN_SHA256", "0" * 64), \
+                mock.patch.object(prefix, "download") as download:
+            with self.assertRaisesRegex(ValueError, "umu-run SHA-256 mismatch"):
+                prefix.ensure_umu(force=True)
+
+        download.assert_not_called()
+        self.assertEqual(launcher.read_bytes(), b"known-good launcher")
         self.assertEqual(list(umu_dir.parent.glob(".umu-extract-*")), [])
         self.assertEqual(list(umu_dir.glob(".umu-run-*")), [])
 

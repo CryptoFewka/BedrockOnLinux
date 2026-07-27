@@ -181,14 +181,12 @@ class WineGDKInstallTests(unittest.TestCase):
         archive = self._archive(marker="new")
 
         with mock.patch.dict(os.environ, {"BOL_ENGINE_ARCHIVE": str(archive)}), \
-                mock.patch.object(winegdk, "gh_releases") as releases, \
                 mock.patch.object(winegdk, "download") as download:
             installed = winegdk._install_prebuilt_winegdk(force=True)
 
         self.assertTrue(installed)
         self.assertEqual((self.engine / "proton").read_text(), "new")
         self.assertTrue(archive.is_file(), "force must not delete a local archive")
-        releases.assert_not_called()
         download.assert_not_called()
         self.assertEqual(self.validator.call_count, 1)
         self.assertEqual(self.validator.call_args.args[1], self.REV)
@@ -203,15 +201,44 @@ class WineGDKInstallTests(unittest.TestCase):
         with mock.patch.dict(
                 os.environ,
                 {"BOL_ENGINE_ARCHIVE": "", "APPIMAGE": str(appimage)}), \
-                mock.patch.object(winegdk, "gh_releases") as releases, \
                 mock.patch.object(winegdk, "download") as download:
             installed = winegdk._install_prebuilt_winegdk()
 
         self.assertTrue(installed)
         self.assertEqual((self.engine / "proton").read_text(), "sibling-r12")
         self.assertEqual(archive.parent, appimage.parent)
-        releases.assert_not_called()
         download.assert_not_called()
+
+    def test_remote_download_ignores_stale_release_metadata(self):
+        fresh = self._archive(name="fresh.tar.gz", marker="fresh")
+        asset = f"GDK-Proton-xuser-{self.REV}.tar.gz"
+        stale_metadata = self.cache / (
+            "releases_Wyze3306_BedrockOnLinux_30.json")
+        stale_metadata.parent.mkdir(parents=True)
+        stale_metadata.write_text(
+            '[{"tag_name":"engine-old","assets":[]}]',
+            encoding="utf-8",
+        )
+
+        def download_fresh(_url, dest, _label, _progress):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(fresh, dest)
+
+        with mock.patch.object(
+                winegdk, "download",
+                side_effect=download_fresh) as download:
+            installed = winegdk._install_prebuilt_winegdk()
+
+        self.assertTrue(installed)
+        download.assert_called_once_with(
+            "https://github.com/Wyze3306/BedrockOnLinux/releases/download/"
+            f"engine-{self.REV}/{asset}",
+            self.cache / asset,
+            "Game engine",
+            None,
+        )
+        self.assertEqual((self.engine / "proton").read_text(), "fresh")
+        self.assertTrue(stale_metadata.is_file())
 
     def test_force_deletes_cached_archive_and_downloads_again(self):
         self._write_engine(self.engine, "old")
@@ -221,25 +248,31 @@ class WineGDKInstallTests(unittest.TestCase):
         cached.parent.mkdir(parents=True)
         cached.write_bytes(b"stale cached bytes")
         cached.with_suffix(cached.suffix + ".part").write_bytes(b"stale part")
-        release = {"assets": [{
-            "name": asset,
-            "browser_download_url": "https://example.invalid/" + asset,
-            "size": fresh.stat().st_size,
-        }]}
 
         def download_fresh(_url, dest, _label, _progress):
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(fresh, dest)
 
-        with mock.patch.object(winegdk, "gh_releases", return_value=[release]), \
-                mock.patch.object(winegdk, "download",
-                                  side_effect=download_fresh) as download:
+        with mock.patch.object(winegdk, "download",
+                               side_effect=download_fresh) as download:
             installed = winegdk._install_prebuilt_winegdk(force=True)
 
         self.assertTrue(installed)
         download.assert_called_once()
         self.assertFalse(cached.with_suffix(cached.suffix + ".part").exists())
         self.assertEqual((self.engine / "proton").read_text(), "fresh")
+
+    def test_remote_download_failure_keeps_current_engine(self):
+        self._write_engine(self.engine, "known-good")
+
+        with mock.patch.object(
+                winegdk, "download",
+                side_effect=OSError("simulated network failure")):
+            installed = winegdk._install_prebuilt_winegdk(force=True)
+
+        self.assertFalse(installed)
+        self.assertEqual((self.engine / "proton").read_text(), "known-good")
+        self.validator.assert_not_called()
 
     def test_manifest_failure_keeps_current_engine(self):
         self._write_engine(self.engine, "known-good")
@@ -281,7 +314,7 @@ class WineGDKInstallTests(unittest.TestCase):
         with mock.patch.object(Path, "replace", autospec=True,
                                side_effect=fail_candidate):
             with self.assertRaises(OSError):
-                winegdk._activate_engine(candidate)
+                winegdk._activate_engine_locked(candidate)
 
         self.assertEqual((self.engine / "proton").read_text(), "known-good")
         self.assertTrue(candidate.exists())
@@ -303,7 +336,7 @@ class WineGDKInstallTests(unittest.TestCase):
 
         with mock.patch.object(
                 winegdk, "_remove_path", side_effect=fail_rollback_cleanup):
-            winegdk._activate_engine(candidate)
+            winegdk._activate_engine_locked(candidate)
 
         self.assertEqual((self.engine / "proton").read_text(), "candidate")
         self.assertEqual((rollback / "proton").read_text(), "known-good")
@@ -422,7 +455,8 @@ class WineGDKInstallTests(unittest.TestCase):
                                   return_value=False) as install, \
                 mock.patch.object(winegdk, "_wire_winegdk",
                                   return_value=self.engine):
-            with self.assertRaises(BolError):
+            with self.assertRaisesRegex(
+                    BolError, "Flatpak and packaged-app users"):
                 winegdk.ensure_winegdk()
 
         install.assert_called_once_with(None, force=False)

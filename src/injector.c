@@ -43,9 +43,15 @@ int wmain(int argc, wchar_t **argv)
 
     SIZE_T n = (wcslen(dll) + 1) * sizeof(wchar_t);
     void *rem = VirtualAllocEx(h, NULL, n, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!rem || !WriteProcessMemory(h, rem, dll, n, NULL)) {
-        fwprintf(stderr, L"ERR write process memory: %lu\n", GetLastError());
+    if (!rem) {
+        fwprintf(stderr, L"ERR allocate process memory: %lu\n", GetLastError());
         CloseHandle(h); return 5;
+    }
+    if (!WriteProcessMemory(h, rem, dll, n, NULL)) {
+        fwprintf(stderr, L"ERR write process memory: %lu\n", GetLastError());
+        VirtualFreeEx(h, rem, 0, MEM_RELEASE);
+        CloseHandle(h);
+        return 5;
     }
 
     /* kernel32 is mapped at the same address in every Wine process, so the
@@ -59,9 +65,30 @@ int wmain(int argc, wchar_t **argv)
         VirtualFreeEx(h, rem, 0, MEM_RELEASE); CloseHandle(h); return 6;
     }
 
-    WaitForSingleObject(th, 15000);
+    DWORD wait = WaitForSingleObject(th, 15000);
+    if (wait != WAIT_OBJECT_0) {
+        if (wait == WAIT_TIMEOUT)
+            fwprintf(stderr, L"ERR LoadLibrary thread timed out\n");
+        else
+            fwprintf(stderr, L"ERR waiting for LoadLibrary thread: %lu\n",
+                     GetLastError());
+        /*
+         * The remote thread can still be reading the path after a timeout.
+         * Do not free that allocation and create a use-after-free in the
+         * target; Wine will reclaim the tiny buffer when Minecraft exits.
+         */
+        CloseHandle(th);
+        CloseHandle(h);
+        return 8;
+    }
     DWORD mod = 0;                       /* low 32 bits of the loaded HMODULE */
-    GetExitCodeThread(th, &mod);
+    if (!GetExitCodeThread(th, &mod)) {
+        fwprintf(stderr, L"ERR GetExitCodeThread: %lu\n", GetLastError());
+        VirtualFreeEx(h, rem, 0, MEM_RELEASE);
+        CloseHandle(th);
+        CloseHandle(h);
+        return 9;
+    }
     VirtualFreeEx(h, rem, 0, MEM_RELEASE);
     CloseHandle(th);
     CloseHandle(h);

@@ -1,4 +1,4 @@
-"""Tests for bol.x11's primary-monitor size lookup."""
+"""Tests for bol.x11 monitor geometry lookup."""
 # SPDX-License-Identifier: MIT
 
 import subprocess
@@ -37,6 +37,25 @@ BARE_XRANDR_COMBINED = (
     "16384\n"
 )
 
+CONNECTED_MIXED = (
+    "DP-1 connected primary 2560x1440+0+0 (normal left inverted right x "
+    "axis y axis)\n"
+    "HDMI-1 connected 1366x768+2560+0 (normal left inverted right x axis "
+    "y axis)\n"
+)
+
+MIXED_MONITORS = (
+    "Monitors: 2\n"
+    " 0: +*DP-1 2560/600x1440/340+0+0  DP-1\n"
+    " 1: +HDMI-1 1366/310x768/170+2560+0  HDMI-1\n"
+)
+
+NEGATIVE_MONITOR = (
+    "Monitors: 2\n"
+    " 0: +DP-1 1920/530x1080/300-1920+0  DP-1\n"
+    " 1: +*eDP-1 1920/340x1080/190+0+0  eDP-1\n"
+)
+
 
 class XrandrCliFallbackTests(unittest.TestCase):
     """Exercises _primary_via_xrandr_cli directly, and through
@@ -73,6 +92,48 @@ class XrandrCliFallbackTests(unittest.TestCase):
         self.assertEqual(x11.primary_output_size(runner=runner),
                           ("1920", "1080"))
 
+    def test_monitor_geometries_include_mixed_and_negative_positions(self):
+        self.assertEqual(
+            x11.monitor_geometries(
+                runner=lambda _args, **_kwargs: result(MIXED_MONITORS)),
+            ((0, 0, 2560, 1440), (2560, 0, 1366, 768)),
+        )
+        self.assertEqual(
+            x11.monitor_geometries(
+                runner=lambda _args, **_kwargs: result(NEGATIVE_MONITOR)),
+            ((-1920, 0, 1920, 1080), (0, 0, 1920, 1080)),
+        )
+
+    def test_monitor_geometries_fall_back_when_active_option_is_unsupported(self):
+        def runner(args, **_kwargs):
+            if "--listactivemonitors" in args:
+                return result(returncode=1)
+            return result(MIXED_MONITORS)
+
+        self.assertEqual(
+            x11.monitor_geometries(runner=runner),
+            ((0, 0, 2560, 1440), (2560, 0, 1366, 768)),
+        )
+
+    def test_monitor_geometries_fall_back_to_connected_outputs(self):
+        def runner(args, **_kwargs):
+            if args[-1].startswith("--list"):
+                return result(returncode=1)
+            return result(CONNECTED_MIXED)
+
+        self.assertEqual(
+            x11.monitor_geometries(runner=runner),
+            ((0, 0, 2560, 1440), (2560, 0, 1366, 768)),
+        )
+
+    def test_combined_root_is_not_reported_as_a_physical_monitor(self):
+        def runner(args, **_kwargs):
+            if args[-1].startswith("--list"):
+                return result(returncode=1)
+            return result(BARE_XRANDR_COMBINED)
+
+        self.assertEqual(x11.monitor_geometries(runner=runner), ())
+
     def test_listmonitors_unsupported_falls_back_to_combined_root(self):
         def runner(args, **_kwargs):
             if "--listmonitors" in args:
@@ -100,10 +161,12 @@ class XrandrCliFallbackTests(unittest.TestCase):
 
 
 class FakeMonitor:
-    def __init__(self, primary, width, height):
+    def __init__(self, primary, width, height, x=0, y=0):
         self.primary = primary
         self.width_in_pixels = width
         self.height_in_pixels = height
+        self.x = x
+        self.y = y
 
 
 class FakeMonitorsReply:
@@ -206,6 +269,16 @@ class XlibPathTests(unittest.TestCase):
             FakeMonitor(False, "2560", "1440"),
         ])
         self.assertEqual(x11._primary_via_xlib(), ("1920", "1080"))
+
+    def test_monitor_geometries_preserve_xlib_positions(self):
+        FakeDisplay.root = FakeRoot(monitors=[
+            FakeMonitor(True, "2560", "1440", 0, 0),
+            FakeMonitor(False, "1366", "768", 2560, 0),
+        ])
+        self.assertEqual(
+            x11.monitor_geometries(),
+            ((0, 0, 2560, 1440), (2560, 0, 1366, 768)),
+        )
 
     def test_empty_monitor_list_returns_none(self):
         FakeDisplay.root = FakeRoot(monitors=[])

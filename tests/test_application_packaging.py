@@ -37,7 +37,7 @@ class ApplicationPackagingPolicyTests(unittest.TestCase):
         for requirement in (
                 "cryptography==43.0.3", "cffi==2.0.0", "pycparser==3.0",
                 "customtkinter==5.2.2", "darkdetect==0.8.0",
-                "packaging==26.2"):
+                "packaging==26.2", "python-xlib==0.33"):
             self.assertIn(requirement, reqs)
         self.assertIn("--hash=sha256:", reqs)
 
@@ -49,7 +49,7 @@ class ApplicationPackagingPolicyTests(unittest.TestCase):
             encoding="utf-8")
         for requirement in (
                 "customtkinter==5.2.2", "darkdetect==0.8.0",
-                "packaging==26.2"):
+                "packaging==26.2", "python-xlib==0.33"):
             self.assertIn(requirement, reqs)
         self.assertIn("--hash=sha256:", reqs)
         self.assertNotIn('*.dist-info', script)
@@ -75,7 +75,12 @@ class ApplicationPackagingPolicyTests(unittest.TestCase):
         self.assertIn('sorted(stage.rglob("*")', script)
         self.assertEqual(
             deps.GUI_INSTALL_REQUIREMENTS,
-            ("customtkinter==5.2.2", "darkdetect==0.8.0", "packaging==26.2"),
+            (
+                "customtkinter==5.2.2",
+                "darkdetect==0.8.0",
+                "packaging==26.2",
+                "python-xlib==0.33",
+            ),
         )
 
     def test_flatpak_installs_project_license(self):
@@ -85,6 +90,35 @@ class ApplicationPackagingPolicyTests(unittest.TestCase):
             "install -Dm644 LICENSE /app/share/licenses/bedrock-on-linux/LICENSE",
             manifest,
         )
+
+    def test_flatpak_keeps_game_controller_device_access(self):
+        manifest = (
+            ROOT / "flatpak/io.github.wyze3306.BedrockOnLinux.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("- --device=all\n", manifest)
+
+    def test_release_workflow_uses_updater_compatible_version_tags(self):
+        workflow = (ROOT / ".github/workflows/build-app.yml").read_text(
+            encoding="utf-8")
+        self.assertIn('- "v[0-9]*"', workflow)
+        self.assertIn('tag="v${ver}"', workflow)
+        self.assertNotIn("app-v", workflow)
+        self.assertIn("target_commitish: ${{ github.sha }}", workflow)
+        self.assertIn(
+            '[ "$GITHUB_REF_NAME" != "v${ver}" ]',
+            workflow,
+        )
+        self.assertIn(
+            "make_latest: ${{ env.RELEASE_PRERELEASE == 'false' }}",
+            workflow,
+        )
+        for name in (
+                "build-engine.yml", "build-winegdk.yml",
+                "build-xcurl.yml", "build-vkd3d.yml"):
+            component = (ROOT / ".github/workflows" / name).read_text(
+                encoding="utf-8")
+            self.assertIn("target_commitish: ${{ github.sha }}", component)
+            self.assertIn("make_latest: false", component)
 
     def test_desktop_entries_launch_gui_and_match_window_class(self):
         for relative in (
@@ -101,6 +135,8 @@ class GuiStartupPolicyTests(unittest.TestCase):
     def test_pure_wayland_double_click_reports_xwayland_requirement(self):
         with mock.patch.dict(
                 os.environ, {"WAYLAND_DISPLAY": "wayland-0"}, clear=True), \
+                mock.patch.object(
+                    gui, "_owned_x11_socket_displays", return_value=()), \
                 mock.patch.object(gui, "_desktop_error") as error:
             gui.gui()
         error.assert_called_once()

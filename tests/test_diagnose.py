@@ -65,6 +65,47 @@ class OnlineDiagnosisTests(unittest.TestCase):
         )
         self.assertFalse(any("no WineGDK XUser" in hit for hit in hits))
 
+    def test_exact_ntquerywnf_abort_reports_missing_ntdll_patch(self):
+        hits = self._diagnose(
+            "wine: Call from 00000001 to unimplemented function "
+            "ntdll.dll.NtQueryWnfStateData, aborting\n",
+            {},
+        )
+        self.assertTrue(any("ntdll patch missing" in hit for hit in hits))
+
+    def test_healthy_patch_messages_do_not_report_missing_patches(self):
+        hits = self._diagnose(
+            "info ntdll.NtQueryWnfStateData: already returns "
+            "STATUS_NOT_IMPLEMENTED\n"
+            "info combase.RoOriginateErrorW: already patched\n",
+            {},
+        )
+        self.assertFalse(any("patch missing" in hit for hit in hits))
+
+    def test_issue_97_user32_failure_is_not_reported_as_ntdll(self):
+        hits = self._diagnose(
+            "err:module:import_dll Loading library user32.dll (which is needed "
+            "by L\"C:\\\\windows\\\\system32\\\\plugplay.exe\") failed "
+            "(error c0000020).\n"
+            "wine: Call from 00000001 to unimplemented function "
+            "user32.dll.BroadcastSystemMessageW, aborting\n"
+            "wine: Call from 00000002 to unimplemented function "
+            "shell32.dll.SHGetFolderPathW, aborting\n",
+            {},
+        )
+        hit = next(hit for hit in hits if "user32.dll" in hit)
+        self.assertIn("Install / Update", hit)
+        self.assertNotIn("use Repair", hit)
+        self.assertFalse(any("ntdll patch missing" in hit for hit in hits))
+
+    def test_exact_combase_abort_still_reports_missing_patch(self):
+        hits = self._diagnose(
+            "wine: Unimplemented function "
+            "combase.dll.RoOriginateErrorW called at address 00000001\n",
+            {},
+        )
+        self.assertTrue(any("combase patch missing" in hit for hit in hits))
+
     def test_xuser_stub_still_reports_missing_runtime(self):
         hits = self._diagnose(
             "00e0:fixme:xgameruntime:XUserAddAsync stub!\n",
@@ -99,6 +140,79 @@ class OnlineDiagnosisTests(unittest.TestCase):
                 hits = gamesetup.diagnose()
         self.assertEqual(len(hits), 1)
         self.assertIn("current compatibility engine", hits[0])
+
+    def test_initial_connection_13_reports_host_firewall_and_profile(self):
+        hits = self._diagnose(
+            "[NetherNet] InitialConnection-13\n",
+            {},
+        )
+        hit = next(hit for hit in hits if "InitialConnection-13" in hit)
+        self.assertIn("host firewall", hit)
+        self.assertIn("UDP 19132", hit)
+        self.assertIn("Private", hit)
+
+    def test_initial_connection_25_reports_stale_host_session(self):
+        hits = self._diagnose(
+            "RakNet error InitialConnection-25: world is full\n",
+            {},
+        )
+        hit = next(hit for hit in hits if "InitialConnection-25" in hit)
+        self.assertIn("stale", hit)
+        self.assertIn("NetherNet/RakNet", hit)
+        self.assertIn("Public to Private", hit)
+        self.assertIn("toggle Multiplayer Game", hit)
+        self.assertIn("requires the host owner", hit)
+        self.assertIn("fully restart both games", hit)
+        self.assertIn("Bedrock Dedicated Server", hit)
+
+    def test_explicit_version_mismatch_reports_exact_host_version(self):
+        hits = self._diagnose(
+            "Connection refused: IncompatibleVersion; "
+            "client build 47475267, host build 47475290\n",
+            {},
+        )
+        hit = next(hit for hit in hits if "version mismatch" in hit)
+        self.assertIn("exactly the host's", hit)
+
+    def test_version_number_without_mismatch_signature_is_not_flagged(self):
+        hits = self._diagnose(
+            "Minecraft version 1.21.90 initialized successfully\n",
+            {},
+        )
+        self.assertFalse(any("version mismatch" in hit for hit in hits))
+
+    def test_vulkan_13_no_adapters_offers_opengl_renderer(self):
+        hits = self._diagnose(
+            "Found device: Intel(R) HD Graphics 4600 (HSW GT2)\n"
+            "Skipping: Device does not support Vulkan 1.3\n"
+            "DXVK: No adapters found. Please check your device filter settings "
+            "and Vulkan setup.\n"
+            "A Vulkan 1.3 capable setup is required.\n"
+            "Failed to initialize DXVK.\n",
+            {},
+        )
+        hit = next(hit for hit in hits if "renderer=opengl" in hit)
+        self.assertIn("Legacy compatibility renderer", hit)
+        self.assertIn("Vulkan 1.3", hit)
+
+    def test_llvmpipe_is_not_misdiagnosed_as_old_gpu_fallback(self):
+        hits = self._diagnose(
+            "Found device: llvmpipe (LLVM 19.1.7, 256 bits)\n"
+            "Skipping: Device does not support Vulkan 1.3\n"
+            "DXVK: No adapters found.\n"
+            "Failed to initialize DXVK.\n",
+            {},
+        )
+        self.assertTrue(any("software rendering (llvmpipe)" in hit
+                            for hit in hits))
+        self.assertFalse(any("renderer=opengl" in hit for hit in hits))
+
+    def test_no_adapters_without_vulkan_13_signature_is_not_flagged(self):
+        hits = self._diagnose(
+            "DXVK: No adapters found because device filter excluded all GPUs\n",
+            {},
+        )
+        self.assertFalse(any("renderer=opengl" in hit for hit in hits))
 
 
 if __name__ == "__main__":

@@ -33,16 +33,23 @@ machine.
   scans or rewrites the running Minecraft process. Packaging rejects remnants
   of the former process-memory implementation. Static, fingerprinted game and
   Proton compatibility fixups are still applied before launch.
-- **Working native file chooser:** the WinAppSDK file picker used by Minecraft
-  is implemented in Wine for both Windows architectures, including single and
-  multiple selection. In-game world and skin selection opens the desktop file
-  dialog instead of terminating the game.
+- **Native file chooser:** the pinned engine implements the WinAppSDK picker
+  for both Windows architectures, and every stopped-prefix preparation repairs
+  its activation registration. Minecraft's in-game world import and custom
+  skin selection therefore open the desktop file dialog instead of failing in
+  `RoGetActivationFactory`. Launcher-side `.mcskin` import remains available as
+  an additional non-interactive installation path.
 - **Graphics safety:** the launcher checks the existing display state and text
   kernel logs without opening Vulkan or OpenGL. A known unsafe session is
-  blocked before Wine starts.
+  blocked before Wine starts. The GUI offers an acknowledgement only for a
+  verified previous-boot incident; it cannot dismiss a current driver fault or
+  a running Wine/UMU session.
 - **Verified updates:** engine archives, critical runtime files and dependency
   payloads are SHA-256 pinned. A rejected update does not replace a working
   engine.
+- **Isolated account profiles:** one Linux user can create separate Xbox
+  account, Wine-prefix, settings and world roots while sharing the large game,
+  engine and runtime downloads.
 
 The Microsoft sign-in flow runs locally between the launcher, Microsoft and
 Xbox services. BedrockOnLinux does not use an account relay or multiplayer
@@ -64,8 +71,8 @@ All currently supported builds target x86-64 Linux.
 ### AppImage quick start
 
 ```bash
-chmod +x BedrockOnLinux-2.0.0-x86_64.AppImage
-./BedrockOnLinux-2.0.0-x86_64.AppImage
+chmod +x BedrockOnLinux-2.1.1-x86_64.AppImage
+./BedrockOnLinux-2.1.1-x86_64.AppImage
 ```
 
 The first **PLAY** needs the matching engine archive:
@@ -88,7 +95,7 @@ The fix is therefore distributed to existing users as well as fresh installs.
 If FUSE is unavailable, AppImage can extract itself at runtime:
 
 ```bash
-APPIMAGE_EXTRACT_AND_RUN=1 ./BedrockOnLinux-2.0.0-x86_64.AppImage
+APPIMAGE_EXTRACT_AND_RUN=1 ./BedrockOnLinux-2.1.1-x86_64.AppImage
 ```
 
 The AppImage bundles Python, Tk, the GUI toolkit, `cryptography` and CA
@@ -100,21 +107,55 @@ and sign-in dependencies on first use.
 Flatpak is built separately when a builder is available. See
 [`flatpak/README.md`](flatpak/README.md) for local build and permission details;
 the presence of a manifest does not imply that a particular release is already
-published on Flathub.
+published on Flathub. Flatpak data is kept in the application-private XDG
+folder:
+
+```text
+~/.var/app/io.github.wyze3306.BedrockOnLinux/data/bedrock-on-linux/
+```
+
+All new writes stay in that private directory. For one upgrade cycle the
+manifest retains read-only access to the exact legacy
+`~/.local/share/bedrock-on-linux` folder, so the launcher can copy it
+atomically before any command creates the new root. The explicit home-relative
+path is required: Flatpak maps the special `xdg-data` alias onto the private
+XDG destination, which would make the destination read-only. The copy
+re-anchors the selected game path and internal `content` link; the host copy
+remains as a recovery backup. Two populated trees are never merged
+automatically.
+
+If a local Flatpak permission override removed that transition access, close
+the app and temporarily restore only the read-only legacy path:
+
+```bash
+flatpak kill io.github.wyze3306.BedrockOnLinux
+flatpak override --user \
+  --filesystem='~/.local/share/bedrock-on-linux:ro' \
+  io.github.wyze3306.BedrockOnLinux
+flatpak run io.github.wyze3306.BedrockOnLinux
+```
+
+Confirm the account, worlds and selected version in the private folder before
+removing the local override. Never merge two non-empty data roots blindly.
 
 ## Requirements and limitations
 
 - An **x86-64 glibc desktop**. The AppImage and managed engine are audited
   against a glibc 2.31 baseline. ARM and musl-only systems such as stock Alpine
-  are not supported.
+  are not supported. A host i386 userspace is not required; the managed engine
+  uses Wine's pure-WoW64 path.
 - **X11 or XWayland for the launcher GUI.** The game normally uses X11/XWayland.
   Native Wine Wayland can be tried with `BOL_INPUT=wayland`, but remains an
   experimental game backend; it does not remove the launcher’s XWayland
   requirement.
-- A working **Vulkan 1.3** driver exposing
+- For the normal renderer, a working **Vulkan 1.3** driver exposing
   `VK_EXT_device_generated_commands`, or the older NVIDIA
   `VK_NV_device_generated_commands`. The managed vkd3d-proton 3.0.1 payload
   contains both implementations and chooses inside the game process.
+- GPUs permanently limited to Vulkan 1.2 can try **Settings ▸ Advanced ▸
+  Legacy compatibility renderer**. This selects WineD3D, which bypasses
+  DXVK’s Vulkan 1.3 gate. It is not a promise that every
+  D3D12 path becomes OpenGL-only, and performance/rendering are not guaranteed.
 - Enough free storage for the game, compressed engine and temporary
   extraction. A `No space left on device` error is non-destructive: free space
   and retry **PLAY**.
@@ -141,17 +182,75 @@ the managed engine and its online/TLS compatibility payload. Later runs reuse
 them. Account credentials are stored in the private BedrockOnLinux data
 directory and seeded into the stopped Wine prefix before launch.
 
+To refresh a same-tag archive replacement instead of reusing the local cache,
+run `bedrock-on-linux setup --mc <version> --force`. This still cannot retrieve
+an internal build the community archive has not published.
+
+### Multiple local Xbox profiles
+
+Create one isolated launcher root and desktop shortcut per player:
+
+```bash
+bedrock-on-linux profiles create "Alice"
+bedrock-on-linux profiles create "Bob"
+bedrock-on-linux profiles list
+```
+
+Each shortcut sets its own `BOL_HOME`, so the Microsoft account, Wine prefix,
+pre-auth cache, settings and worlds stay separate. Game packages, Proton, UMU
+and download caches are shared to avoid duplicate multi-gigabyte downloads.
+Add the matching shortcut to each Steam user as a separate non-Steam game.
+When created from an AppImage, the shortcut records the persistent AppImage
+file rather than its temporary mounted executable. Because PLAY can repair a
+shared runtime before starting, only one profile can run Minecraft at a time;
+setup/update is also refused while that session owns the shared-assets lock.
+
+Create profiles after choosing the final **Game files location**. Relocation is
+refused while profiles exist because moving their shared base would break the
+links. Host-visible desktop/Steam shortcuts cannot be installed from inside
+the Flatpak sandbox; use the AppImage, `.deb` or native package for this
+workflow.
+
+### Achievements
+
+The launcher prepares a dedicated user-only XSTS token for Minecraft's original
+Windows Achievements request. XUser selects it only for the Achievements
+service, preserving the packaged Windows title, SCID and platform while leaving
+social, Marketplace, PlayFab, multiplayer and Realms authentication unchanged.
+This loads the existing list; it does not unlock, emulate or force
+achievements. Minecraft/Xbox policy, the world configuration, cheats, Creative
+mode and some add-ons can disable or affect achievement eligibility.
+
 Minecraft’s **Import World** and skin-selection actions use the WineGDK native
 file picker. For direct launcher-side content installation while Minecraft is
 closed, use:
 
 ```bash
-bedrock-on-linux import world.mcworld addon.mcaddon pack.mcpack template.mctemplate
+bedrock-on-linux import world.mcworld addon.mcaddon pack.mcpack \
+  template.mctemplate skin.mcskin
 ```
 
-The launcher imports `.mcworld`, `.mcaddon`, `.mcpack` and `.mctemplate`
-archives into the appropriate `com.mojang` directory. It does not overwrite an
-existing item with the same folder name.
+The launcher imports `.mcworld`, `.mcaddon`, `.mcpack`, `.mctemplate` and
+`.mcskin` archives into the appropriate `com.mojang` directory. This is useful
+for direct or scripted installation; it is not a replacement for Minecraft's
+in-game custom-skin picker. Existing items are not overwritten; an available
+folder name is selected.
+
+### Compatible external client DLLs
+
+While Minecraft is at its main menu, **Settings ▸ Tools ▸ Inject a client
+DLL…** can load a compatible 64-bit Windows client DLL through the same Wine
+prefix as the game. The client release must target the exact Minecraft line:
+a repository’s “latest” DLL may still target an older game build. After
+`LoadLibrary` succeeds, the launcher watches briefly for an immediate game exit
+or a new Wine crash debugger and reports that as a failed injection instead of
+a false success.
+
+BedrockOnLinux does not ship or endorse client DLLs. Their Wine compatibility,
+dependencies, safety, update compatibility and compliance with server rules
+remain the user’s responsibility. The injector is supported by the native,
+AppImage and `.deb` layouts, not by the Flatpak sandbox; a successful injection
+cannot be promised for a specific third-party client.
 
 ## GPU safety
 
@@ -174,17 +273,25 @@ failure and therefore still require the explicit one-time acknowledgement
 below.
 
 If the desktop freezes or the machine requires a forced power-off, do not
-blindly retry. Repair or reinstall the host GPU driver, reboot, then run:
+blindly retry. Inspect why the session stopped and reboot. If the kernel log
+contains a fatal GPU event, repair or update the host graphics driver first; a
+marker alone does not prove a driver fault. When the launcher can prove that
+the remaining incident belongs to the previous boot, **Settings ▸ Tools**
+displays **Acknowledge previous GPU incident…** with a confirmation step. The
+equivalent CLI flow is:
 
 ```bash
 bedrock-on-linux doctor
 bedrock-on-linux doctor --acknowledge-gpu-crash
 ```
 
-Acknowledgement clears only an old interrupted-session block. A current
-kernel fault or unsafe display state remains blocked. The advanced override
-below is intended only for a confirmed false positive and can re-expose a
-kernel hard lock:
+Acknowledgement is revalidated while the launch lock is held and clears only
+an old interrupted-session block or records a previous-boot driver incident.
+It is refused when there is no eligible incident, Wine/UMU is still running,
+the marker belongs to the current boot, its origin is unreadable, or the
+current kernel journal contains a GPU fault. A current unsafe display state
+remains blocked. The advanced override below is intended only for a confirmed
+false positive and can re-expose a kernel hard lock:
 
 ```bash
 BOL_ALLOW_UNSAFE_GPU=1 bedrock-on-linux play
@@ -195,28 +302,56 @@ BOL_ALLOW_UNSAFE_GPU=1 bedrock-on-linux play
 Open **Settings ▸ Open logs folder**, or inspect:
 
 ```text
-~/.local/share/bedrock-on-linux/logs/
+$XDG_DATA_HOME/bedrock-on-linux/logs/
 ```
+
+`XDG_DATA_HOME` defaults to `~/.local/share`; `BOL_HOME` or a location selected
+in Settings replaces that root. Flatpak uses the private path shown in the
+installation section. If a native XDG-root change triggers the one-time copy,
+the previous data and UMU trees are retained as recovery backups; remove them
+manually only after verifying the new location.
 
 The GUI’s **Details** panel contains the live launcher log. Useful commands:
 
 ```bash
 bedrock-on-linux doctor                 # host dependencies and GPU safety
+bedrock-on-linux doctor --network       # DNS/TLS, clock and VPN observations
+bedrock-on-linux doctor --host 192.0.2.10 # plus route to one literal LAN IP
 bedrock-on-linux repair                 # rebuild the managed Wine prefix
 bedrock-on-linux versions               # available stable versions
 bedrock-on-linux versions --beta        # include beta versions
 bedrock-on-linux setup --mc <version>   # download and prepare one version
+bedrock-on-linux profiles list          # isolated local Xbox profiles
 bedrock-on-linux login                  # link a Microsoft account
 bedrock-on-linux play                   # launch the selected version
 bedrock-on-linux update                 # check for a launcher update
 ```
 
+Network diagnostics are read-only. They resolve and establish
+certificate-verified TLS connections to the Xbox, PlayFab and Minecraft
+endpoints, report NTP/RTC and commonly named VPN or container-bridge
+interfaces, and optionally show the kernel route to a validated literal host
+IP. A route does not prove that the host accepts RakNet UDP 19132, so the
+doctor deliberately does not claim that an unanswered UDP probe is an
+open-port test. Logs additionally recognise `InitialConnection-13`,
+`InitialConnection-25` and explicit client/host version-mismatch signatures
+and provide host-side guidance.
+
+A Friends-world “full” response can originate from the remote player-host
+session. Once the client and host use the same internal build, the Windows host
+owner should change the active network profile from **Public** to **Private**,
+toggle **Multiplayer Game** off and back on for the world, then fully restart
+both games. A guest without access to that remote host cannot apply the fix;
+use a correctly configured Bedrock Dedicated Server when host ownership is not
+available. BedrockOnLinux cannot change a remote host or repair a
+Minecraft/Xbox service regression.
+
 `repair` resets compatibility state, not the host graphics driver. Back up any
-important game data before manual changes under
-`~/.local/share/bedrock-on-linux`. When reporting a bug, include the launcher
-version, engine revision, Minecraft version, distribution, GPU/driver and the
-relevant log files; never publish account tokens or the private authentication
-directory.
+important game data before manual changes under the active data directory
+(`$XDG_DATA_HOME/bedrock-on-linux` by default). When reporting a bug, include
+the launcher version, engine revision, Minecraft version, distribution,
+GPU/driver and the relevant log files; never publish account tokens or the
+private authentication directory.
 
 ## Engine integrity and source provenance
 
@@ -285,8 +420,8 @@ candidate before publication.
 
 ## Legal and license
 
-BedrockOnLinux ships **no Minecraft game files**. By default, game packages
-are obtained from the community-maintained
+BedrockOnLinux ships **no Minecraft game files**. Game packages are obtained
+from the community-maintained
 [`bubbles-wow/mcbe-gdk-unpack-archive`](https://github.com/bubbles-wow/mcbe-gdk-unpack-archive),
 or from a local source selected by the user. You must own Minecraft and comply
 with the terms that apply to it.

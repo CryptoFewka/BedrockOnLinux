@@ -14,7 +14,10 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from .config import WINEGDK_SOURCE_COMMIT
+from .config import (
+    WINEGDK_SOURCE_COMMIT,
+    WINEGDK_SOURCE_MANIFEST_SHA256,
+)
 from .engine_lock import managed_engine_lock
 from .log import BolError
 
@@ -35,11 +38,11 @@ REQUIRED_COMPONENTS = {
     "vkd3d_nv_dgc": VKD3D_NV_DGC_COMPONENT_VERSION,
 }
 
-# native5 keeps the reviewed r11/r12 universal graphics payload. Hashing
+# native5 through native12 keep the reviewed r11/r12 universal graphics payload. Hashing
 # whatever an archive declares would only prove internal consistency, so pin
 # the known DLL bytes as an independent trust anchor. Future engine revisions
 # must update the revision pin deliberately.
-REQUIRED_VARIANT_HASHES_BUILD_REV = "wow64-archs-native5"
+REQUIRED_VARIANT_HASHES_BUILD_REV = "wow64-archs-native12"
 REQUIRED_ENGINE_GLIBC_MAX = "2.31"
 REQUIRED_VKD3D_BASE_COMMIT = "3b10bd7a7ec6a7347e616cf8bea59333afec2255"
 REQUIRED_VKD3D_REVERT = "76c11d2e2b90b0a46dc894508e67e2aaacc2c04d"
@@ -48,6 +51,10 @@ REQUIRED_GDK_PROTON_BASE_RELEASE = "release10-32"
 REQUIRED_GDK_PROTON_BASE_ARCHIVE = "GDK-Proton10-32.tar.gz"
 REQUIRED_GDK_PROTON_BASE_ARCHIVE_SHA256 = (
     "1e80f4e714f877f42101d5775bd38ca0a15a38d304e24af1f15c6deec4ebac2d"
+)
+REQUIRED_WINEGDK_SOURCE_MANIFEST_PATH = (
+    "files/share/bedrock-on-linux/licenses-and-provenance/winegdk/"
+    "native5/SOURCE-SHA256SUMS"
 )
 XGAMERUNTIME_THREADING_PATH = (
     "files/lib/wine/x86_64-windows/xgameruntime.dll.threading"
@@ -73,13 +80,16 @@ REQUIRED_CRITICAL_FILE_PATHS = (
     "files/lib/x86_64-linux-gnu/libunwind.so.8",
     "files/lib/wine/x86_64-windows/ntdll.dll",
     "files/lib/wine/x86_64-windows/combase.dll",
+    "files/lib/wine/x86_64-windows/user32.dll",
     "files/lib/wine/x86_64-windows/xgameruntime.dll",
     "files/lib/wine/x86_64-windows/windows.storage.dll",
+    "files/lib/wine/x86_64-windows/windows.storage.applicationdata.dll",
     XGAMERUNTIME_THREADING_PATH,
     "files/lib/wine/i386-windows/ntdll.dll",
     "files/lib/wine/i386-windows/combase.dll",
     "files/lib/wine/i386-windows/xgameruntime.dll",
     "files/lib/wine/i386-windows/windows.storage.dll",
+    "files/lib/wine/i386-windows/windows.storage.applicationdata.dll",
     "files/lib/wine/x86_64-unix/ntdll.so",
 )
 REQUIRED_EXECUTABLE_FILE_PATHS = (
@@ -340,6 +350,13 @@ def validate_engine_manifest(
 
     winegdk_distribution = _validated_distribution_files(
         root, winegdk, "provenance.winegdk")
+    actual_source_manifest = winegdk_distribution.get(
+        REQUIRED_WINEGDK_SOURCE_MANIFEST_PATH)
+    if actual_source_manifest != WINEGDK_SOURCE_MANIFEST_SHA256:
+        raise BolError(
+            "Game engine WineGDK source-manifest mismatch: manifest has %r, "
+            "expected '%s'." %
+            (actual_source_manifest, WINEGDK_SOURCE_MANIFEST_SHA256))
     vkd3d_distribution = _validated_distribution_files(
         root, universal, "provenance.vkd3d_universal")
     gdk_proton_distribution = _validated_distribution_files(

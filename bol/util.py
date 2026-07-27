@@ -27,12 +27,31 @@ from .config import (
 )
 from .log import IS_TTY, die, warn
 
+_XDG_MIGRATION_CHECKED = False
+
+
+def _ensure_xdg_storage():
+    """Run the guarded legacy XDG migration before reading user state."""
+    global _XDG_MIGRATION_CHECKED
+    if _XDG_MIGRATION_CHECKED:
+        return
+    try:
+        from .xdg_migration import migrate_legacy_flatpak_data
+        migrate_legacy_flatpak_data()
+    except Exception as exc:
+        die(
+            "Could not migrate the legacy data safely. The original "
+            f"files were retained; free disk space/check permissions ({exc})."
+        )
+    _XDG_MIGRATION_CHECKED = True
+
 def run(cmd, **kw):
     kw.setdefault("check", True)
     return subprocess.run(cmd, **kw)
 
 
 def mkdirs():
+    _ensure_xdg_storage()
     for d in (DATA, PROTON_DIR, UMU_DIR, CACHE, LOGS, GAMES):
         d.mkdir(parents=True, exist_ok=True)
     try:
@@ -42,6 +61,7 @@ def mkdirs():
 
 
 def load_settings():
+    _ensure_xdg_storage()
     s = {}
     if SETTINGS.exists():
         try:
@@ -54,6 +74,7 @@ def load_settings():
 
 
 def save_settings(s):
+    _ensure_xdg_storage()
     DATA.mkdir(parents=True, exist_ok=True)
     try:
         os.chmod(DATA, 0o700)
@@ -105,8 +126,7 @@ def apply_custom_env(env, custom_env):
 
 
 def http_json(url, timeout=10):
-    # Public read-only endpoints (GitHub releases, Minecraft feedback); no
-    # credentials, so an ambient token can't leak to a non-GitHub host.
+    # Never forward ambient credentials to these public endpoints.
     headers = {"User-Agent": APP, "Accept": "application/vnd.github+json"}
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -131,10 +151,7 @@ def http_post_form(url, fields):
             raise
 
 
-# Network reads can stall mid-transfer (slow CDN, flaky Wi-Fi, captive proxy);
-# a single failed read used to abort the whole setup with "read operation timed
-# out". Retry transient failures and RESUME via HTTP Range so a large engine or
-# DLL-set download survives a drop instead of restarting from zero.
+# Retry and resume large downloads after transient network failures.
 _RETRYABLE = (urllib.error.URLError, TimeoutError, socket.timeout,
               ConnectionError, http.client.IncompleteRead,
               http.client.HTTPException)
@@ -149,13 +166,13 @@ def download(url, dest: Path, label=None, progress=None, attempts=5):
         have = tmp.stat().st_size if tmp.exists() else 0
         headers = {"User-Agent": APP}
         if have:
-            headers["Range"] = f"bytes={have}-"      # resume where we stopped
+            headers["Range"] = f"bytes={have}-"
         req = urllib.request.Request(url, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=60) as r:
                 resuming = have > 0 and getattr(r, "status", 200) == 206
                 if have and not resuming:
-                    have = 0                          # server ignored Range
+                    have = 0
                 if resuming:
                     cr = r.headers.get("Content-Range", "")
                     total = int(cr.rsplit("/", 1)[-1]) if "/" in cr else 0
@@ -175,20 +192,20 @@ def download(url, dest: Path, label=None, progress=None, attempts=5):
                             last = got
                             print(f"\r:: {label}: {got*100//total:3d}% "
                                   f"({got>>20}/{total>>20} MiB)", end="", flush=True)
-                if total and got < total:             # short read → resume
+                if total and got < total:
                     raise http.client.IncompleteRead(b"", total - got)
             if IS_TTY:
                 print()
             tmp.replace(dest)
             return dest
         except urllib.error.HTTPError as e:
-            if e.code == 416 and tmp.exists():        # stale/complete .part
+            if e.code == 416 and tmp.exists():
                 tmp.unlink(missing_ok=True)
                 last_err = e
-            elif e.code < 500:                        # 4xx won't fix itself
+            elif e.code < 500:
                 die(f"Download failed: {url}\n{e}")
             else:
-                last_err = e                          # 5xx → retry
+                last_err = e
         except _RETRYABLE as e:
             last_err = e
         if attempt < attempts:
