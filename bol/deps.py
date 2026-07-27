@@ -96,6 +96,9 @@ GUI_DEPS = {
     "darkdetect": "darkdetect==0.8.0",
     "packaging": "packaging==26.2",
     "Xlib": "python-xlib==0.33",
+    # python-xlib pulls six transitively; pin it here too so the bare-host pip
+    # fallback matches the hash-pinned closures instead of resolving it freely.
+    "six": "six==1.17.0",
 }
 GUI_INSTALL_REQUIREMENTS = tuple(GUI_DEPS.values())
 

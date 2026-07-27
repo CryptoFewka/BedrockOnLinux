@@ -80,6 +80,7 @@ class ApplicationPackagingPolicyTests(unittest.TestCase):
                 "darkdetect==0.8.0",
                 "packaging==26.2",
                 "python-xlib==0.33",
+                "six==1.17.0",
             ),
         )
 

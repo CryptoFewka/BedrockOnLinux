@@ -39,7 +39,10 @@ else:
             _custom_home = _pointer.read_text(encoding="utf-8").strip()
         except OSError:
             continue
-        if _custom_home:
+        # Only honor an absolute path: a relative pointer would resolve DATA
+        # (and the managed engine tree executed from it) against the current
+        # working directory.
+        if _custom_home and os.path.isabs(_custom_home):
             _data_path = _custom_home
             break
 
