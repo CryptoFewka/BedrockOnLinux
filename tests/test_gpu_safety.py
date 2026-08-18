@@ -51,6 +51,10 @@ class GraphicsSafetyTests(unittest.TestCase):
                 {"DISPLAY": ":0", "XDG_SESSION_TYPE": "x11"},
                 xrandr_runner=xrandr,
                 journal_runner=self.clean_journal,
+                # Never let the zero-provider assertion depend on the
+                # caller's real X display: without this the live
+                # GAMESCOPE_* root-atom probe runs and can suppress it.
+                atom_probe=lambda _env: False,
             )
         self.assertIn("zero RandR GPU providers", problem)
 
@@ -94,6 +98,10 @@ class GraphicsSafetyTests(unittest.TestCase):
                 {"DISPLAY": ":0", "XDG_SESSION_TYPE": "x11"},
                 xrandr_runner=xrandr,
                 journal_runner=self.clean_journal,
+                # Never let the zero-provider assertion depend on the
+                # caller's real X display: without this the live
+                # GAMESCOPE_* root-atom probe runs and can suppress it.
+                atom_probe=lambda _env: False,
             )
         self.assertIn("zero RandR GPU providers", problem)
         self.assertIn("mesa-diverted", problem)
@@ -545,6 +553,10 @@ class GraphicsSafetyTests(unittest.TestCase):
                 {"DISPLAY": ":0", "XDG_SESSION_TYPE": "x11"},
                 xrandr_runner=xrandr,
                 journal_runner=self.clean_journal,
+                # Never let the zero-provider assertion depend on the
+                # caller's real X display: without this the live
+                # GAMESCOPE_* root-atom probe runs and can suppress it.
+                atom_probe=lambda _env: False,
             )
         self.assertIn("zero RandR GPU providers", problem)
 
