@@ -40,9 +40,9 @@ from .doctor import acknowledge_gpu_crash, gpu_crash_acknowledgement_status
 from .games import list_mc_versions
 from .gamesetup import do_setup
 from .inject import run_injector
-from .launch import launch
+from .launch import direct_launch_readiness, launch, single_window_session
 from . import log
-from .log import BolError, _LEVELS, warn
+from .log import BolError, _LEVELS, desktop_notify, warn
 from .prefix import (
     _mc_running,
     kill_wine,
@@ -51,8 +51,11 @@ from .prefix import (
 )
 from .profiles import (
     create_profile,
+    play_launch_command,
     profile_launch_command,
     require_profile_shortcuts_supported,
+    require_shortcuts_supported,
+    write_play_shortcut,
     write_profile_shortcut,
 )
 from .update import check_for_update, self_update
@@ -67,15 +70,7 @@ _DIALOG_MAX_PHYSICAL_SIZE = (760, 640)
 
 def _desktop_error(message):
     warn(message)
-    notifier = shutil.which("notify-send")
-    if notifier:
-        try:
-            subprocess.run(
-                [notifier, "--app-name", PRETTY, PRETTY, message],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=5, check=False)
-        except (OSError, subprocess.SubprocessError):
-            pass
+    desktop_notify(message)
 
 
 _X11_SOCKET_NAME = re.compile(r"^X([0-9]+)$")
@@ -329,6 +324,22 @@ def _bind_x11_mousewheel_recursive(widget, target_canvas):
             _bind(child)
 
     _bind(widget)
+
+
+def _enable_scrollable_frame_wheel(scrollable_frame, container=None):
+    """Give one CustomTkinter scrollable area a working X11 wheel.
+
+    CustomTkinter removes its own wheel bindings as soon as the pointer enters
+    a child widget, so any list built from controls — the Settings tabs, the
+    version picker — only scrolled by dragging its scrollbar. Forward the
+    events from every descendant of ``container`` to the frame's canvas.
+    """
+    canvas = getattr(scrollable_frame, "_parent_canvas", None)
+    if canvas is None:
+        return False
+    _bind_x11_mousewheel_recursive(
+        scrollable_frame if container is None else container, canvas)
+    return True
 
 
 class _ThemedMessageBox:
@@ -789,7 +800,11 @@ def gui():
     na = NativeAuth()
     ui = {"versions": [], "labels": [], "busy": False, "details": False,
           "launch_active": False, "changelog_active": False,
-          "changelogs_loaded": False, "changelog_head": None, "settings_head": None}
+          "changelogs_loaded": False, "changelog_head": None,
+          "settings_head": None,
+          # Probed once: it opens the X display to read Gamescope's own root
+          # properties, and the answer cannot change while the window lives.
+          "single_window": single_window_session(), "stepped_aside": False}
     tab_game = None
     tab_launcher = None
 
@@ -1192,6 +1207,9 @@ def gui():
         search.bind("<Escape>", lambda _event: close_picker())
         
         rebuild()
+        # Bind after every row exists so the wheel scrolls the list from
+        # anywhere in the popup, including over a version button.
+        _enable_scrollable_frame_wheel(sf, win)
         win.bind("<Escape>", lambda _event: close_picker())
         
     def global_click(event):
@@ -1378,6 +1396,10 @@ def gui():
         if "minecraft is running" in low:
             return ("Minecraft is running — close the game to come back here.",
                     True)
+        # Keep the launch visibly on track: an unusable Xbox Live session no
+        # longer stops it, so say what the game is starting as.
+        if "offline mode" in low:
+            return "Starting Minecraft in offline mode…"
         if "starting minecraft" in low or "launching minecraft" in low:
             return "Starting Minecraft…"
         if "game closed" in low:
@@ -1452,8 +1474,10 @@ def gui():
             if getattr(acct_btn, "_confirm_out", False):
                 na.stop()
                 try:
-                    with prefix_operation_lock("sign out of Microsoft"):
-                        msa_logout()
+                    # msa_logout() takes the prefix lock itself; wrapping the
+                    # call here would nest two flock() acquisitions on the same
+                    # file from separate descriptors and always be refused.
+                    msa_logout()
                 except BolError as exc:
                     warn(str(exc))
                     acct_state("in" if msa_signed_in() else "out")
@@ -1576,10 +1600,10 @@ def gui():
                         if qr.get_module(x, y):
                             pixels[x + border, y + border] = 0
                 img = img.resize((150, 150), Image.Resampling.NEAREST).convert("RGB")
-                ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(150, 150))
                 def _apply_qr():
                     if not qr_frame.winfo_exists():
                         return
+                    ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(150, 150))
                     qr_lbl._is_loaded = True
                     qr_lbl.destroy()
                     ctk.CTkLabel(qr_frame, text="", image=ctk_img).pack(expand=True, fill="both")
@@ -1677,6 +1701,44 @@ def gui():
                     cur_ver = mc_var.get().split('  ')[0].strip() if mc_var.get() else "Game"
                     play_btn._tooltip.text = f"Play {cur_ver}"
 
+    def step_aside_for_game():
+        """Unmap the launcher window once the game process exists.
+
+        Gamescope — Steam Game Mode — presents one application window at a
+        time, so a mapped launcher window keeps the game's own off screen: the
+        game is audible but never appears (#130). Stepping aside for as long
+        as the game runs is what makes the launcher usable there; skipping the
+        launcher is not. A desktop session shows both windows, so nothing
+        moves.
+
+        Called from the launch thread, so the window work is handed to Tk.
+        """
+        if not ui.get("single_window") or ui.get("stepped_aside"):
+            return
+        ui["stepped_aside"] = True
+
+        def hide():
+            try:
+                root.withdraw()
+            except Exception:
+                pass
+        root.after(0, hide)
+
+    def come_back_from_game():
+        """Map the launcher window again, whether the game ran or failed."""
+        if not ui.get("stepped_aside"):
+            return
+        ui["stepped_aside"] = False
+
+        def show():
+            try:
+                root.deiconify()
+                root.lift()
+                root.focus_force()
+            except Exception:
+                pass
+        root.after(0, show)
+
     def do_play():
         if ui["busy"]:
             return
@@ -1690,7 +1752,12 @@ def gui():
                 do_setup(mc_ver=ver, progress=set_progress)
                 set_status("Starting Minecraft…", T.FG)
                 ui["launch_active"] = True
-                launch()
+                try:
+                    launch(on_started=step_aside_for_game)
+                finally:
+                    # Before the failure dialog below: it is a child of a
+                    # window that has to be on screen to carry it.
+                    come_back_from_game()
                 set_status("Minecraft closed.", T.SUB)
             except Exception as e:
                 message = str(e) or type(e).__name__
@@ -1717,6 +1784,9 @@ def gui():
                 root.after(0, lambda text=message: messagebox.showerror(
                     "Minecraft could not start", text[:2000], parent=root))
             finally:
+                # A launcher left unmapped would be unreachable, so restore it
+                # here too, on any path the inner handler could have missed.
+                come_back_from_game()
                 ui["launch_active"] = False
                 end_progress()
                 root.after(0, lambda: busy(False))
@@ -1906,7 +1976,8 @@ def gui():
         ctk.CTkSwitch(
             tab_advanced,
             text="Legacy compatibility renderer\n"
-                 "(bypasses DXVK on Vulkan 1.2 GPUs such as Intel Haswell)",
+                 "(last resort for GPUs without Vulkan 1.3: swaps D3D9–D3D12\n"
+                 "to WineD3D, dropping DXVK and vkd3d — artifacts likely)",
             variable=legacy_renderer_v, command=save_renderer,
             progress_color=T.THEME_ACCENT, font=font(13),
         ).pack(anchor="w", pady=(0, 12), padx=4)
@@ -2371,10 +2442,35 @@ def gui():
                 parent=d,
             )
 
+        def do_play_shortcut():
+            try:
+                require_shortcuts_supported()
+                shortcut = write_play_shortcut()
+                command = play_launch_command()
+                pending = direct_launch_readiness()
+            except Exception as exc:
+                messagebox.showerror(
+                    "Direct launch shortcut", str(exc), parent=d)
+                return
+            message = (
+                f"Created:\n{shortcut}\n\n"
+                "It starts Minecraft straight away, with no launcher window. "
+                "Add it to Steam with 'Add a Non-Steam Game' to play it from "
+                "the library, including Steam Deck Game Mode.\n\n"
+                f"Direct command:\n{command}"
+            )
+            if pending:
+                message += ("\n\nStill to do in the launcher:\n• "
+                            + "\n• ".join(pending))
+            messagebox.showinfo(
+                "Direct launch shortcut", message, parent=d)
+
         tool_actions = [
             ("Import content (.mcpack / .mcworld / .mcaddon / .mcskin)…",
              do_import, "ghost"),
             ("Inject a client DLL…", do_inject, "ghost"),
+            ("Create direct launch shortcut (skips this window)…",
+             do_play_shortcut, "ghost"),
             ("Create isolated Xbox account shortcut…",
              do_create_profile, "ghost"),
             ("Open Minecraft folder", lambda: subprocess.Popen(
@@ -2442,7 +2538,7 @@ def gui():
                      font=font(11)).pack(anchor="w", pady=(6, 0), padx=4)
 
         for _sf in (tab_general, tab_advanced, tab_tools):
-            _bind_x11_mousewheel_recursive(_sf, _sf._parent_canvas)
+            _enable_scrollable_frame_wheel(_sf)
 
     _build_settings()
 
@@ -2928,40 +3024,16 @@ def gui():
         mkbtn(ui["changelog_head"], "← Back", toggle_changelog, kind="flat", width=76,
               height=28, font=font(12)).pack(side="right")
 
-        ui["last_tab"] = "Game"
-        def on_tab_change():
-            ui["last_tab"] = tabs.get()
-
         tabs = ctk.CTkTabview(
             outer, fg_color=T.CARD_2,
             segmented_button_fg_color=T.CARD_2,
             segmented_button_selected_color=T.THEME_ACCENT,
             segmented_button_selected_hover_color=T.THEME_HOV,
             segmented_button_unselected_color=T.CARD_2,
-            text_color=T.FG, corner_radius=12, command=on_tab_change)
+            text_color=T.FG, corner_radius=12)
         tabs.pack(fill="both", expand=True)
         tab_game = tabs.add("Game")
         tab_launcher = tabs.add("Launcher")
-        
-        def _force_refresh(tab_name):
-            if ui.get("last_tab") != tab_name:
-                return
-            from .util import mc_releases, gh_releases
-            from .config import SELF_REPO
-            if tab_name == "Game":
-                load_tab_changelog(tab_game, lambda: mc_releases(fetch_all=False, ignore_cache=True), render_game_changelog)
-            elif tab_name == "Launcher":
-                load_tab_changelog(tab_launcher, lambda: gh_releases(SELF_REPO, ignore_cache=True), render_launcher_changelog)
-                
-        try:
-            for btn in tabs._segmented_button._buttons_dict.values():
-                btn.bind(
-                    "<Button-1>",
-                    lambda _event, b=btn: _force_refresh(b.cget("text")),
-                    add="+",
-                )
-        except Exception:
-            pass
 
     _build_changelog_view()
 

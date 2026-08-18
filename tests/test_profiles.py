@@ -17,9 +17,12 @@ from bol.profiles import (
     create_profile,
     launcher_executable,
     list_profiles,
+    play_launch_command,
     profile_launch_command,
     profile_slug,
     require_profile_shortcuts_supported,
+    require_shortcuts_supported,
+    write_play_shortcut,
     write_profile_shortcut,
 )
 
@@ -247,3 +250,86 @@ def test_flatpak_profile_shortcut_is_rejected_before_private_desktop_write(
             {"FLATPAK_ID": "io.github.wyze3306.BedrockOnLinux"},
             tmp_path / "not-flatpak-info",
         )
+
+
+def test_play_shortcut_launches_the_game_without_the_launcher_window(
+        tmp_path):
+    apps = tmp_path / "desktop entries"
+    launcher = tmp_path / "Bedrock Launcher"
+    launcher.write_text("#!/bin/sh\n")
+
+    entry = write_play_shortcut(
+        applications_dir=apps, executable=launcher,
+    )
+
+    text = entry.read_text()
+    assert entry.name == "bedrock-on-linux-play.desktop"
+    assert "Name=Minecraft Bedrock\n" in text
+    assert f'Exec="{launcher.resolve()}" play\n' in text
+    # The default installation is not profile-scoped.
+    assert "BOL_HOME" not in text
+    assert "Terminal=false" in text
+    assert entry.stat().st_mode & 0o777 == 0o644
+
+
+def test_play_shortcut_for_a_profile_keeps_its_isolated_home(tmp_path):
+    base = tmp_path / "shared data"
+    profile = create_profile("Family Two", base)
+    apps = tmp_path / "desktop entries"
+    launcher = tmp_path / "Bedrock Launcher"
+    launcher.write_text("#!/bin/sh\n")
+
+    entry = write_play_shortcut(
+        profile_name="Family Two", profile_dir=profile,
+        applications_dir=apps, executable=launcher,
+    )
+
+    text = entry.read_text()
+    assert entry.name == "bedrock-on-linux-play-family-two.desktop"
+    assert "Name=Minecraft Bedrock — Family Two\n" in text
+    assert f'Exec=env BOL_HOME="{profile}" "{launcher.resolve()}" play\n' \
+        in text
+
+
+def test_play_shortcut_does_not_collide_with_the_launcher_shortcut(tmp_path):
+    base = tmp_path / "shared data"
+    profile = create_profile("Family Two", base)
+    apps = tmp_path / "desktop entries"
+    launcher = tmp_path / "launcher"
+    launcher.write_text("#!/bin/sh\n")
+
+    windowed = write_profile_shortcut(
+        "Family Two", profile_dir=profile, applications_dir=apps,
+        executable=launcher,
+    )
+    direct = write_play_shortcut(
+        profile_name="Family Two", profile_dir=profile,
+        applications_dir=apps, executable=launcher,
+    )
+
+    assert windowed != direct
+    assert windowed.read_text().endswith("Categories=Game;\n")
+    assert " gui\n" in windowed.read_text()
+    assert " play\n" in direct.read_text()
+
+
+def test_play_launch_command_is_copyable_for_steam(tmp_path):
+    launcher = tmp_path / "launcher with spaces"
+
+    assert play_launch_command(executable=launcher).endswith("' play")
+    assert play_launch_command(
+        tmp_path / "profile with spaces", launcher).startswith("BOL_HOME='")
+
+
+def test_flatpak_play_shortcut_is_refused_with_a_runnable_alternative(
+        tmp_path):
+    with pytest.raises(BolError) as refusal:
+        require_shortcuts_supported(
+            {"FLATPAK_ID": "io.github.wyze3306.BedrockOnLinux"},
+            tmp_path / "not-flatpak-info",
+        )
+
+    message = str(refusal.value)
+    assert "cannot be written from the Flatpak sandbox" in message
+    # A refusal with no way forward is what sends users to the issue tracker.
+    assert "flatpak run io.github.wyze3306.BedrockOnLinux play" in message

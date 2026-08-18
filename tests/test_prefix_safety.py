@@ -1,6 +1,7 @@
 """Regression tests for prefix shutdown and operation serialization."""
 # SPDX-License-Identifier: MIT
 
+import ast
 import os
 import tempfile
 import subprocess
@@ -11,7 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from bol import fixups, gameinput, gamesetup, prefix
+from bol import auth, fixups, gameinput, gamesetup, prefix
 from bol.log import BolError
 
 
@@ -207,6 +208,166 @@ class PrefixShutdownTests(unittest.TestCase):
 
         self.assertIn(mock.call(10, 15), kill.call_args_list)
         self.assertIn(mock.call(10, 9), kill.call_args_list)
+
+    def _rng_abort_writer(self, attempts, finish_on=None, pfx=None):
+        """Fake wineboot which reproduces the unresolved-RtlGenRandom abort."""
+
+        def fake_run(_cmd, **kwargs):
+            attempts.append(dict(kwargs.get("env") or {}))
+            log = kwargs["stdout"]
+            index = len(attempts)
+            if finish_on is not None and index >= finish_on:
+                log.write("wineboot: prefix updated\n")
+                _make_ready_prefix(pfx)
+                return SimpleNamespace(returncode=0)
+            log.write(
+                "wine: Call from 00006FFFFFC59E08 to unimplemented function "
+                "advapi32.dll.SystemFunction036, aborting\n"
+                "err:module:find_forwarded_export module not found for "
+                "forward 'cryptbase.SystemFunction036' used by "
+                'L"C:\\\\windows\\\\system32\\\\advapi32.dll"\n'
+                "err:winediag:nodrv_CreateWindow Application tried to create "
+                "a window, but no driver could be loaded.\n"
+            )
+            raise prefix.subprocess.TimeoutExpired(["umu", "wineboot"], 300)
+
+        return fake_run
+
+    def test_rng_abort_reseeds_cryptbase_and_completes_the_prefix(self):
+        with tempfile.TemporaryDirectory() as td:
+            pfx = Path(td) / "pfx"
+            attempts = []
+            with mock.patch.object(prefix, "LOGS", Path(td) / "logs"), \
+                    mock.patch(
+                        "bol.gpu_safety.require_safe_graphics_session"), \
+                    mock.patch.object(
+                        prefix, "proton_umu_cmd",
+                        return_value=(["umu", "wineboot"], {})), \
+                    mock.patch.object(
+                        prefix, "seed_managed_bootstrap_cryptbase",
+                        return_value=False), \
+                    mock.patch.object(
+                        prefix, "repair_bootstrap_cryptbase",
+                        return_value=True) as repair, \
+                    mock.patch.object(
+                        prefix, "repair_managed_prefix_user32"), \
+                    mock.patch.object(
+                        prefix.subprocess, "run",
+                        side_effect=self._rng_abort_writer(
+                            attempts, finish_on=2, pfx=pfx)), \
+                    mock.patch.object(prefix, "stop_prefix_procs"):
+                self.assertTrue(prefix.boot_prefix(pfx))
+
+            repair.assert_called_once_with(pfx)
+            self.assertEqual(len(attempts), 2)
+            self.assertIn("cryptbase=b", attempts[0]["WINEDLLOVERRIDES"])
+            self.assertIn("cryptbase=n,b", attempts[1]["WINEDLLOVERRIDES"])
+
+    def test_rng_abort_is_retried_only_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            pfx = Path(td) / "pfx"
+            logs = Path(td) / "logs"
+            attempts = []
+            with mock.patch.object(prefix, "LOGS", logs), \
+                    mock.patch(
+                        "bol.gpu_safety.require_safe_graphics_session"), \
+                    mock.patch.object(
+                        prefix, "proton_umu_cmd",
+                        return_value=(["umu", "wineboot"], {})), \
+                    mock.patch.object(
+                        prefix, "seed_managed_bootstrap_cryptbase",
+                        return_value=True), \
+                    mock.patch.object(
+                        prefix, "repair_bootstrap_cryptbase",
+                        return_value=True), \
+                    mock.patch.object(
+                        prefix.subprocess, "run",
+                        side_effect=self._rng_abort_writer(attempts)), \
+                    mock.patch.object(prefix, "stop_prefix_procs"), \
+                    mock.patch.object(prefix, "warn") as warn:
+                self.assertFalse(prefix.boot_prefix(pfx))
+
+            self.assertEqual(len(attempts), 2)
+            self.assertIn("timed out", warn.call_args.args[0])
+            self.assertIn(
+                str(logs / "native-login.log"), warn.call_args.args[0])
+
+    def test_rng_abort_without_a_verified_component_is_reported(self):
+        with tempfile.TemporaryDirectory() as td:
+            pfx = Path(td) / "pfx"
+            attempts = []
+            with mock.patch.object(prefix, "LOGS", Path(td) / "logs"), \
+                    mock.patch(
+                        "bol.gpu_safety.require_safe_graphics_session"), \
+                    mock.patch.object(
+                        prefix, "proton_umu_cmd",
+                        return_value=(["umu", "wineboot"], {})), \
+                    mock.patch.object(
+                        prefix, "seed_managed_bootstrap_cryptbase",
+                        return_value=False), \
+                    mock.patch.object(
+                        prefix, "repair_bootstrap_cryptbase",
+                        return_value=False), \
+                    mock.patch.object(
+                        prefix.subprocess, "run",
+                        side_effect=self._rng_abort_writer(attempts)), \
+                    mock.patch.object(prefix, "stop_prefix_procs"), \
+                    mock.patch.object(prefix, "warn") as warn:
+                self.assertFalse(prefix.boot_prefix(pfx))
+
+            # Without a usable RNG component another attempt cannot help.
+            self.assertEqual(len(attempts), 1)
+            messages = " ".join(call.args[0] for call in warn.call_args_list)
+            self.assertIn("No verified cryptbase.dll", messages)
+            self.assertIn("Install / Update", messages)
+
+    def test_only_this_attempt_s_log_section_triggers_the_retry(self):
+        with tempfile.TemporaryDirectory() as td:
+            logs = Path(td) / "logs"
+            logs.mkdir()
+            log_path = logs / "native-login.log"
+            log_path.write_text(
+                "wine: Call from 0000 to unimplemented function "
+                "advapi32.dll.SystemFunction036, aborting\n",
+                encoding="utf-8",
+            )
+            stale = log_path.stat().st_size
+            log_path.write_text(
+                log_path.read_text(encoding="utf-8")
+                + "wineboot: prefix updated\n",
+                encoding="utf-8",
+            )
+
+            self.assertTrue(prefix._wineboot_hit_rng_abort(log_path))
+            self.assertFalse(prefix._wineboot_hit_rng_abort(log_path, stale))
+
+    def test_unrelated_wineboot_failure_is_not_retried(self):
+        with tempfile.TemporaryDirectory() as td:
+            attempts = []
+
+            def fake_run(_cmd, **kwargs):
+                attempts.append(True)
+                kwargs["stdout"].write("err:winediag:something else\n")
+                return SimpleNamespace(returncode=42)
+
+            with mock.patch.object(prefix, "LOGS", Path(td) / "logs"), \
+                    mock.patch(
+                        "bol.gpu_safety.require_safe_graphics_session"), \
+                    mock.patch.object(
+                        prefix, "proton_umu_cmd",
+                        return_value=(["umu", "wineboot"], {})), \
+                    mock.patch.object(
+                        prefix, "seed_managed_bootstrap_cryptbase",
+                        return_value=True), \
+                    mock.patch.object(
+                        prefix, "repair_bootstrap_cryptbase") as repair, \
+                    mock.patch.object(
+                        prefix.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(prefix, "stop_prefix_procs"):
+                self.assertFalse(prefix.boot_prefix(Path(td) / "pfx"))
+
+            self.assertEqual(len(attempts), 1)
+            repair.assert_not_called()
 
     def test_wineboot_propagates_shutdown_failure(self):
         with tempfile.TemporaryDirectory() as td, \
@@ -438,6 +599,33 @@ class PrefixEnvironmentTests(unittest.TestCase):
         self.assertNotIn("PROTON_USE_WOW64", env)
 
 
+class CryptbaseRepairTests(unittest.TestCase):
+    def test_repair_refetches_the_payload_before_seeding_again(self):
+        order = []
+        with mock.patch.object(
+                fixups, "ensure_openssl_xcurl_set",
+                side_effect=lambda: order.append("fetch")), \
+                mock.patch.object(
+                    prefix, "seed_managed_bootstrap_cryptbase",
+                    side_effect=lambda _p: order.append("seed") or True):
+            self.assertTrue(
+                prefix.repair_bootstrap_cryptbase(Path("/tmp/bol-pfx")))
+        self.assertEqual(order, ["fetch", "seed"])
+
+    def test_repair_still_seeds_when_the_download_fails(self):
+        with mock.patch.object(
+                fixups, "ensure_openssl_xcurl_set",
+                side_effect=OSError("offline")), \
+                mock.patch.object(
+                    prefix, "seed_managed_bootstrap_cryptbase",
+                    return_value=False) as seed, \
+                mock.patch.object(prefix, "warn") as warn:
+            self.assertFalse(
+                prefix.repair_bootstrap_cryptbase(Path("/tmp/bol-pfx")))
+        seed.assert_called_once_with(Path("/tmp/bol-pfx"))
+        self.assertIn("offline", warn.call_args.args[0])
+
+
 class CryptbaseInstallTests(unittest.TestCase):
     def test_install_is_atomic_and_preserves_existing_file_once(self):
         with tempfile.TemporaryDirectory() as td:
@@ -621,6 +809,204 @@ class ManagedRuntimeRepairTests(unittest.TestCase):
             self.assertEqual(target.read_bytes(), b"corrupt-user32")
 
 
+class ManagedRuntimeRefreshTests(unittest.TestCase):
+    """Engine upgrades must refresh the prefix's cached Windows system DLLs.
+
+    Swapping the WineGDK engine while reusing a prefix built by the previous
+    engine leaves stale system32/syswow64 DLLs that fault Minecraft's
+    account/menu path under the pure-WoW64 runtime (issue #135)."""
+
+    def _runtime_paths(self, root, marker_rev="__absent__"):
+        engine = root / "engine"
+        pfx = root / "prefix"
+        e64 = engine / "files/lib/wine/x86_64-windows"
+        e32 = engine / "files/lib/wine/i386-windows"
+        e64.mkdir(parents=True)
+        e32.mkdir(parents=True)
+        (e64 / "user32.dll").write_bytes(b"new-user32-64")
+        (e64 / "ntdll.dll").write_bytes(b"new-ntdll-64")
+        (e32 / "user32.dll").write_bytes(b"new-user32-32")
+        _make_ready_prefix(pfx)
+        sys32 = pfx / "drive_c/windows/system32"
+        wow = pfx / "drive_c/windows/syswow64"
+        wow.mkdir(parents=True, exist_ok=True)
+        (sys32 / "user32.dll").write_bytes(b"old-user32-64")
+        (sys32 / "ntdll.dll").write_bytes(b"old-ntdll-64")
+        (wow / "user32.dll").write_bytes(b"old-user32-32")
+        users = (pfx / "drive_c/users/steamuser/AppData/Roaming/"
+                 "Minecraft Bedrock")
+        users.mkdir(parents=True)
+        (users / "worlds.mcworld").write_bytes(b"precious-world")
+        if marker_rev != "__absent__":
+            (pfx / prefix.ENGINE_REV_MARKER).write_text(marker_rev + "\n")
+        return engine, pfx
+
+    def _managed(self, engine, pfx):
+        return mock.patch.dict(prefix.os.environ, {}, clear=True), \
+            mock.patch.object(prefix, "PFX", pfx), \
+            mock.patch.object(prefix, "WINEGDK_OUT", engine), \
+            mock.patch.object(prefix, "proton_path", return_value=engine)
+
+    def test_engine_upgrade_refreshes_stale_system_dlls(self):
+        with tempfile.TemporaryDirectory() as td:
+            engine, pfx = self._runtime_paths(Path(td))
+            m = self._managed(engine, pfx)
+            with m[0], m[1], m[2], m[3], \
+                    mock.patch.object(prefix, "require_prefix_idle") as idle, \
+                    mock.patch.object(prefix, "ok"):
+                changed = prefix.refresh_managed_prefix_runtime(pfx)
+
+            self.assertTrue(changed)
+            sys32 = pfx / "drive_c/windows/system32"
+            wow = pfx / "drive_c/windows/syswow64"
+            self.assertEqual((sys32 / "user32.dll").read_bytes(),
+                             b"new-user32-64")
+            self.assertEqual((sys32 / "ntdll.dll").read_bytes(),
+                             b"new-ntdll-64")
+            self.assertEqual((wow / "user32.dll").read_bytes(),
+                             b"new-user32-32")
+            self.assertEqual(
+                (sys32 / "user32.dll.bol-runtime-backup").read_bytes(),
+                b"old-user32-64")
+            idle.assert_called_once_with(
+                pfx, "refresh the managed Wine runtime")
+            self.assertEqual(list(sys32.glob(".bol-runtime-*")), [])
+            # The user profile (worlds, settings, login) is preserved.
+            self.assertEqual(
+                (pfx / "drive_c/users/steamuser/AppData/Roaming/"
+                 "Minecraft Bedrock/worlds.mcworld").read_bytes(),
+                b"precious-world")
+
+    def test_matching_runtime_is_untouched(self):
+        with tempfile.TemporaryDirectory() as td:
+            engine, pfx = self._runtime_paths(Path(td))
+            sys32 = pfx / "drive_c/windows/system32"
+            wow = pfx / "drive_c/windows/syswow64"
+            (sys32 / "user32.dll").write_bytes(b"new-user32-64")
+            (sys32 / "ntdll.dll").write_bytes(b"new-ntdll-64")
+            (wow / "user32.dll").write_bytes(b"new-user32-32")
+            m = self._managed(engine, pfx)
+            with m[0], m[1], m[2], m[3], \
+                    mock.patch.object(prefix, "require_prefix_idle") as idle:
+                changed = prefix.refresh_managed_prefix_runtime(pfx)
+
+            self.assertFalse(changed)
+            idle.assert_not_called()
+            self.assertFalse(
+                (sys32 / "user32.dll.bol-runtime-backup").exists())
+
+    def test_custom_engine_and_external_prefix_are_never_refreshed(self):
+        with tempfile.TemporaryDirectory() as td:
+            engine, pfx = self._runtime_paths(Path(td))
+            custom = Path(td) / "custom-engine"
+            external = Path(td) / "external-prefix"
+            with mock.patch.dict(prefix.os.environ, {}, clear=True), \
+                    mock.patch.object(prefix, "PFX", pfx), \
+                    mock.patch.object(prefix, "WINEGDK_OUT", engine), \
+                    mock.patch.object(prefix, "proton_path",
+                                      return_value=custom):
+                self.assertFalse(prefix.refresh_managed_prefix_runtime(pfx))
+            with mock.patch.dict(prefix.os.environ, {}, clear=True), \
+                    mock.patch.object(prefix, "PFX", pfx), \
+                    mock.patch.object(prefix, "WINEGDK_OUT", engine), \
+                    mock.patch.object(prefix, "proton_path",
+                                      return_value=engine):
+                self.assertFalse(
+                    prefix.refresh_managed_prefix_runtime(external))
+            with mock.patch.dict(prefix.os.environ,
+                                 {"BOL_WINEPREFIX": str(external)},
+                                 clear=True), \
+                    mock.patch.object(prefix, "PFX", pfx), \
+                    mock.patch.object(prefix, "WINEGDK_OUT", engine), \
+                    mock.patch.object(prefix, "proton_path",
+                                      return_value=engine):
+                self.assertFalse(prefix.refresh_managed_prefix_runtime(pfx))
+
+            self.assertEqual(
+                (pfx / "drive_c/windows/system32/user32.dll").read_bytes(),
+                b"old-user32-64")
+
+    def test_managed_prefix_engine_is_stale(self):
+        with tempfile.TemporaryDirectory() as td:
+            engine, pfx = self._runtime_paths(Path(td))
+            m = self._managed(engine, pfx)
+            with m[0], m[1], m[2], m[3]:
+                # Missing marker (in-place upgrade) counts as stale.
+                self.assertTrue(prefix.managed_prefix_engine_is_stale(pfx))
+                (pfx / prefix.ENGINE_REV_MARKER).write_text(
+                    "wow64-archs-native6\n")
+                self.assertTrue(prefix.managed_prefix_engine_is_stale(pfx))
+                (pfx / prefix.ENGINE_REV_MARKER).write_text(
+                    prefix.WINEGDK_BUILD_REV + "\n")
+                self.assertFalse(prefix.managed_prefix_engine_is_stale(pfx))
+
+    def test_boot_prefix_refreshes_and_records_marker_on_engine_change(self):
+        with tempfile.TemporaryDirectory() as td:
+            engine, pfx = self._runtime_paths(Path(td))
+            compat = Path(td) / "compatdata"
+            m = self._managed(engine, pfx)
+            with m[0], m[1], m[2], m[3], \
+                    mock.patch.object(prefix, "COMPAT", compat), \
+                    mock.patch.object(prefix, "require_prefix_idle"), \
+                    mock.patch.object(
+                        prefix, "repair_managed_prefix_user32") as repair, \
+                    mock.patch.object(prefix, "ok"):
+                self.assertTrue(prefix.boot_prefix(pfx))
+
+            self.assertEqual(
+                (pfx / "drive_c/windows/system32/ntdll.dll").read_bytes(),
+                b"new-ntdll-64")
+            self.assertEqual(prefix.read_managed_engine_rev(pfx),
+                             prefix.WINEGDK_BUILD_REV)
+            repair.assert_called_once_with(pfx)
+
+    def test_boot_prefix_skips_refresh_when_engine_matches(self):
+        with tempfile.TemporaryDirectory() as td:
+            engine, pfx = self._runtime_paths(
+                Path(td), marker_rev=prefix.WINEGDK_BUILD_REV)
+            compat = Path(td) / "compatdata"
+            m = self._managed(engine, pfx)
+            with m[0], m[1], m[2], m[3], \
+                    mock.patch.object(prefix, "COMPAT", compat), \
+                    mock.patch.object(prefix, "require_prefix_idle") as idle, \
+                    mock.patch.object(
+                        prefix, "repair_managed_prefix_user32"), \
+                    mock.patch.object(prefix, "ok"):
+                self.assertTrue(prefix.boot_prefix(pfx))
+
+            idle.assert_not_called()
+            self.assertEqual(
+                (pfx / "drive_c/windows/system32/user32.dll").read_bytes(),
+                b"old-user32-64")
+
+    def test_engine_only_dlls_are_not_injected_into_prefix(self):
+        # A DLL the engine ships but the prefix lacks is deliberately NOT
+        # copied in: a prefix's system dir is the subset wineboot installed
+        # and Wine loads the rest from the engine dir. Only the prefix's
+        # existing DLLs are refreshed (issue #135).
+        with tempfile.TemporaryDirectory() as td:
+            engine, pfx = self._runtime_paths(Path(td))
+            e64 = engine / "files/lib/wine/x86_64-windows"
+            (e64 / "xinput.dll").write_bytes(b"engine-only-xinput")
+            m = self._managed(engine, pfx)
+            with m[0], m[1], m[2], m[3], \
+                    mock.patch.object(prefix, "require_prefix_idle") as idle, \
+                    mock.patch.object(prefix, "ok"):
+                changed = prefix.refresh_managed_prefix_runtime(pfx)
+
+            sys32 = pfx / "drive_c/windows/system32"
+            self.assertTrue(changed)
+            self.assertEqual((sys32 / "user32.dll").read_bytes(),
+                             b"new-user32-64")
+            self.assertEqual((sys32 / "ntdll.dll").read_bytes(),
+                             b"new-ntdll-64")
+            self.assertFalse((sys32 / "xinput.dll").exists())
+            self.assertFalse(
+                (sys32 / "xinput.dll.bol-runtime-backup").exists())
+            idle.assert_called_once_with(
+                pfx, "refresh the managed Wine runtime")
+
+
 class PrefixSetupTests(unittest.TestCase):
     def test_setup_stops_before_gameinput_when_prefix_boot_fails(self):
         with tempfile.TemporaryDirectory() as td:
@@ -744,6 +1130,45 @@ class PrefixOperationLockTests(unittest.TestCase):
 
         stop.assert_not_called()
         rmtree.assert_not_called()
+
+    def test_logout_is_refused_while_the_common_lock_is_held(self):
+        """msa_logout() takes the prefix lock itself, so no caller may take it
+        on its behalf. flock() is per open file description, so a second
+        acquisition from the same process is refused just like one from
+        another process: wrapping the call (as the GUI's sign-out button once
+        did) makes sign-out fail every time, with the misleading "already in
+        progress" message."""
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(prefix, "DATA", Path(td)), \
+                mock.patch.object(auth, "wine_reg_remove_refresh_token") as rm:
+            with prefix.prefix_operation_lock("test operation"):
+                with self.assertRaisesRegex(BolError, "another BedrockOnLinux"):
+                    auth.msa_logout()
+
+        rm.assert_not_called()
+
+    def test_gui_sign_out_does_not_nest_the_prefix_lock(self):
+        """Guards the call site, which no GUI test can reach: a branch cut
+        before the lock moved into msa_logout() reintroduced a
+        `with prefix_operation_lock(...)` wrapper around the sign-out button's
+        call. That nesting is always refused (see the test above), so sign-out
+        failed for every user while the whole suite stayed green."""
+        source = (Path(__file__).resolve().parent.parent
+                  / "bol" / "gui.py").read_text(encoding="utf-8")
+        for node in ast.walk(ast.parse(source)):
+            if not isinstance(node, ast.With):
+                continue
+            if not any(isinstance(item.context_expr, ast.Call)
+                       and getattr(item.context_expr.func, "id", None)
+                       == "prefix_operation_lock"
+                       for item in node.items):
+                continue
+            for inner in ast.walk(node):
+                self.assertNotEqual(
+                    getattr(getattr(inner, "func", None), "id", None),
+                    "msa_logout",
+                    "msa_logout() takes the prefix lock itself; nesting it "
+                    "inside prefix_operation_lock() always fails")
 
     def test_setup_holds_the_same_operation_lock(self):
         events = []

@@ -20,7 +20,7 @@ from .config import (
     WINEGDK_REG,
 )
 from .log import BolError, die, err, info, ok, warn
-from .prefix import active_prefix
+from .prefix import active_prefix, prefix_operation_lock
 from .util import http_post_form, load_settings, save_settings
 from .wine_registry import (
     reg_delete,
@@ -76,27 +76,40 @@ def msa_gamertag():
 
 def msa_logout():
     """Forget account credentials without retaining reusable Xbox tokens."""
-    try:
-        # Rotate the account generation, purge Xbox tokens and remove the MSA
-        # refresh token under one lock. An in-flight login/launch either wins
-        # before this block (and is then deleted) or observes the new epoch and
-        # is refused; it can never resurrect the old account afterwards.
-        _purge_account_preauth(MSA_DIR / "token.json")
-        if MSA_DIR.is_dir():
-            try:
-                fd = os.open(MSA_DIR, os.O_RDONLY
-                             | getattr(os, "O_DIRECTORY", 0))
+    with prefix_operation_lock("sign out of Microsoft"):
+        try:
+            # Clear the durable Wine copy first. If this fails, leave the
+            # canonical MSA token and account generation intact so the UI keeps
+            # showing the real state and the user can safely retry.
+            wine_reg_remove_refresh_token()
+        except Exception as exc:
+            raise BolError(
+                "Could not remove the Microsoft login token from the Wine "
+                "prefix; sign-out was cancelled."
+            ) from exc
+
+        try:
+            # Rotate the account generation, purge Xbox tokens and remove the
+            # canonical MSA refresh token under one lock. An in-flight login
+            # either wins before this block (and is then deleted) or observes
+            # the new epoch and is refused; it cannot resurrect the old account.
+            _purge_account_preauth(MSA_DIR / "token.json")
+            if MSA_DIR.is_dir():
                 try:
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-            except OSError:
-                pass
-    except Exception as exc:
-        # Fail closed: keeping the current account linked is safer than showing
-        # "signed out" while its old XSTS cache could survive for a new login.
-        raise BolError("Could not safely clear the Microsoft/Xbox account "
-                       "cache; sign-out was cancelled.") from exc
+                    fd = os.open(MSA_DIR, os.O_RDONLY
+                                 | getattr(os, "O_DIRECTORY", 0))
+                    try:
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+                except OSError:
+                    pass
+        except Exception as exc:
+            # The registry token is already gone, but never claim success while
+            # another reusable account cache may remain.
+            raise BolError("Could not safely clear the Microsoft/Xbox account "
+                           "cache; sign-out was cancelled.") from exc
+    ok("Microsoft account signed out from this installation")
     return True
 
 
@@ -319,13 +332,33 @@ def xbl_preauth_diagnostic():
         return dict(_XBL_PREAUTH_DIAGNOSTIC)
 
 
+# A drifted host clock puts the signed XSTS request outside its validity
+# window, and Xbox Live answers exactly like a genuinely unusable account. The
+# generic advice then sends people to xbox.com to fix a profile that is fine.
+_XBL_CLOCK_CATEGORIES = frozenset({"account", "age", "session", "service"})
+
+_XBL_CLOCK_HINT = (
+    " The system clock is also not synchronized, which by itself makes Xbox "
+    "Live reject the sign-in: correct the host date/time first (for example "
+    "`sudo timedatectl set-ntp true`), then try again."
+)
+
+
 def xbl_preauth_error_message():
     """Return an actionable, credential-free message for the last failure."""
 
     diagnostic = xbl_preauth_diagnostic()
     if diagnostic is None:
         return None
-    return diagnostic["message"]
+    message = diagnostic["message"]
+    if diagnostic.get("category") in _XBL_CLOCK_CATEGORIES:
+        try:
+            from .network import clock_is_unsynchronized
+            if clock_is_unsynchronized():
+                message += _XBL_CLOCK_HINT
+        except Exception:
+            pass
+    return message
 
 
 def _xbl_response_error(response):
@@ -763,7 +796,8 @@ def _store_online_preauth(path, payload, expected_epoch=None):
     return True
 
 
-def xbl_preauth(msa_access_token, expected_account_epoch=None):
+def xbl_preauth(msa_access_token, expected_account_epoch=None,
+                refresh_unreachable=False):
     """Run the whole Xbox Live auth chain (device + user + SISU tokens) from
     the host's OpenSSL stack and persist it as winegdk-preauth/device.json,
     where xgameruntime.dll short-circuits its own HTTP calls.
@@ -774,6 +808,10 @@ def xbl_preauth(msa_access_token, expected_account_epoch=None):
     payload (including the multiplayer and Realms XSTS tokens) is available.
     A failed refresh never overwrites a previously valid payload with
     device-only data.
+
+    ``refresh_unreachable`` tells the caller's Microsoft token refresh failed
+    on transport rather than being rejected, so a missing access token is
+    reported as an unreachable service instead of a bad account.
     """
     import base64, uuid as _uuid
     _clear_xbl_preauth_diagnostic()
@@ -842,7 +880,8 @@ def xbl_preauth(msa_access_token, expected_account_epoch=None):
     if not msa_access_token:
         return _fallback("xbl_preauth: no fresh Microsoft access token; cannot "
                          "refresh the Xbox multiplayer chain.",
-                         "microsoft-token", "account")
+                         "microsoft-token",
+                         "network" if refresh_unreachable else "account")
     try:
         from cryptography.hazmat.primitives.asymmetric import ec
         from cryptography.hazmat.primitives import hashes, serialization
@@ -1231,6 +1270,26 @@ def wine_reg_set_refresh_token(token):
     return True
 
 
+def wine_reg_remove_refresh_token():
+    """Remove WineGDK's durable MSA refresh token from an offline prefix.
+
+    A prefix that has never been booted cannot contain the registry copy and is
+    therefore already clean. Other failures propagate so ``msa_logout`` can
+    fail closed before deleting the canonical account cache.
+    """
+    prefix = active_prefix()
+    system_reg = prefix / "system.reg"
+    try:
+        system_reg.lstat()
+    except FileNotFoundError:
+        return True
+    update_prefix_registry(
+        prefix,
+        machine=[reg_delete(WINEGDK_REG, "RefreshToken")],
+    )
+    return True
+
+
 def wine_apply_winegdk_prereqs():
     """Registry prereqs: ConsoleMode=8 (console enum → the XSAPI code path;
     1 = Win32 PC would block the Servers tab as a 'dev build'), TLS 1.2
@@ -1266,9 +1325,8 @@ def wine_apply_winegdk_prereqs():
         user.append(reg_sz("Environment", name, val))
     # Wine's virtual desktop makes ClipCursor reliable in windowed mode.
     # This remains opt-in because it changes windowing for the whole prefix.
-    from .util import _screen_wh
-    confine = (os.environ.get("BOL_CONFINE_CURSOR", "").lower()
-               in ("1", "yes", "on", "true")
+    from .util import _screen_wh, env_flag
+    confine = (env_flag(os.environ.get("BOL_CONFINE_CURSOR"))
                or load_settings().get("confine_cursor", False))
     applied = load_settings().get("_confine_applied", False)
     if confine:

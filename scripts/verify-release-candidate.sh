@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Verify that packaged application candidates embed this checkout's metadata.
 #
-# With no arguments, require and inspect the current .deb, .pyz and AppImage in
-# dist/.  Explicit arguments verify exactly those supported artifacts, which is
-# useful for build-release.sh when an optional format could not be produced.
+# With no arguments, require and inspect the current .deb, .rpm, .pyz and
+# AppImage in dist/.  Explicit arguments verify exactly those supported
+# artifacts, which is useful for build-release.sh when an optional format could
+# not be produced.
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -82,6 +83,7 @@ done
 if (( $# == 0 )); then
   set -- \
     "$OUT/bedrock-on-linux_${expected_version}_amd64.deb" \
+    "$OUT/bedrock-on-linux-${expected_version}-1.x86_64.rpm" \
     "$OUT/bedrock-on-linux-${expected_version}.pyz" \
     "$OUT/BedrockOnLinux-${expected_version}-x86_64.AppImage"
 fi
@@ -183,6 +185,37 @@ PY
       config="$root/usr/lib/bedrock-on-linux/bol/config.py"
       payload_bol="$root/usr/lib/bedrock-on-linux/bol"
       license="$root/usr/share/doc/bedrock-on-linux/copyright"
+      desktop="$root/usr/share/applications/bedrock-on-linux.desktop"
+      icon="$root/usr/share/icons/hicolor/256x256/apps/bedrock-on-linux.png"
+      launcher="$root/usr/lib/bedrock-on-linux/bedrock-on-linux"
+      ;;
+
+    *.rpm)
+      command -v rpm >/dev/null || die "rpm is required to inspect $name"
+      command -v rpm2cpio >/dev/null \
+        || die "rpm2cpio is required to extract $name"
+      command -v cpio >/dev/null || die "cpio is required to extract $name"
+      # A candidate is never signed, so digests/signatures are not consulted;
+      # the payload itself is compared against this checkout below.
+      rpm_version="$(rpm -qp --nosignature --qf '%{VERSION}' "$artifact" \
+        2>/dev/null)" || die "could not read RPM metadata from $name"
+      rpm_arch="$(rpm -qp --nosignature --qf '%{ARCH}' "$artifact" \
+        2>/dev/null)" || die "could not read RPM architecture from $name"
+      [[ "$rpm_version" == "$expected_version" ]] \
+        || die "$name header Version=$rpm_version, expected $expected_version"
+      [[ "$rpm_arch" == "x86_64" ]] \
+        || die "$name header Arch=$rpm_arch, expected x86_64"
+      # The bundled wheels' dist-info must not turn into distribution
+      # dependencies nobody can satisfy; the spec declares them by hand.
+      if rpm -qp --nosignature --requires "$artifact" 2>/dev/null \
+          | grep -q "^python3dist("; then
+        die "$name requires generated python3dist() dependencies"
+      fi
+      ( cd "$root" && rpm2cpio "$artifact" | cpio -idm --quiet ) \
+        || die "could not extract $name"
+      config="$root/usr/lib/bedrock-on-linux/bol/config.py"
+      payload_bol="$root/usr/lib/bedrock-on-linux/bol"
+      license="$root/usr/share/licenses/bedrock-on-linux/LICENSE"
       desktop="$root/usr/share/applications/bedrock-on-linux.desktop"
       icon="$root/usr/share/icons/hicolor/256x256/apps/bedrock-on-linux.png"
       launcher="$root/usr/lib/bedrock-on-linux/bedrock-on-linux"

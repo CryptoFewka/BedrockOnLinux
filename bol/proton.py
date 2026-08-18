@@ -18,6 +18,8 @@ from .util import (
     gh_latest,
     gh_releases,
     load_settings,
+    path_exists,
+    remove_path,
     save_settings,
 )
 
@@ -49,22 +51,6 @@ def custom_proton():
     if pdir and _canonical_winegdk_path(pdir):
         return False
     return bool(s.get("proton_dir") or s.get("proton_url"))
-
-
-def _path_exists(path: Path):
-    """Like exists(), but also true for a dangling symlink."""
-    return path.exists() or path.is_symlink()
-
-
-def _remove_path(path: Path):
-    """Remove one path without ever following a directory symlink."""
-    try:
-        if path.is_symlink() or path.is_file():
-            path.unlink()
-        elif path.exists():
-            shutil.rmtree(path)
-    except FileNotFoundError:
-        pass
 
 
 def _extract_proton_archive(archive, destination: Path):
@@ -144,7 +130,7 @@ def _extract_proton_archive(archive, destination: Path):
         if kind == "directory":
             continue
         output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if _path_exists(output):
+        if path_exists(output):
             raise ValueError(f"conflicting path in Proton archive: {name}")
         if kind == "symlink":
             output.symlink_to(member.linkname)
@@ -220,13 +206,13 @@ def _activate_proton(candidate: Path, target: Path, commit=None):
 
     with managed_engine_lock(PROTON_DIR):
         # Recover or discard the residue of an interrupted earlier swap.
-        if _path_exists(backup):
-            if not _path_exists(target):
+        if path_exists(backup):
+            if not path_exists(target):
                 backup.replace(target)
             else:
-                _remove_path(backup)
+                remove_path(backup)
 
-        had_target = _path_exists(target)
+        had_target = path_exists(target)
         if had_target:
             target.replace(backup)
         try:
@@ -234,15 +220,15 @@ def _activate_proton(candidate: Path, target: Path, commit=None):
             if commit is not None:
                 commit()
         except Exception:
-            if _path_exists(target):
-                _remove_path(target)
-            if had_target and _path_exists(backup):
+            if path_exists(target):
+                remove_path(target)
+            if had_target and path_exists(backup):
                 backup.replace(target)
             raise
         else:
-            if _path_exists(backup):
+            if path_exists(backup):
                 try:
-                    _remove_path(backup)
+                    remove_path(backup)
                 except OSError as exc:
                     # The engine and settings are already committed.  Keep a
                     # harmless rollback tree for recovery on the next update

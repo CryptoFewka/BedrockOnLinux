@@ -12,15 +12,21 @@ from .doctor import doctor
 from .games import list_mc_versions
 from .gamesetup import do_setup
 from .gui import gui
-from .launch import launch
-from .log import BolError, IS_TTY, die, err, info, ok, warn
+from .launch import (
+    direct_launch_readiness,
+    launch,
+)
+from .log import BolError, IS_TTY, desktop_notify, die, err, info, ok, warn
 from .network import diagnose_network
 from .prefix import reset_prefix
 from .profiles import (
     create_profile,
     list_profiles,
+    play_launch_command,
     profile_launch_command,
     require_profile_shortcuts_supported,
+    require_shortcuts_supported,
+    write_play_shortcut,
     write_profile_shortcut,
 )
 from .update import check_for_update, self_update, update_kind
@@ -37,6 +43,13 @@ def _run_network_diagnostics(host_ip=None):
             f"  {check.kind:14} {check.target}: {state} — {check.detail}"
         )
     return healthy
+
+
+def _report_launch_failure(message):
+    """Show why PLAY stopped when a shortcut left no terminal to print to."""
+    if IS_TTY:
+        return
+    desktop_notify(f"Minecraft did not start.\n{message}")
 
 
 def main():
@@ -87,6 +100,16 @@ def main():
     )
     profiles_create.add_argument("name", metavar="NAME")
     profiles_sub.add_parser("list", help="list isolated profiles")
+    sc = sub.add_parser(
+        "shortcut",
+        help="create a desktop/Steam shortcut that launches Minecraft "
+             "directly, without the launcher window",
+    )
+    sc.add_argument(
+        "--profile",
+        metavar="NAME",
+        help="launch an isolated profile instead of the default installation",
+    )
     sub.add_parser("update", help="check for and install launcher updates")
 
     sub.add_parser("changelog", help="display the launcher's release changelog history")
@@ -107,6 +130,19 @@ def main():
             ok(f"Done. Run:  {APP} play")
         elif a.cmd == "play":
             launch()
+        elif a.cmd == "shortcut":
+            require_shortcuts_supported()
+            profile = create_profile(a.profile) if a.profile else None
+            entry = write_play_shortcut(
+                profile_name=a.profile, profile_dir=profile)
+            ok(f"Desktop shortcut: {entry}")
+            print("Steam command: " + play_launch_command(profile))
+            info("It starts Minecraft with no launcher window. Add it to "
+                 "Steam with 'Add a Non-Steam Game' to play it from the "
+                 "library, including Steam Deck Game Mode.")
+            # A profile's own installation state lives under its BOL_HOME.
+            for pending in ([] if profile else direct_launch_readiness()):
+                warn(pending)
         elif a.cmd == "versions":
             for v in list_mc_versions(a.beta):
                 print(f"  {v['tag']:<14}{'beta' if v['beta'] else 'stable':>7}"
@@ -192,4 +228,6 @@ def main():
     except BolError as exc:
         if not getattr(exc, "reported", False):
             err(str(exc))
+        if a.cmd == "play":
+            _report_launch_failure(str(exc))
         sys.exit(1)

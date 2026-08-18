@@ -54,6 +54,22 @@ exposes the parent background along the top and left edges. It is a narrow
 semantic backport of the client-surface geometry behavior introduced by
 upstream Wine commit `b868cd31d6b`.
 
+The `0006` patch stops the XStore composite from fabricating store answers.
+Nothing implements the Microsoft Store behind it, yet its game-license query
+completed with a hard-coded license and its associated-products query completed
+with a zeroed result, which reaches the caller as `S_OK` plus a null
+product-query handle. A signed-in Minecraft reads that as a store that answered,
+marks its offer repository loaded and then walks the containers the enumeration
+was supposed to fill, faulting on the first null one while the main menu is
+still assembling (issue #171). Both queries now report
+`E_GAMESTORE_NETWORK_ERROR`, which needs no task queue and leaves the caller's
+async block untouched; the title retries a few times and continues with the
+store disabled. The same patch teaches `XAsync` that a task queue this DLL does
+not own may still belong to the native GDK threading sidecar, where
+`QueryApiImpl` sends `CLSID_XThreadingImpl`: such handles are duplicated,
+driven and closed through the implementation that owns them instead of being
+silently replaced by a thread-pool queue of our own.
+
 `SOURCE-SHA256SUMS` pins every source file changed by the cumulative r12 to
 native5 delta and its follow-ups. The Bullseye builder applies the reviewed r12
 and native patches when the target commit is unavailable, always applies `0002`

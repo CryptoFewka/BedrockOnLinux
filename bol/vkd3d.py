@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shutil
@@ -20,6 +19,7 @@ from .config import (
 )
 from .engine_lock import managed_engine_lock
 from .log import BolError
+from .util import sha256_file
 
 
 EXT_DGC = "ext-dgc"
@@ -38,11 +38,16 @@ REQUIRED_COMPONENTS = {
     "vkd3d_nv_dgc": VKD3D_NV_DGC_COMPONENT_VERSION,
 }
 
-# native5 through native12 keep the reviewed r11/r12 universal graphics payload. Hashing
-# whatever an archive declares would only prove internal consistency, so pin
-# the known DLL bytes as an independent trust anchor. Future engine revisions
-# must update the revision pin deliberately.
-REQUIRED_VARIANT_HASHES_BUILD_REV = "wow64-archs-native12"
+# native5 through native13 kept the reviewed r11/r12 universal graphics
+# payload; native14 rebuilds it with the occluded frame-latency fix, which
+# changes d3d12core.dll on both architectures and leaves d3d12.dll untouched.
+# Hashing whatever an archive declares would only prove internal consistency,
+# so pin the known DLL bytes as an independent trust anchor. Future engine
+# revisions must update the revision pin deliberately.
+# native15 rebuilds the same vkd3d payload as native14: it differs only in
+# xgameruntime, which the store fix changed, so every variant hash below is
+# unchanged and only the revision this launcher accepts moves.
+REQUIRED_VARIANT_HASHES_BUILD_REV = "wow64-archs-native15"
 REQUIRED_ENGINE_GLIBC_MAX = "2.31"
 REQUIRED_VKD3D_BASE_COMMIT = "3b10bd7a7ec6a7347e616cf8bea59333afec2255"
 REQUIRED_VKD3D_REVERT = "76c11d2e2b90b0a46dc894508e67e2aaacc2c04d"
@@ -119,13 +124,13 @@ REQUIRED_VARIANT_HASHES = {
             "d6f4e30131e5f05f9167f93c2277652b7d2299ef43a4f623990ee4fd8a34cc4c",
         ("files/lib/wine/vkd3d-proton/x86_64-windows/"
          "d3d12core.dll.bol-ext-dgc"):
-            "870d498f1762b99c18fc3fa02cb92bc35dfbbf121162fa49e06521d8d5ef54da",
+            "09cc495a96dd4861b1fd75c3ce1e6a5efc21c8bccc1f1ac8a4b134dd63f14b2b",
         ("files/lib/wine/vkd3d-proton/i386-windows/"
          "d3d12.dll.bol-ext-dgc"):
             "aac73e3555cb3ca893b3ef11ab033e42a0ffa3139e3ac4ae8ded1667cd321190",
         ("files/lib/wine/vkd3d-proton/i386-windows/"
          "d3d12core.dll.bol-ext-dgc"):
-            "48ecfec79064ea81fcca378239da02051655588fff69005678b2483b7a2f0daa",
+            "b0ef89b9c147b35d751154186cd5a4e249cb2cdbbbafe9f0a47757f6c3fd0fd7",
     },
     NV_DGC: {
         ("files/lib/wine/vkd3d-proton/x86_64-windows/"
@@ -133,13 +138,13 @@ REQUIRED_VARIANT_HASHES = {
             "d6f4e30131e5f05f9167f93c2277652b7d2299ef43a4f623990ee4fd8a34cc4c",
         ("files/lib/wine/vkd3d-proton/x86_64-windows/"
          "d3d12core.dll.bol-nv-dgc"):
-            "870d498f1762b99c18fc3fa02cb92bc35dfbbf121162fa49e06521d8d5ef54da",
+            "09cc495a96dd4861b1fd75c3ce1e6a5efc21c8bccc1f1ac8a4b134dd63f14b2b",
         ("files/lib/wine/vkd3d-proton/i386-windows/"
          "d3d12.dll.bol-nv-dgc"):
             "aac73e3555cb3ca893b3ef11ab033e42a0ffa3139e3ac4ae8ded1667cd321190",
         ("files/lib/wine/vkd3d-proton/i386-windows/"
          "d3d12core.dll.bol-nv-dgc"):
-            "48ecfec79064ea81fcca378239da02051655588fff69005678b2483b7a2f0daa",
+            "b0ef89b9c147b35d751154186cd5a4e249cb2cdbbbafe9f0a47757f6c3fd0fd7",
     },
 }
 
@@ -203,17 +208,6 @@ def _safe_manifest_file(root: Path, relative: str, variant: str,
             raise _nv_variant_missing("missing file %s" % relative)
         raise BolError("Engine manifest entry is not a file: %s" % relative)
     return resolved
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while True:
-            block = stream.read(1 << 20)
-            if not block:
-                break
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _valid_sha256(value) -> bool:
@@ -386,7 +380,7 @@ def validate_engine_manifest(
                 relative)
         expected_hash = expected_hash.lower()
         source = _safe_manifest_file(root, relative, "critical_files", None)
-        actual_hash = _sha256(source)
+        actual_hash = sha256_file(source)
         if actual_hash != expected_hash:
             raise BolError(
                 "Engine manifest validation failed: SHA-256 mismatch for "
@@ -490,7 +484,7 @@ def validate_engine_manifest(
             expected_hash = expected_hash.lower()
             source = _safe_manifest_file(root, relative, variant,
                                          required_variant)
-            actual_hash = _sha256(source)
+            actual_hash = sha256_file(source)
             if actual_hash != expected_hash:
                 detail = "SHA-256 mismatch for %s" % relative
                 if variant == NV_DGC and required_variant == NV_DGC:
@@ -564,7 +558,7 @@ def _transactional_activate(
             stage_path = target.with_name(
                 target.name + ".bol-stage-" + transaction)
             _copy_file_synced(source, stage_path)
-            if _sha256(stage_path) != expected_hash:
+            if sha256_file(stage_path) != expected_hash:
                 raise OSError("staged SHA-256 mismatch for %s" % target)
             stages[target] = stage_path
 
@@ -582,7 +576,7 @@ def _transactional_activate(
         _fsync_directories(directories)
 
         for target, expected_hash in all_targets:
-            if not target.is_file() or _sha256(target) != expected_hash:
+            if not target.is_file() or sha256_file(target) != expected_hash:
                 raise OSError("post-activation SHA-256 mismatch for %s" % target)
     except Exception as exc:
         rollback_errors = []
@@ -639,7 +633,7 @@ def activate_vkd3d_variant(
             target = root.joinpath(*PurePosixPath(target_relative).parts)
             all_targets.append((target, expected_hash))
             try:
-                current_hash = _sha256(target) if target.is_file() else None
+                current_hash = sha256_file(target) if target.is_file() else None
             except OSError:
                 current_hash = None
             if current_hash != expected_hash:

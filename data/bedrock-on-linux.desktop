@@ -10,3 +10,8 @@ Categories=Game;ActionGame;
 Keywords=minecraft;bedrock;gdk;wine;proton;mcbe;
 StartupNotify=true
 StartupWMClass=BedrockOnLinux
+Actions=Play;
+
+[Desktop Action Play]
+Name=Play without the launcher
+Exec=bedrock-on-linux play

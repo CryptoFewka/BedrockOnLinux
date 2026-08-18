@@ -328,7 +328,7 @@ class WineGDKInstallTests(unittest.TestCase):
         self._write_engine(candidate, "candidate")
         rollback = self.engine.with_name(
             "." + self.engine.name + ".rollback")
-        original_remove = winegdk._remove_path
+        original_remove = winegdk.remove_path
 
         def fail_rollback_cleanup(path):
             if Path(path) == rollback:
@@ -336,7 +336,7 @@ class WineGDKInstallTests(unittest.TestCase):
             return original_remove(path)
 
         with mock.patch.object(
-                winegdk, "_remove_path", side_effect=fail_rollback_cleanup):
+                winegdk, "remove_path", side_effect=fail_rollback_cleanup):
             winegdk._activate_engine_locked(candidate)
 
         self.assertEqual((self.engine / "proton").read_text(), "candidate")

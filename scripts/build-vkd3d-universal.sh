@@ -10,6 +10,7 @@ LOCK_FILE="$PROVENANCE_DIR/provenance.env"
 SUBMODULE_LOCK="$PROVENANCE_DIR/submodules.lock"
 EXPECTED_HASHES="$PROVENANCE_DIR/OUTPUT-SHA256SUMS"
 REVERT_PATCH="$PROVENANCE_DIR/restore-nv-dgc.patch"
+OCCLUSION_PATCH="$PROVENANCE_DIR/fix-occluded-frame-latency.patch"
 LICENSE_FILE="$PROVENANCE_DIR/COPYING.LGPL-2.1"
 README_FILE="$PROVENANCE_DIR/README.md"
 BUILD_RECIPE="$PROJECT_ROOT/scripts/build-vkd3d-universal.sh"
@@ -36,6 +37,7 @@ EOF
 [[ $# -eq 1 ]] || { usage >&2; exit 2; }
 [[ -f "$LOCK_FILE" && -f "$SUBMODULE_LOCK" && \
    -f "$EXPECTED_HASHES" && -f "$REVERT_PATCH" && \
+   -f "$OCCLUSION_PATCH" && \
    -f "$LICENSE_FILE" && -f "$README_FILE" && \
    -f "$BUILD_RECIPE" ]] || die "incomplete vkd3d provenance bundle"
 
@@ -102,6 +104,8 @@ hash_file() {
 
 assert_equal "vendored revert patch" "$(hash_file "$REVERT_PATCH")" \
   "$VKD3D_REVERT_PATCH_SHA256"
+assert_equal "vendored occlusion patch" "$(hash_file "$OCCLUSION_PATCH")" \
+  "$VKD3D_OCCLUSION_PATCH_SHA256"
 assert_equal "upstream licence" "$(hash_file "$LICENSE_FILE")" \
   "$VKD3D_LICENSE_SHA256"
 assert_equal "submodule lock" "$(hash_file "$SUBMODULE_LOCK")" \
@@ -183,18 +187,25 @@ diff -u "$SUBMODULE_LOCK" "$ACTUAL_SUBMODULES" || die \
 
 echo "== Restoring the exact NV-DGC implementation removed by $VKD3D_REMOVAL_COMMIT"
 git -C "$SOURCE_DIR" revert --no-commit "$VKD3D_REMOVAL_COMMIT"
-git -C "$SOURCE_DIR" diff --cached --check
+# The restored shader source ends on a blank line upstream, which is not a sign
+# of a corrupted revert; keep every other whitespace rule armed.
+git -C "$SOURCE_DIR" -c core.whitespace=-blank-at-eof diff --cached --check
 GENERATED_PATCH="$WORK_ROOT/restore-nv-dgc.generated.patch"
 git -C "$SOURCE_DIR" \
   -c core.quotePath=true \
   -c diff.mnemonicPrefix=false \
   -c diff.noprefix=false \
+  -c core.abbrev=7 \
   diff --cached --binary --no-ext-diff --no-textconv > "$GENERATED_PATCH"
 assert_equal "revert patch" \
   "$(sha256sum "$GENERATED_PATCH" | awk '{print $1}')" \
   "$VKD3D_REVERT_PATCH_SHA256"
 cmp "$REVERT_PATCH" "$GENERATED_PATCH" || die \
   "vendored revert patch differs from git revert output"
+
+echo "== Applying the occluded frame-latency fix"
+git -C "$SOURCE_DIR" apply --index --whitespace=nowarn "$OCCLUSION_PATCH" || die \
+  "vendored occlusion patch does not apply to the pinned source"
 
 build_arch() {
   local arch="$1" cross_file="$2" bindir="$3" epoch="$4"
@@ -240,8 +251,8 @@ echo "== Verifying reviewed r11 DLL hashes"
 PROVENANCE_OUT="$OUTPUT_DIR/provenance"
 mkdir -p "$PROVENANCE_OUT"
 install -m 0644 "$LOCK_FILE" "$SUBMODULE_LOCK" "$EXPECTED_HASHES" \
-  "$REVERT_PATCH" "$LICENSE_FILE" "$README_FILE" "$BUILD_RECIPE" \
-  "$PROVENANCE_OUT/"
+  "$REVERT_PATCH" "$OCCLUSION_PATCH" "$LICENSE_FILE" "$README_FILE" \
+  "$BUILD_RECIPE" "$PROVENANCE_OUT/"
 {
   printf 'git: %s\n' "$(git --version)"
   printf 'python: %s\n' "$(python3 --version)"

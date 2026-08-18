@@ -19,8 +19,9 @@ mkdir -p "$BIN" "$APPS" "$ICONS"
 chmod +x "$SRC/bedrock-on-linux"
 ln -sf "$SRC/bedrock-on-linux" "$BIN/bedrock-on-linux"
 
-# .desktop with an absolute Exec so it works even if ~/.local/bin isn't in PATH
-sed "s|^Exec=.*|Exec=$BIN/bedrock-on-linux gui|" \
+# .desktop with an absolute Exec so it works even if ~/.local/bin isn't in PATH.
+# Rewrite only the program, so the Play action keeps its own argument.
+sed "s|^Exec=bedrock-on-linux |Exec=$BIN/bedrock-on-linux |" \
     "$SRC/data/bedrock-on-linux.desktop" > "$APPS/bedrock-on-linux.desktop"
 
 [[ -f "$SRC/data/icon.png" ]] && cp "$SRC/data/icon.png" \

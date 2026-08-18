@@ -6,7 +6,9 @@ from pathlib import Path
 
 APP = "bedrock-on-linux"
 PRETTY = "BedrockOnLinux"
-VERSION = "2.1.1"
+VERSION = "2.1.4"
+# Published Flatpak identity; used to print a runnable command for that layout.
+FLATPAK_APP_ID = "io.github.wyze3306.BedrockOnLinux"
 
 HOME = Path.home()
 XDG_DATA_HOME = Path(
@@ -95,11 +97,11 @@ WINEGDK_OUT = PROTON_DIR / "GDK-Proton-xuser"
 # exact bytes pinned here, so the pins match upstream's while the source differs.
 WINEGDK_PREBUILT_REPO = "CryptoFewka/BedrockOnLinux"
 # The commit alone does not identify vendored follow-up patches.
-WINEGDK_SOURCE_MANIFEST_SHA256 = "2dc69fe66823ab29cc3fd54b92605d9f9149eb8006486c0e7450192b2857cbb6"
-WINEGDK_BUILD_REV = "wow64-archs-native12"
-WINEGDK_ARCHIVE_SHA256 = "481738ec668377d68207d8fdcc7b59db6d3178a0c23bf17dca5981f3f6d351cf"
+WINEGDK_SOURCE_MANIFEST_SHA256 = "642486a98b1985395e0a704bca76fbfa2124ee1de97d1d8c671213790b9bbd29"
+WINEGDK_BUILD_REV = "wow64-archs-native15"
+WINEGDK_ARCHIVE_SHA256 = "a75d697a61d79ffd39005e198fe9d10d401562bfc4d27cbdb9ca8bfbf67ec4ca"
 # Build workflows verify this deterministic intermediate before reusing it.
-WINEGDK_PREFIX_SHA256 = "bcb5f9a2974c6159dca8006ffc158cfa183d43aadf079a90eac21124804c5da2"
+WINEGDK_PREFIX_SHA256 = "c5760c6275d32fc3c9a1dc31194fe14fb6966a81a51b2461e81970cd74331c81"
 
 # Decoupled from the engine repo: the launcher checks upstream for its own
 # update notifications so this follow-upstream fork still learns about new

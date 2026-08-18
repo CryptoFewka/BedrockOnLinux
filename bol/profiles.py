@@ -1,4 +1,4 @@
-"""Isolated account/prefix profiles with optional desktop shortcuts."""
+"""Isolated account/prefix profiles, and the desktop/Steam shortcuts."""
 # SPDX-License-Identifier: MIT
 
 import fcntl
@@ -10,7 +10,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from .config import APP, DATA, PRETTY, XDG_DATA_HOME
+from .config import APP, DATA, FLATPAK_APP_ID, PRETTY, XDG_DATA_HOME
 from .log import BolError
 
 
@@ -180,6 +180,19 @@ def require_profile_shortcuts_supported(
         )
 
 
+def require_shortcuts_supported(
+        environ=None, info_path=Path("/.flatpak-info")):
+    if not profile_shortcuts_supported(environ, info_path):
+        raise BolError(
+            "Shortcuts cannot be written from the Flatpak sandbox: neither "
+            "the host desktop nor Steam can see the sandbox's private "
+            "applications directory. This build already offers the same "
+            "launch from the app menu entry's 'Play without the launcher' "
+            "action, and Steam can run it as a non-Steam game with the "
+            f"command: flatpak run {FLATPAK_APP_ID} play"
+        )
+
+
 def launcher_executable(explicit=None):
     if explicit:
         return str(Path(explicit).expanduser().resolve())
@@ -195,6 +208,42 @@ def launcher_executable(explicit=None):
     return str(Path(sys.argv[0]).expanduser().resolve())
 
 
+def _desktop_command(argument, profile_dir=None, executable=None):
+    """Exec field running one launcher command, optionally profile-scoped."""
+    prefix = ("env BOL_HOME=" + _desktop_quote(profile_dir) + " "
+              if profile_dir is not None else "")
+    return (prefix + _desktop_quote(launcher_executable(executable))
+            + " " + argument)
+
+
+def _shell_command(argument, profile_dir=None, executable=None):
+    """Shell-display form of the same command, for Steam's target field."""
+    import shlex
+    prefix = (f"BOL_HOME={shlex.quote(str(Path(profile_dir).resolve()))} "
+              if profile_dir is not None else "")
+    return (prefix + shlex.quote(launcher_executable(executable))
+            + " " + argument)
+
+
+def _write_desktop_entry(entry, name, comment, command):
+    def one_line(value):
+        return str(value).replace("\n", " ").replace("\r", " ")
+
+    entry.write_text(
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        f"Name={one_line(name)}\n"
+        f"Comment={one_line(comment)}\n"
+        f"Exec={command}\n"
+        "Icon=bedrock-on-linux\n"
+        "Terminal=false\n"
+        "Categories=Game;\n",
+        encoding="utf-8",
+    )
+    os.chmod(entry, 0o644)
+    return entry
+
+
 def write_profile_shortcut(
         name, profile_dir=None, base_data=None, applications_dir=None,
         executable=None):
@@ -207,34 +256,52 @@ def write_profile_shortcut(
     directory = Path(profile_dir or create_profile(display, base_data))
     apps = Path(applications_dir or (XDG_DATA_HOME / "applications"))
     apps.mkdir(parents=True, exist_ok=True)
-    entry = apps / f"{APP}-profile-{slug}.desktop"
-    command = (
-        "env BOL_HOME="
-        + _desktop_quote(directory)
-        + " "
-        + _desktop_quote(launcher_executable(executable))
-        + " gui"
+    return _write_desktop_entry(
+        apps / f"{APP}-profile-{slug}.desktop",
+        f"{PRETTY} — {display}",
+        f"Isolated Xbox profile: {display}",
+        _desktop_command("gui", directory, executable),
     )
-    safe_name = display.replace("\n", " ").replace("\r", " ")
-    entry.write_text(
-        "[Desktop Entry]\n"
-        "Type=Application\n"
-        f"Name={PRETTY} — {safe_name}\n"
-        f"Comment=Isolated Xbox profile: {safe_name}\n"
-        f"Exec={command}\n"
-        "Icon=bedrock-on-linux\n"
-        "Terminal=false\n"
-        "Categories=Game;\n",
-        encoding="utf-8",
+
+
+def write_play_shortcut(
+        profile_name=None, profile_dir=None, base_data=None,
+        applications_dir=None, executable=None):
+    """Write a desktop entry that starts Minecraft with no launcher window.
+
+    It runs the same guarded launch as the PLAY button, so it needs an
+    installation the launcher has already prepared; see
+    `bol.launch.direct_launch_readiness`.
+    """
+    if applications_dir is None:
+        require_shortcuts_supported()
+    directory = None if profile_dir is None else Path(profile_dir)
+    suffix = ""
+    name = "Minecraft Bedrock"
+    comment = f"Start Minecraft directly, without the {PRETTY} window"
+    if profile_name is not None:
+        display = str(profile_name).strip()
+        suffix = "-" + profile_slug(display)
+        if directory is None:
+            directory = Path(create_profile(display, base_data))
+        name = f"Minecraft Bedrock — {display}"
+        comment = (f"Start Minecraft directly for the {display} profile, "
+                   f"without the {PRETTY} window")
+    apps = Path(applications_dir or (XDG_DATA_HOME / "applications"))
+    apps.mkdir(parents=True, exist_ok=True)
+    return _write_desktop_entry(
+        apps / f"{APP}-play{suffix}.desktop",
+        name,
+        comment,
+        _desktop_command("play", directory, executable),
     )
-    os.chmod(entry, 0o644)
-    return entry
 
 
 def profile_launch_command(profile_dir, executable=None):
     """Shell-display form for adding a profile directly to Steam."""
-    import shlex
-    return (
-        f"BOL_HOME={shlex.quote(str(Path(profile_dir).resolve()))} "
-        f"{shlex.quote(launcher_executable(executable))} gui"
-    )
+    return _shell_command("gui", profile_dir, executable)
+
+
+def play_launch_command(profile_dir=None, executable=None):
+    """Shell-display form of the launcher-free launch, for Steam."""
+    return _shell_command("play", profile_dir, executable)

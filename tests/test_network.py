@@ -131,6 +131,31 @@ class NetworkDiagnosticsTests(unittest.TestCase):
         self.assertIn("not synchronized", clock.detail)
         self.assertIn("Xbox", clock.detail)
 
+    @staticmethod
+    def _timedatectl(stdout, returncode=0):
+        def runner(argv, **_kwargs):
+            assert argv[0] == "timedatectl"
+            return subprocess.CompletedProcess(
+                argv, returncode, stdout=stdout, stderr="")
+        return runner
+
+    def test_clock_is_unsynchronized_only_when_positively_reported(self):
+        self.assertTrue(network.clock_is_unsynchronized(
+            self._timedatectl("NTPSynchronized=no\nNTP=yes\nLocalRTC=no\n")))
+        self.assertFalse(network.clock_is_unsynchronized(
+            self._timedatectl("NTPSynchronized=yes\nNTP=yes\nLocalRTC=no\n")))
+
+    def test_clock_is_unsynchronized_stays_false_when_unavailable(self):
+        """No timedatectl (or a failing one) must never blame the clock."""
+
+        self.assertFalse(network.clock_is_unsynchronized(
+            self._timedatectl("", returncode=1)))
+
+        def missing(*_args, **_kwargs):
+            raise FileNotFoundError("timedatectl")
+
+        self.assertFalse(network.clock_is_unsynchronized(missing))
+
     def test_endpoint_checks_are_run_in_parallel(self):
         barrier = threading.Barrier(3)
 

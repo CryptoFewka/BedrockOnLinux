@@ -11,6 +11,7 @@ from pathlib import Path
 from .auth import (
     account_epoch_is_current,
     msa_refresh,
+    msa_signed_in,
     msa_save_for_account_epoch,
     msa_session_snapshot,
     wine_apply_winegdk_prereqs,
@@ -21,17 +22,21 @@ from .auth import (
 )
 from .config import CONTENT, DATA, HOME, LOGS, WINEGDK_BUILD_REV
 from .deps import ensure_login_deps
+from .dgc import dgc_warning_message, intel_dgpus_on_legacy_driver
 from .fixups import _install_cryptbase_in_prefix, bump_stack_reserve
 from .gameinput import install_gameinput
 from .gamesetup import diagnose
 from .gpu_safety import (
+    acknowledge_gpu_crash_command,
     arm_gpu_launch,
     disarm_gpu_launch,
+    in_gamescope_session,
     mark_gpu_wrapper_returned,
     require_safe_graphics_session,
     retire_idle_current_boot_marker,
 )
 from .log import BolError, die, info, ok, warn
+from .ntsync import inproc_sync_problem
 from .prefix import (
     active_prefix,
     boot_prefix,
@@ -41,10 +46,27 @@ from .prefix import (
     proton_umu_cmd,
 )
 from .proton import custom_proton, patch_proton, proton_path
-from .util import _screen_wh, apply_custom_env, load_settings
+from .util import (
+    _screen_wh,
+    apply_custom_env,
+    custom_env_map,
+    env_flag,
+    LAUNCHER_OWNED_ENV,
+    LAUNCHER_OWNED_ENV_ALTERNATIVE,
+    launcher_owned_overrides,
+    load_settings,
+)
 from .vkd3d import prepare_universal_vkd3d
 from .winegdk import ensure_winegdk
 
+
+# Completes both "Minecraft starts in …" sentences below. Keep the wording in
+# one place: it is the answer to "why can I not play without signing in?".
+_OFFLINE_MODE_NOTICE = (
+    "offline mode — single-player worlds and LAN play work, while Realms, "
+    "servers, the Marketplace and Xbox friends stay unavailable until "
+    "Xbox Live sign-in succeeds."
+)
 
 _SONY_STEAM_INPUT_HIDRAW_IDS = ",".join((
     "0x054C/0x05C4",  # DualShock 4
@@ -105,6 +127,65 @@ def _is_steam_deck(environ=None, product_name_path=None):
         return False
 
 
+def _warn_custom_env_overrides(custom_env):
+    """Name the launcher settings the Advanced field is overriding.
+
+    That field is applied last and keeps the final word by design, so this
+    never blocks or rewrites it. It only makes the override visible: an
+    unsupported value there crashes the game at every launch with nothing
+    pointing at the field, and the reporter of issue #134 wiped their whole
+    installation three times before connecting the two.
+    """
+    for key in launcher_owned_overrides(custom_env):
+        alternative = LAUNCHER_OWNED_ENV_ALTERNATIVE.get(key)
+        warn("Custom environment variable %s overrides what Settings "
+             "configures%s. If the game crashes or misbehaves, clear it from "
+             "the Advanced custom-environment field before reinstalling "
+             "anything."
+             % (key,
+                "; the supported control is " + alternative
+                if alternative else ""))
+
+
+def _warn_if_dgc_unavailable(environ=None):
+    """Pre-launch heads-up for Intel dGPUs that cannot expose DGC under i915.
+
+    GPU-free (sysfs only), and managed-engine only: a custom Proton may not
+    use the DGC-only vkd3d this advisory is about. Advisory, not a block;
+    BOL_SKIP_DGC_CHECK=1 silences it.
+    """
+    source = os.environ if environ is None else environ
+    if custom_proton() or source.get("BOL_SKIP_DGC_CHECK") == "1":
+        return
+    cards = intel_dgpus_on_legacy_driver()
+    if cards:
+        warn(dgc_warning_message(cards))
+
+
+def _warn_if_inproc_sync_unavailable(settings, environ=None):
+    """Pre-launch heads-up when Wine has no fast synchronization path.
+
+    Wine 11 dropped esync/fsync, so without the kernel ntsync backend every
+    Win32 wait is a wineserver round-trip and Minecraft's worker threads end
+    up serialised behind it — the "the game runs on one thread" performance
+    reports. File/stat inspection only, no Wine process and no ioctl.
+    Advisory, not a block; BOL_SKIP_NTSYNC_CHECK=1 silences it.
+
+    PROTON_NO_NTSYNC is read from the Advanced custom-environment field rather
+    than the host environment: an inherited copy is dropped as a
+    launcher-owned variable, so only the field can actually disable the
+    fast path.
+    """
+    source = os.environ if environ is None else environ
+    if source.get("BOL_SKIP_NTSYNC_CHECK") == "1":
+        return
+    problem = inproc_sync_problem(
+        proton_path(),
+        environ=custom_env_map(settings.get("custom_env") or ""))
+    if problem:
+        warn(problem)
+
+
 def _configure_runtime_compat(env, settings, backend, host_wayland,
                               diagnostics=False, host_env=None,
                               steam_deck=None):
@@ -116,17 +197,7 @@ def _configure_runtime_compat(env, settings, backend, host_wayland,
     source = os.environ if host_env is None else host_env
     # Drop inherited compatibility flags; Advanced custom values are applied
     # last and remain the supported override.
-    for name in (
-        "PROTON_ENABLE_WAYLAND",
-        "WINE_DISABLE_VULKAN_OPWR",
-        "PROTON_PREFER_SDL",
-        "PROTON_DISABLE_HIDRAW",
-        "PROTON_NO_STEAMINPUT",
-        "PROTON_NO_WM_DECORATION",
-        "PROTON_USE_WINED3D",
-        "PROTON_LOG",
-        "PROTON_LOG_DIR",
-    ):
+    for name in LAUNCHER_OWNED_ENV:
         env.pop(name, None)
 
     if backend == "x11":
@@ -224,7 +295,7 @@ def _prepare_launch_engine():
     return _prepare_graphics_engine()
 
 
-def _launch_once(lock_fds=()):
+def _launch_once(lock_fds=(), on_started=None):
     s = load_settings()
     gd = s.get("game_dir")
     if not gd or not Path(gd, "Minecraft.Windows.exe").exists():
@@ -233,26 +304,34 @@ def _launch_once(lock_fds=()):
         die("GDK-Proton missing — run Install / Update.")
     # Engine preparation is GPU-free and may repair state from an older build.
     _prepare_launch_engine()
+    # GPU-free advisory: an Intel dGPU on i915 cannot expose the DGC the
+    # menu needs; warn before the cryptic page fault instead of after it.
+    _warn_if_dgc_unavailable()
+    # Same idea for the synchronization fast path: name the cause of the
+    # "runs on one thread" stutter before the game starts, not after.
+    _warn_if_inproc_sync_unavailable(s)
     # Only completed, idle wrappers can retire a current-boot marker.
     retire_idle_current_boot_marker()
     require_safe_graphics_session()
 
     account, account_epoch = msa_session_snapshot()
     tok = account.get("refresh_token")
-    if not tok:
-        die("No Microsoft account linked — click 'Sign in' first.")
-    try:
-        fresh = msa_refresh(tok)
-    except Exception as e:
-        fresh = None
-        warn(f"Token refresh skipped ({e}) — using cached token.")
-    if fresh:
-        if not msa_save_for_account_epoch(
-                {"refresh_token": fresh["refresh_token"],
-                 "obtained": int(time.time())}, account_epoch):
-            die("The Microsoft account changed during launch; no stale token "
-                "was stored. Click PLAY again after signing in.")
-        tok = fresh["refresh_token"]
+    fresh = None
+    # A transport failure here is the offline case, not a rejected account.
+    refresh_unreachable = False
+    if tok:
+        try:
+            fresh = msa_refresh(tok)
+        except Exception as e:
+            refresh_unreachable = True
+            warn(f"Token refresh skipped ({e}) — using cached token.")
+        if fresh:
+            if not msa_save_for_account_epoch(
+                    {"refresh_token": fresh["refresh_token"],
+                     "obtained": int(time.time())}, account_epoch):
+                die("The Microsoft account changed during launch; no stale "
+                    "token was stored. Click PLAY again after signing in.")
+            tok = fresh["refresh_token"]
     if not boot_prefix():
         die("Could not initialise the managed Wine prefix safely.")
     wine_apply_winegdk_prereqs()
@@ -261,23 +340,35 @@ def _launch_once(lock_fds=()):
         install_gameinput(active_prefix(), Path(gd))
     except Exception as e:
         warn(f"GameInput check failed ({e}) — continuing.")
-    if not wine_reg_set_refresh_token(tok):
-        die("Could not write the Microsoft login token into the Wine prefix. "
-            "The offline registry was left unchanged; use Repair and try "
-            "again.")
-    access = (fresh or {}).get("access_token")
-    ensure_login_deps()
-    if not xbl_preauth(access or "", account_epoch):
-        detail = xbl_preauth_error_message()
-        diagnostic = xbl_preauth_diagnostic() or {}
-        stage = diagnostic.get("stage")
-        suffix = f" (stage: {stage})" if stage else ""
-        die(
-            "Could not prepare a complete Xbox Live multiplayer session"
-            + suffix + ". "
-            + (detail or
-               "Check the Microsoft account/network connection and try again.")
-        )
+    # Xbox Live is required for Realms, servers, the Marketplace and Friends —
+    # never for the game itself. Neither a missing account nor an unreachable
+    # Xbox Live may keep single-player and LAN worlds from starting (#160).
+    online = False
+    if not tok:
+        warn("No Microsoft account is linked, so Minecraft starts in "
+             + _OFFLINE_MODE_NOTICE + " Use 'Sign in' to add one.")
+    else:
+        if not wine_reg_set_refresh_token(tok):
+            die("Could not write the Microsoft login token into the Wine "
+                "prefix. The offline registry was left unchanged; use Repair "
+                "and try again.")
+        ensure_login_deps()
+        online = xbl_preauth((fresh or {}).get("access_token") or "",
+                             account_epoch,
+                             refresh_unreachable=refresh_unreachable)
+        if not online:
+            detail = xbl_preauth_error_message()
+            diagnostic = xbl_preauth_diagnostic() or {}
+            stage = diagnostic.get("stage")
+            suffix = f" (stage: {stage})" if stage else ""
+            warn(
+                "Could not prepare a complete Xbox Live multiplayer session"
+                + suffix + ". "
+                + (detail or
+                   "Check the Microsoft account/network connection and try "
+                   "again.")
+                + " Minecraft starts in " + _OFFLINE_MODE_NOTICE
+            )
     exe = str(CONTENT / "Minecraft.Windows.exe")
     bump_stack_reserve(Path(exe))
     cmd, env = proton_umu_cmd(exe)
@@ -298,15 +389,29 @@ def _launch_once(lock_fds=()):
     env["MICROSOFT_WINDOWSAPPRUNTIME_BOOTSTRAP_INITIALIZE_SHOWUI"] = "0"
     env["MICROSOFT_WINDOWSAPPRUNTIME_BOOTSTRAP_INITIALIZE_FAILFAST"] = "0"
     env["MICROSOFT_WINDOWSAPPRUNTIME_DEPLOYMENT_INITIALIZE_ONERRORSHOWUI"] = "0"
-    # Azure rejects Wine's TLS 1.3 ClientHello; force TLS 1.2 for this process.
-    prio = DATA / "etc" / "gnutls-no-tls13.cfg"
-    if not prio.exists():
-        prio.parent.mkdir(parents=True, exist_ok=True)
-        prio.write_text("[priorities]\nSYSTEM = NORMAL:-VERS-TLS1.3:%COMPAT\n")
-    env["GNUTLS_SYSTEM_PRIORITY_FILE"] = str(prio)
-    env["GNUTLS_SYSTEM_PRIORITY_FAIL_ON_INVALID"] = "0"
+    # Do NOT set GNUTLS_SYSTEM_PRIORITY_FILE. A previous workaround pointed it
+    # at a "[priorities]\nSYSTEM = NORMAL:-VERS-TLS1.3:%COMPAT" file to force
+    # TLS 1.2, but inside the Flatpak it does the opposite: the runtime's
+    # GnuTLS default priority is not "@SYSTEM", so the file's SYSTEM override
+    # never applies, while the mere presence of the variable makes Wine's
+    # secur32 (set_priority in schannel_gnutls.c) skip its own version-capped
+    # priority string and use raw GnuTLS defaults — negotiating TLS 1.3, which
+    # this Wine's schannel does not support. Result: every in-game WinHTTP TLS
+    # connection to Xbox/Azure edges died post-handshake (0x2746 resets /
+    # 0x80090304 fatal alerts), the XSAPI RTA WebSocket could never connect,
+    # MPSD session writes lacked the required "connection" member, and Friends
+    # worlds failed with the misleading "world is full" error (issue #48).
+    # Wine's own schannel priority already caps at TLS 1.2, achieving what the
+    # workaround intended. Verified with tools/winhttp-rta-probe.c: with the
+    # variable set, 58/66 probes fail (rta.xboxlive.com 100%); without it,
+    # 66/66 succeed.
+    env.pop("GNUTLS_SYSTEM_PRIORITY_FILE", None)
+    env.pop("GNUTLS_SYSTEM_PRIORITY_FAIL_ON_INVALID", None)
     preauth = DATA / "winegdk-preauth" / "device.json"
-    if preauth.exists():
+    # Only a payload pre-auth just vouched for is handed to the engine: an
+    # expired or account-mismatched one would send it chasing a sign-in that
+    # cannot complete instead of settling into offline mode.
+    if online and preauth.exists():
         env["WINEGDK_PREAUTH_DEVICE"] = "Z:" + str(preauth).replace("/", "\\")
     rp = s.get("xsts_rp")
     if rp:
@@ -364,7 +469,7 @@ def _launch_once(lock_fds=()):
             warn("Wayland session without X DISPLAY — install XWayland (or set "
                  "BOL_INPUT=wayland to use winewayland).")
     if use_gamescope:
-        if gs_opt and gs_opt.strip().lower() not in ("1", "yes", "on", "true"):
+        if gs_opt and not env_flag(gs_opt):
             gs_argv = ["gamescope"] + shlex.split(gs_opt)
         else:
             gs_argv = ["gamescope", "-f"]
@@ -377,6 +482,7 @@ def _launch_once(lock_fds=()):
         die("The Microsoft account changed before the game process started. "
             "Minecraft was not started; click PLAY again.")
     apply_custom_env(env, s.get("custom_env") or "")
+    _warn_custom_env_overrides(s.get("custom_env") or "")
     # Prevent diagnosis from attributing stale Proton logs to this launch.
     _clear_previous_proton_logs()
     info("Starting Minecraft … sign in with Microsoft in-game, then "
@@ -412,6 +518,14 @@ def _launch_once(lock_fds=()):
                      "GPU safety marker failed (%s)." %
                      type(marker_error).__name__)
             raise
+        if on_started is not None:
+            # The caller owns a window that may have to step aside for the
+            # game's own; never let that bookkeeping abort a running launch.
+            try:
+                on_started()
+            except Exception as hook_error:
+                warn("The launcher could not step aside for the game window "
+                     "(%s)." % type(hook_error).__name__)
         started = time.time()
         announced = False
         while True:
@@ -444,8 +558,8 @@ def _launch_once(lock_fds=()):
                      "driver before acknowledging the incident.")
             elif not disarm_gpu_launch(gpu_marker_token):
                 warn("Minecraft returned, but its GPU safety marker could not "
-                     "be cleared. Run 'bedrock-on-linux doctor "
-                     "--acknowledge-gpu-crash' after checking the driver.")
+                     f"be cleared. Run '{acknowledge_gpu_crash_command()}' "
+                     "after checking the driver.")
         glog.close()
         patch_options()
         logs = sorted(LOGS.glob("steam-*.log"),
@@ -483,7 +597,47 @@ def _launch_once(lock_fds=()):
     return rc
 
 
-def launch():
-    """Run exactly one guarded launch for each user action."""
+def launch(on_started=None):
+    """Run exactly one guarded launch for each user action.
+
+    ``on_started`` is called once the game process exists, before the wait on
+    it. A launcher window uses it to get out of the game's way in a session
+    that shows one window at a time.
+    """
     with launch_lock() as lock_fds:
-        return _launch_once(lock_fds)
+        return _launch_once(lock_fds, on_started=on_started)
+
+
+def direct_launch_readiness():
+    """First-run steps a launcher-free shortcut cannot perform on its own.
+
+    A shortcut that skips the window has nowhere to show a device code or a
+    version picker, so name what is still missing when one is created rather
+    than letting the first click fail silently. Cheap and offline: settings
+    and token files only, no network and no Wine process.
+    """
+    pending = []
+    game_dir = load_settings().get("game_dir")
+    if not game_dir or not Path(game_dir, "Minecraft.Windows.exe").exists():
+        pending.append(
+            "No Minecraft version is installed yet. Open the launcher once "
+            "and install one; the shortcut only starts a prepared "
+            "installation.")
+    if not msa_signed_in():
+        pending.append(
+            "No Microsoft account is linked yet. Sign in from the launcher "
+            "once; a shortcut has nowhere to display the Microsoft device "
+            "code.")
+    return pending
+
+
+def single_window_session(environ=None):
+    """Whether the session shows one application window at a time.
+
+    Steam Game Mode is that session: Gamescope presents a single window, so
+    the launcher's own stands between Steam and the game — the game stays
+    audible but never appears (#130). The answer is for the launcher to step
+    aside while the game runs, not for it to be skipped: starting the
+    launcher must open the launcher, in Game Mode as everywhere else.
+    """
+    return in_gamescope_session(os.environ if environ is None else environ)

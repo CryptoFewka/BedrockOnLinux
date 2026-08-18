@@ -253,7 +253,8 @@ mkdir -p "$APPDIR/usr/bin/data"
 cp "$SRC/data/icon.png" "$APPDIR/usr/bin/data/icon.png"
 cp "$SRC/data/icon.png" "$APPDIR/bedrock-on-linux.png"
 cp "$SRC/data/icon.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/bedrock-on-linux.png"
-sed 's|^Exec=.*|Exec=bedrock-on-linux gui|' \
+# Normalise the launcher entry without touching the Play action's argument.
+sed '0,/^Exec=/s|^Exec=.*|Exec=bedrock-on-linux gui|' \
    "$SRC/data/bedrock-on-linux.desktop" > "$APPDIR/bedrock-on-linux.desktop"
 cp "$APPDIR/bedrock-on-linux.desktop" \
    "$APPDIR/usr/share/applications/bedrock-on-linux.desktop"

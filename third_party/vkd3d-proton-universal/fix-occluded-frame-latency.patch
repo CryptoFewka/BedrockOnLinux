@@ -1,0 +1,48 @@
+From: BedrockOnLinux contributors
+Subject: [PATCH] vkd3d: keep the frame latency object ticking while occluded
+
+An occluded Present returns DXGI_STATUS_OCCLUDED before it enqueues
+anything, so the present callback that releases the frame latency waitable
+object never runs. An application which created its swapchain with
+DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT waits on that object
+before every frame, so the first occluded present stops its render loop for
+good.
+
+Under Wine that turns into a permanent hang rather than a paused frame. The
+window manager iconifying the window is what makes the surface report a zero
+maximum image extent in the first place (win32u derives it from the Win32
+client rect, which a minimized window reports as empty), and the blocked
+render loop no longer pumps messages, so Wine cannot deliver the restore
+that would give the window its client rect back. The occlusion can then
+never clear: the window stays black and unresponsive until the process is
+killed.
+
+Release the waitable object on the occluded path, mirroring what the
+present-wait worker does for a retired present, so the render loop keeps
+running while occluded and observes the window coming back.
+
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index 8dd2cc10fb2..3e95f7644dd 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -1130,7 +1130,20 @@
+     (void)pPresentParameters;
+ 
+     if (dxgi_vk_swap_chain_present_is_occluded(chain))
++    {
++        /* An application using a waitable swapchain blocks on the frame
++         * latency object before every frame, and only the present callback
++         * below ever releases it. Returning here without releasing it stops
++         * such a render loop for good: the window then stops pumping
++         * messages, the window manager can no longer deliver the restore
++         * that would clear the occlusion, and the application hangs with a
++         * black window until it is killed. Keep the object ticking so the
++         * loop survives being occluded and observes the change.
++         * Releasing an already full semaphore fails harmlessly. */
++        if (vkd3d_native_sync_handle_is_valid(chain->frame_latency_event))
++            vkd3d_native_sync_handle_release(chain->frame_latency_event, 1);
+         return DXGI_STATUS_OCCLUDED;
++    }
+     if (PresentFlags & DXGI_PRESENT_TEST)
+         return S_OK;
+ 

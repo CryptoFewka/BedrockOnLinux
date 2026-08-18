@@ -6,6 +6,7 @@ from __future__ import annotations
 import shutil
 import hashlib
 import json
+import os
 import re
 import subprocess
 import tempfile
@@ -154,6 +155,8 @@ class FlatpakLocalManifestTests(unittest.TestCase):
             "[Desktop Entry]\nType=Application\nName=fixture\n",
             encoding="utf-8",
         )
+        (self.checkout / f"flatpak/{APPID}.metainfo.xml").write_text(
+            "<component type=\"desktop-application\"/>\n", encoding="utf-8")
 
         # This intentionally has the same name as the maintainer's untracked
         # release draft. The local path must neither read nor rewrite it.
@@ -164,15 +167,23 @@ class FlatpakLocalManifestTests(unittest.TestCase):
     def tearDown(self):
         self.tmpdir.cleanup()
 
-    def _run(self, option):
+    def _run(self, option, appstream="0"):
+        env = dict(os.environ, BOL_FLATPAK_APPSTREAM=appstream)
         return subprocess.run(
             ["bash", str(self.checkout / "scripts/build-flatpak.sh"), option],
             cwd=self.checkout,
+            env=env,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
         )
+
+    def _resolved_app(self):
+        resolved = self.checkout / f"flatpak/.{APPID}.resolved.yml"
+        self.assertTrue(resolved.is_file())
+        manifest = yaml.safe_load(resolved.read_text(encoding="utf-8"))
+        return manifest["modules"][-1]
 
     def test_resolve_only_uses_working_tree_and_preserves_release_draft(self):
         result = self._run("--resolve-only")
@@ -209,6 +220,25 @@ class FlatpakLocalManifestTests(unittest.TestCase):
         self.assertIn(f"VERSION={VERSION}", result.stdout)
         self.assertIn(f"WINEGDK_BUILD_REV={WINEGDK_BUILD_REV}", result.stdout)
         self.assertIn("no build or release performed", result.stdout)
+        self.assertNotIn("metainfo", "\n".join(app["build-commands"]))
+
+    def test_working_tree_build_keeps_metainfo_when_appstream_is_available(self):
+        # The nightly builds this path, and a bundle without AppStream data was
+        # why the release build was pinned to the tracked manifest in the first
+        # place; keep the metadata instead of losing it again.
+        result = self._run("--resolve-only", appstream="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        app = self._resolved_app()
+        self.assertIn(
+            {"type": "file", "path": f"{APPID}.metainfo.xml",
+             "dest": "flatpak"},
+            app["sources"],
+        )
+        self.assertIn(f"{APPID}.metainfo.xml",
+                      "\n".join(app["build-commands"]))
+        self.assertFalse(any(source.get("type") == "git"
+                             for source in app["sources"]))
+        self.assertIn("metainfo=kept", result.stdout)
 
     def test_release_mode_refuses_old_tracked_tag_before_any_build(self):
         manifest_path = self.checkout / f"flatpak/{APPID}.yml"

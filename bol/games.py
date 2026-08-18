@@ -10,7 +10,14 @@ from pathlib import Path
 
 from .config import CACHE, CONTENT, GAMES, GAME_ARCHIVE_REPO
 from .log import BolError, die, info, ok, warn
-from .util import download, gh_releases, load_settings, save_settings
+from .util import (
+    download,
+    gh_releases,
+    load_settings,
+    path_exists,
+    remove_path,
+    save_settings,
+)
 
 
 _ASSET_METADATA = ".bedrock-on-linux-asset.json"
@@ -68,17 +75,6 @@ def _game_root(dest):
                for m in ("appxmanifest.xml", "AppxManifest.xml")):
             return exe.parent
     return None
-
-
-def _path_exists(path):
-    return path.exists() or path.is_symlink()
-
-
-def _remove_path(path):
-    if path.is_symlink() or path.is_file():
-        path.unlink(missing_ok=True)
-    elif path.exists():
-        shutil.rmtree(path)
 
 
 def _asset_record(ver):
@@ -154,9 +150,9 @@ def _recover_interrupted_game_refresh(archive, target, refresh, staging):
     """
     archive_backup = archive.with_name("." + archive.name + ".rollback")
     game_backup = target.with_name("." + target.name + ".rollback")
-    candidates_present = _path_exists(refresh) or _path_exists(staging)
+    candidates_present = path_exists(refresh) or path_exists(staging)
     backups_present = (
-        _path_exists(archive_backup) or _path_exists(game_backup)
+        path_exists(archive_backup) or path_exists(game_backup)
     )
     if not candidates_present and not backups_present:
         return
@@ -167,8 +163,8 @@ def _recover_interrupted_game_refresh(archive, target, refresh, staging):
     if backups_present and not candidates_present and active_complete:
         # Both candidates reached their active names; only cleanup was cut
         # short. Keep the new pair and retire the old rollback paths.
-        _remove_path(archive_backup)
-        _remove_path(game_backup)
+        remove_path(archive_backup)
+        remove_path(game_backup)
         return
 
     # In every other interrupted state, prefer the known-old rollback pair.
@@ -176,18 +172,18 @@ def _recover_interrupted_game_refresh(archive, target, refresh, staging):
     # ``staging`` is created, so a missing staging name alone does not prove
     # that the game candidate was promoted. Deleting the active game in that
     # ambiguous download/activation window would lose a valid installation.
-    if _path_exists(archive_backup):
-        _remove_path(archive)
+    if path_exists(archive_backup):
+        remove_path(archive)
         archive_backup.replace(archive)
 
-    if _path_exists(game_backup):
-        _remove_path(target)
+    if path_exists(game_backup):
+        remove_path(target)
         game_backup.replace(target)
 
-    _remove_path(refresh)
-    _remove_path(staging)
-    _remove_path(archive_backup)
-    _remove_path(game_backup)
+    remove_path(refresh)
+    remove_path(staging)
+    remove_path(archive_backup)
+    remove_path(game_backup)
 
 
 def _activate_game_refresh(staged_archive, archive, staged_game, target):
@@ -199,14 +195,14 @@ def _activate_game_refresh(staged_archive, archive, staged_game, target):
     # alongside a complete active path is only stale cleanup residue.
     for active, backup in (
             (archive, archive_backup), (target, game_backup)):
-        if _path_exists(backup):
-            if _path_exists(active):
-                _remove_path(backup)
+        if path_exists(backup):
+            if path_exists(active):
+                remove_path(backup)
             else:
                 backup.replace(active)
 
-    had_archive = _path_exists(archive)
-    had_game = _path_exists(target)
+    had_archive = path_exists(archive)
+    had_game = path_exists(target)
     archive_backed_up = False
     game_backed_up = False
     try:
@@ -231,10 +227,10 @@ def _activate_game_refresh(staged_archive, archive, staged_game, target):
                 # old path was moved aside, discard any candidate before
                 # putting the backup back.
                 if backed_up or not had_active:
-                    if _path_exists(active):
-                        _remove_path(active)
+                    if path_exists(active):
+                        remove_path(active)
                 if backed_up:
-                    if not _path_exists(backup):
+                    if not path_exists(backup):
                         raise OSError(f"rollback backup missing: {backup}")
                     backup.replace(active)
             except Exception as rollback_exc:
@@ -248,9 +244,9 @@ def _activate_game_refresh(staged_archive, archive, staged_game, target):
         raise
     else:
         for backup in (archive_backup, game_backup):
-            if _path_exists(backup):
+            if path_exists(backup):
                 try:
-                    _remove_path(backup)
+                    remove_path(backup)
                 except OSError as exc:
                     # Both validated candidates are already active. Keep the
                     # harmless rollback for recovery instead of rejecting them.
@@ -297,16 +293,16 @@ def download_game(ver, progress=None, force=False):
             # With no complete active game there is nothing to preserve, and
             # retaining the now-invalid cache would make every retry fail
             # before download() gets a chance to fetch the replacement.
-            _remove_path(zp)
+            remove_path(zp)
             info(
                 f"Cached Minecraft {ver['tag']} archive no longer matches "
                 "the published asset; downloading it again."
             )
     if force:
         refresh_part = refresh.with_suffix(refresh.suffix + ".part")
-        _remove_path(refresh)
-        _remove_path(refresh_part)
-        _remove_path(staging)
+        remove_path(refresh)
+        remove_path(refresh_part)
+        remove_path(staging)
         preserve_transaction = False
         info(f"Refreshing Minecraft {ver['tag']} archive "
              f"(~{ver['size']>>20} Mio) …")
@@ -351,10 +347,10 @@ def download_game(ver, progress=None, force=False):
             # Download/extract failures have not touched active data, so their
             # candidates are disposable. After an activation exception they
             # are recovery state and must survive until the next invocation.
-            _remove_path(refresh_part)
+            remove_path(refresh_part)
             if not preserve_transaction:
-                _remove_path(refresh)
-                _remove_path(staging)
+                remove_path(refresh)
+                remove_path(staging)
         root = dest / relative_root
         ok(f"Minecraft {ver['tag']} installed")
         return root
@@ -368,7 +364,7 @@ def download_game(ver, progress=None, force=False):
         # This non-transactional path is used only when no complete game is
         # active. Never retain a freshly downloaded archive whose published
         # digest failed, otherwise all later retries would reuse it forever.
-        _remove_path(zp)
+        remove_path(zp)
         raise
     info(f"{'Reinstalling' if root else 'Installing'} Minecraft "
          f"{ver['tag']} …")

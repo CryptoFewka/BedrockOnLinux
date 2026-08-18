@@ -268,6 +268,15 @@ if [[ -n "$WINEGDK_PREFIX" ]]; then
 else
   WINEGDK_BUILD_RECORD="$ENGINE_DIR/files/.bol-winegdk-build.env"
   WINEGDK_PACKAGE_VERSIONS="$ENGINE_DIR/files/.bol-winegdk-package-versions.tsv"
+  # A published engine keeps those records beside its embedded provenance
+  # rather than at the root of files/, which is where a freshly built prefix
+  # leaves them. Repackaging one to change only the vkd3d payload must find
+  # them there; both copies are checked against the pinned WineGDK commit and
+  # source manifest below either way.
+  if [[ ! -f "$WINEGDK_BUILD_RECORD" ]]; then
+    WINEGDK_BUILD_RECORD="$ENGINE_DIR/$WINEGDK_PROVENANCE_REL/.bol-winegdk-build.env"
+    WINEGDK_PACKAGE_VERSIONS="$ENGINE_DIR/$WINEGDK_PROVENANCE_REL/.bol-winegdk-package-versions.tsv"
+  fi
 fi
 PROVENANCE_FILES=(
   COPYING.LGPL-2.1
@@ -275,6 +284,7 @@ PROVENANCE_FILES=(
   submodules.lock
   OUTPUT-SHA256SUMS
   restore-nv-dgc.patch
+  fix-occluded-frame-latency.patch
 )
 WINEGDK_R12_PROVENANCE_FILES=(
   README.md
@@ -289,6 +299,7 @@ WINEGDK_NATIVE_PROVENANCE_FILES=(
   0003-xgameruntime-use-windows-achievements-token.patch
   0004-combase-implement-context-callback.patch
   0005-winex11-use-client-surface-origin.patch
+  0006-xgameruntime-stop-faking-xstore-answers.patch
 )
 
 verify_sha256() {
@@ -310,17 +321,20 @@ verify_reviewed_provenance() {
     "dc626520dcd53a22f727af3ee42c770e56c97a64fe3adb063799d8ab032fe551" \
     "vkd3d-proton LGPL notice"
   verify_sha256 "$root/provenance.env" \
-    "a2c6f2f6f36c426034d5845aee0c98a6bc07a5a63849b829ab377b89e9319262" \
+    "f46ed5078a90958968ff40c2c9b5caf1c79fb5adaa34ac2a1f5c1c47f5e36e58" \
     "vkd3d-proton provenance lock"
   verify_sha256 "$root/submodules.lock" \
     "19ae5e28d0828ebf911fe99569e4de56328ea39e1a076a11506a78d98c76f3aa" \
     "vkd3d-proton submodule lock"
   verify_sha256 "$root/OUTPUT-SHA256SUMS" \
-    "c64397dec052d7f86f65a0f39d6aecb813d4d1527327fe572cab3e4b59d6ad24" \
+    "09d22ca93ae4b0a2f99294a43cec6a89a2bd92b96dffb14f2fcc5cf66685b3df" \
     "vkd3d-proton output hash lock"
   verify_sha256 "$root/restore-nv-dgc.patch" \
     "91878d389dc0e315f770fa6c7fffea8f78f410a04796c38e2a6410ff0b9b4a33" \
     "vkd3d-proton NV-DGC restoration patch"
+  verify_sha256 "$root/fix-occluded-frame-latency.patch" \
+    "aac04d2bf777345272dec90f48b715d3eaebac7b2890f2b1ece4aa8daffc3465" \
+    "vkd3d-proton occluded frame-latency fix"
 }
 
 verify_winegdk_source_provenance() {
@@ -335,10 +349,10 @@ verify_winegdk_source_provenance() {
     "ee0543f11737a11f5edec389967bb41482c7f5eda3807c24d171dd6bf6301274" \
     "WineGDK r12 source delta"
   verify_sha256 "$native_root/README.md" \
-    "024273361c23c92f1ddce82d47e064ee466025c15935173ec440bbc2fa1f2a2c" \
+    "04bbe7412e66e61dac3be4f1ec2eeda1590d9bfb184bece8575eca4c5d9377b6" \
     "WineGDK native5 source-delta README"
   verify_sha256 "$native_root/SOURCE-SHA256SUMS" \
-    "2dc69fe66823ab29cc3fd54b92605d9f9149eb8006486c0e7450192b2857cbb6" \
+    "642486a98b1985395e0a704bca76fbfa2124ee1de97d1d8c671213790b9bbd29" \
     "WineGDK native5 source hash lock"
   verify_sha256 \
     "$native_root/0001-winegdk-native5-Xbox-and-file-picker-runtime.patch" \
@@ -360,6 +374,10 @@ verify_winegdk_source_provenance() {
     "$native_root/0005-winex11-use-client-surface-origin.patch" \
     "464da914667bd9c683fb79bc7c2a4477546a73060c66f29809cfa93783cbc1c8" \
     "WineGDK X11 client-surface geometry backport"
+  verify_sha256 \
+    "$native_root/0006-xgameruntime-stop-faking-xstore-answers.patch" \
+    "0ae38358531a81af9b20a997d73f07b383db68afcd14cf89107dd9442f101fd1" \
+    "WineGDK XStore honest-failure fix"
 }
 
 has_marker() {
@@ -643,6 +661,8 @@ for arch in "${ARCHES[@]}"; do
     echo "!! WineGDK Xbox Achievements token fix missing for $arch" >&2
     exit 1
   }
+  has_text "$xgdk" "no store service available, failing the" || {
+    echo "!! WineGDK XStore honest-failure fix missing for $arch" >&2; exit 1; }
   has_text "$xgdk" "requesting token: method=" || {
     echo "!! WineGDK native XUser request path missing for $arch" >&2; exit 1; }
   has_text "$xgdk" "unsupported GDK QueryApiImpl class" || {
@@ -839,6 +859,7 @@ for relative_root, names in (
         "native5/0003-xgameruntime-use-windows-achievements-token.patch",
         "native5/0004-combase-implement-context-callback.patch",
         "native5/0005-winex11-use-client-surface-origin.patch",
+        "native5/0006-xgameruntime-stop-faking-xstore-answers.patch",
     )),
     (gdk_proton_provenance_root, ("provenance.env",)),
 ):

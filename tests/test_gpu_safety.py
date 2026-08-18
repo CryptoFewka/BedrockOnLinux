@@ -200,8 +200,46 @@ class GraphicsSafetyTests(unittest.TestCase):
                 env,
                 xrandr_runner=xrandr,
                 journal_runner=self.clean_journal,
+                atom_probe=lambda _env: False,
             )
         self.assertIn("zero RandR GPU providers", problem)
+
+    def test_sandboxed_gamescope_is_recognised_without_its_variables(self):
+        # A Flatpak sandbox does not forward GAMESCOPE_WAYLAND_DISPLAY, so in
+        # Steam Deck Game Mode the packaged launcher saw a plain X11 session
+        # with zero RandR providers and refused to start (#127).
+        def xrandr(*_args, **_kwargs):
+            return result("Providers: number : 0\n")
+
+        with mock.patch.object(
+                gpu_safety, "_nvidia_device_with_mesa_glx",
+                side_effect=AssertionError(
+                    "nested Gamescope must not inspect direct-Xorg GLX")):
+            self.assertIsNone(gpu_safety.graphics_safety_problem(
+                {"DISPLAY": ":0", "XDG_SESSION_TYPE": "x11"},
+                xrandr_runner=xrandr,
+                journal_runner=self.clean_journal,
+                atom_probe=lambda _env: True,
+            ))
+
+    def test_root_atoms_are_not_probed_when_the_environment_already_says_so(self):
+        def xrandr(*_args, **_kwargs):
+            return result("Providers: number : 0\n")
+
+        def must_not_run(_env):
+            raise AssertionError("the X server must not be opened needlessly")
+
+        self.assertIsNone(gpu_safety.graphics_safety_problem(
+            {"DISPLAY": ":0", "XDG_SESSION_TYPE": "x11",
+             "GAMESCOPE_WAYLAND_DISPLAY": "gamescope-0"},
+            xrandr_runner=xrandr,
+            journal_runner=self.clean_journal,
+            atom_probe=must_not_run,
+        ))
+
+    def test_root_atom_probe_needs_a_display(self):
+        self.assertFalse(gpu_safety._gamescope_root_atoms({}))
+        self.assertFalse(gpu_safety._gamescope_root_atoms({"DISPLAY": "  "}))
 
     def test_gamescope_only_exempts_a_parsed_zero_provider_result(self):
         def failed(*_args, **_kwargs):
@@ -363,6 +401,30 @@ class GraphicsSafetyTests(unittest.TestCase):
         )
         self.assertIn("did not return cleanly", problem)
         self.assertIn("--acknowledge-gpu-crash", problem)
+
+    def test_same_boot_marker_does_not_advertise_an_impossible_action(self):
+        """A current-boot marker is refused, so the block must say 'reboot'."""
+        self.marker.write_text(json.dumps({
+            "version": gpu_safety._STATE_VERSION,
+            "engine_rev": "wow64-archs-native12",
+            "phase": "running",
+            "token": "1" * 32,
+            "boot_id": "boot-now",
+            "launcher_pid": 424242,
+            "created": 1,
+        }))
+
+        problem = gpu_safety.graphics_safety_problem(
+            {"XDG_SESSION_TYPE": "wayland"},
+            journal_runner=self.clean_journal,
+        )
+        status = gpu_safety.gpu_safety_acknowledgement_status(
+            journal_runner=self.clean_journal)
+
+        self.assertFalse(status.can_acknowledge)
+        self.assertIn("during this boot", problem)
+        self.assertIn("cannot be acknowledged", problem)
+        self.assertIn("only clears it after that reboot", problem)
 
     def test_torn_hard_reboot_marker_is_still_blocking(self):
         self.marker.write_text("{torn")
@@ -650,6 +712,59 @@ class GraphicsSafetyTests(unittest.TestCase):
             with self.assertRaisesRegex(gpu_safety.BolError,
                                         "did not start Wine"):
                 gpu_safety.require_safe_graphics_session({})
+
+
+class AcknowledgementGuidanceTests(unittest.TestCase):
+    """The blocking message must name a command this installation can run."""
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.root = Path(self.tempdir.name)
+        self.marker = self.root / "gpu-launch.json"
+        self.marker.write_text(json.dumps({
+            "version": gpu_safety._STATE_VERSION,
+            "engine_rev": "wow64-archs-native12",
+            "token": "1" * 32,
+            "boot_id": "boot-before-power-loss",
+            "launcher_pid": 424242,
+            "created": 1,
+        }))
+
+    def problem(self, packaged_command):
+        calls = []
+
+        def fake_launcher_command(*arguments):
+            calls.append(arguments)
+            return packaged_command + " " + " ".join(arguments)
+
+        with mock.patch.object(gpu_safety, "GPU_LAUNCH_MARKER", self.marker), \
+                mock.patch.object(gpu_safety, "_boot_id",
+                                  return_value="boot-now"), \
+                mock.patch.object(gpu_safety, "launcher_command",
+                                  fake_launcher_command):
+            return gpu_safety.interrupted_launch_problem(), calls
+
+    def test_guidance_uses_the_packaging_aware_invocation(self):
+        problem, calls = self.problem(
+            "/home/p/BedrockOnLinux-2.1.1-x86_64.AppImage")
+        self.assertIn(
+            "/home/p/BedrockOnLinux-2.1.1-x86_64.AppImage doctor "
+            "--acknowledge-gpu-crash",
+            problem,
+        )
+        self.assertNotIn("'bedrock-on-linux doctor", problem)
+        self.assertEqual(
+            calls, [("doctor", "--acknowledge-gpu-crash")])
+
+    def test_flatpak_guidance_is_runnable(self):
+        problem, _calls = self.problem(
+            "flatpak run io.github.wyze3306.BedrockOnLinux")
+        self.assertIn(
+            "flatpak run io.github.wyze3306.BedrockOnLinux doctor "
+            "--acknowledge-gpu-crash",
+            problem,
+        )
 
 
 if __name__ == "__main__":

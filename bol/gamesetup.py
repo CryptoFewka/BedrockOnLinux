@@ -19,7 +19,7 @@ from .prefix import (
     shared_assets_lock,
 )
 from .proton import ensure_proton
-from .util import load_settings, mkdirs
+from .util import launcher_owned_overrides, load_settings, mkdirs
 from .winegdk import ensure_winegdk
 
 def do_setup(game_dir=None, mc_ver=None, proton_tag=None, force=False,
@@ -67,9 +67,13 @@ _DIAG_RULES = [
      r"Cannot implement command signature|"
      r"d3d12_command_signature_create: Device generated commands is not "
      r"supported by implementation",
-     "The installed engine cannot run Minecraft's ExecuteIndirect menu path "
-     "on this Vulkan driver — install the current compatibility engine "
-     "('bedrock-on-linux setup --force')."),
+     "Minecraft's menu needs Vulkan Device Generated Commands (DGC), which "
+     "this GPU/driver did not provide. Reinstall the engine first — it is "
+     "the common cause and the safe fix ('bedrock-on-linux setup --force'). "
+     "If that changes nothing, the GPU/driver itself cannot provide DGC: on "
+     "an Intel discrete GPU it is exposed only under the 'xe' kernel driver, "
+     "not 'i915'; otherwise update your Vulkan driver or use a DGC-capable "
+     "GPU."),
     (r"Unimplemented function\s+combase\.dll\.RoOriginateErrorW?\b",
      "combase patch missing — re-run 'Install / Update'."),
     (r"Unimplemented function\s+ntdll\.dll\.NtQueryWnfStateData\b",
@@ -88,6 +92,17 @@ _DIAG_RULES = [
     (r"wineserver.*version mismatch|wineserver binary was not upgraded",
      "Broken WineGDK packaging (wine vs wineserver mismatch) — rebuild the "
      "engine: 'bedrock-on-linux setup --force'."),
+    # Wine only prints these when it is about to hand the process to the crash
+    # debugger, so they are the game's own fatal fault rather than a first-
+    # chance exception. Without this rule the launcher reported "No known
+    # cause" for a reproducible crash (issues #115, #116, #129, #132).
+    (r"wine: Unhandled page fault on \w+ access to [0-9A-Fa-f]+ at address|"
+     r"wine: Unhandled exception 0xc0000005",
+     "Minecraft itself crashed with a memory access violation (unhandled page "
+     "fault) — the launcher, the Wine prefix and the GPU driver are not the "
+     "failing component, so repairing the prefix does not change it. Note the "
+     "faulting address and the engine revision from proton.log, try another "
+     "Minecraft version, and attach both to a bug report."),
     (r"Authentication failed|invalid_grant|login.*failed",
      "Microsoft sign-in failed in-game — sign in again "
      "(open the link, enter the code)."),
@@ -117,7 +132,9 @@ _DIAG_RULES = [
      r"forward 'cryptbase\.SystemFunction036'|"
      r"module not found for forward 'cryptbase",
      "Wine RNG unresolved (cryptbase.SystemFunction036) — re-run "
-     "'Install / Update'; setup seeds the verified native RNG before wineboot."),
+     "'Install / Update'; setup seeds the verified native RNG before wineboot "
+     "and reinstalls it once if the prefix still aborts. Connect to the "
+     "network for that download if the message persists."),
     (r"nodrv_CreateWindow|no driver could be loaded|"
      r"explorer process failed to start",
      "Wine prefix broken (Wine couldn't open a window)."),
@@ -196,12 +213,29 @@ def diagnose():
     )
     if lacks_vulkan_13 and no_dxvk_adapter and not software_only:
         hits.append("DXVK found no usable Vulkan 1.3 adapter — choose the "
-                    "Legacy compatibility renderer (WineD3D/DXVK fallback; "
-                    "renderer=opengl) in Settings for GPUs whose Vulkan "
-                    "driver cannot provide Vulkan 1.3.")
+                    "Legacy compatibility renderer (renderer=opengl) in "
+                    "Settings for GPUs whose Vulkan driver cannot provide "
+                    "Vulkan 1.3. It is a last resort: it swaps the whole "
+                    "Direct3D stack, D3D12 included, to WineD3D, so both "
+                    "DXVK and vkd3d-proton are dropped. Minecraft renders "
+                    "exclusively through D3D12, so expect visual artifacts "
+                    "and no ray tracing.")
+    # Check the field itself, not the log: an override that breaks the launch
+    # can leave nothing in the log to match on, which is how issue #134 ended
+    # in three full reinstalls.
+    overrides = launcher_owned_overrides(load_settings().get("custom_env"))
+    if overrides:
+        hits.append("Custom environment variables override launcher "
+                    "settings: %s. Clear the Advanced custom-environment "
+                    "field and launch again before reinstalling anything — "
+                    "PROTON_USE_WINED3D forces the legacy renderer, which "
+                    "Minecraft's menu can crash on. Use the Renderer setting "
+                    "instead." % ", ".join(overrides))
     if not msa_signed_in():
-        hits.append("No Microsoft account linked — click 'Sign in' "
-                    "before PLAY.")
+        hits.append("No Microsoft account linked — the game runs, but in "
+                    "offline mode: single-player worlds and LAN play only. "
+                    "Click 'Sign in' before PLAY for Realms, servers, the "
+                    "Marketplace and Xbox friends.")
     if hits:
         warn("Likely cause:")
         for h in dict.fromkeys(hits):

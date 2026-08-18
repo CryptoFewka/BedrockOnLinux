@@ -222,19 +222,22 @@ def test_xdg_migration_refuses_isolated_profiles_without_splitting_roots(
     assert (profile / "games").resolve() == (old_data / "games").resolve()
 
 
+def _staging_leftovers(destination):
+    return sorted(destination.parent.glob(
+        f".{destination.name}.xdg-migration-*"
+    ))
+
+
 def test_transactional_copy_cleans_partial_staging_after_copy_failure(
         tmp_path, monkeypatch):
     source = tmp_path / "source"
     destination = tmp_path / "destination"
     source.mkdir()
     (source / "complete").write_text("source", encoding="utf-8")
-    staging = destination.with_name(
-        f".{destination.name}.xdg-migration-{os.getpid()}"
-    )
 
     def fail_after_partial_copy(_source, partial, **_kwargs):
-        partial.mkdir()
-        (partial / "incomplete").write_text("partial", encoding="utf-8")
+        Path(partial).mkdir(exist_ok=True)
+        (Path(partial) / "incomplete").write_text("partial", encoding="utf-8")
         raise OSError("disk full")
 
     monkeypatch.setattr(xdg_migration.shutil, "copytree",
@@ -243,7 +246,7 @@ def test_transactional_copy_cleans_partial_staging_after_copy_failure(
         xdg_migration._copy_tree_transactionally(source, destination)
 
     assert not destination.exists()
-    assert not staging.exists()
+    assert _staging_leftovers(destination) == []
 
 
 def test_transactional_copy_cleans_staging_after_activation_failure(
@@ -252,9 +255,6 @@ def test_transactional_copy_cleans_staging_after_activation_failure(
     destination = tmp_path / "destination"
     source.mkdir()
     (source / "complete").write_text("source", encoding="utf-8")
-    staging = destination.with_name(
-        f".{destination.name}.xdg-migration-{os.getpid()}"
-    )
 
     def fail_activation(_source, _destination):
         raise OSError("rename failed")
@@ -264,7 +264,54 @@ def test_transactional_copy_cleans_staging_after_activation_failure(
         xdg_migration._copy_tree_transactionally(source, destination)
 
     assert not destination.exists()
-    assert not staging.exists()
+    assert _staging_leftovers(destination) == []
+
+
+def test_transactional_copy_discards_a_stale_staging_tree(tmp_path):
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    (source / "world.dat").write_text("kept", encoding="utf-8")
+    # A killed earlier run (same sandbox PID) left an incomplete copy behind.
+    stale = destination.with_name(
+        f".{destination.name}.xdg-migration-{os.getpid()}"
+    )
+    stale.mkdir()
+    (stale / "incomplete").write_text("partial", encoding="utf-8")
+
+    xdg_migration._copy_tree_transactionally(source, destination)
+
+    assert (destination / "world.dat").read_text(encoding="utf-8") == "kept"
+    assert not (destination / "incomplete").exists()
+    assert not stale.exists()
+    assert _staging_leftovers(destination) == []
+
+
+def test_migration_recovers_from_a_stale_staging_tree(tmp_path):
+    old_data = tmp_path / "legacy"
+    new_data = tmp_path / "xdg" / "bedrock-on-linux"
+    (old_data / "msa").mkdir(parents=True)
+    (old_data / "msa" / "account.json").write_text(
+        '{"gamertag":"kept"}', encoding="utf-8")
+    new_data.parent.mkdir(parents=True)
+    stale = new_data.with_name(
+        f".{new_data.name}.xdg-migration-{os.getpid()}"
+    )
+    (stale / "msa").mkdir(parents=True)
+
+    assert migrate_legacy_flatpak_data(
+        environ={"FLATPAK_ID": "io.github.wyze3306.BedrockOnLinux"},
+        info_path=tmp_path / "no-flatpak-info",
+        old_data=old_data,
+        new_data=new_data,
+        old_umu=tmp_path / "no-old-umu",
+        new_umu=new_data / "umu",
+    )
+
+    assert json.loads(
+        (new_data / "msa" / "account.json").read_text())["gamertag"] == "kept"
+    assert not stale.exists()
+    assert _staging_leftovers(new_data) == []
 
 
 def test_migration_reanchors_game_dir_and_internal_content_link(tmp_path):

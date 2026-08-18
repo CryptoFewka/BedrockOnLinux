@@ -6,7 +6,7 @@ import os
 import re
 import shutil
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .log import die, ok, warn
 from .prefix import _mc_running, active_prefix
@@ -98,6 +98,10 @@ def import_content(src, prefix=None):
         dest = _unique_path(base / sub / _safe_component(stem))
         dest.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(src) as z:
+            for m in z.infolist():
+                p = PurePosixPath(m.filename)
+                if p.is_absolute() or ".." in p.parts:
+                    raise ValueError(f"unsafe path in zip archive: {m.filename}")
             z.extractall(dest)
         kind = "world" if ext == ".mcworld" else "world template"
         results.append(f"{kind}: {dest.name}")
@@ -109,6 +113,10 @@ def import_content(src, prefix=None):
     tmp.mkdir(parents=True, exist_ok=True)
     try:
         with zipfile.ZipFile(src) as z:
+            for m in z.infolist():
+                p = PurePosixPath(m.filename)
+                if p.is_absolute() or ".." in p.parts:
+                    raise ValueError(f"unsafe path in zip archive: {m.filename}")
             z.extractall(tmp)
         manifests = sorted(tmp.rglob("manifest.json"),
                            key=lambda p: len(p.parts))

@@ -62,6 +62,46 @@ class ApplicationPackagingPolicyTests(unittest.TestCase):
                       script)
         self.assertIn('touch -h -d "@$SOURCE_DATE_EPOCH"', script)
 
+    def test_rpm_bundles_the_same_audited_payload_as_the_deb(self):
+        # Fedora-based distributions (Nobara, Bazzite) asked for an .rpm; it
+        # must carry the identical hash-pinned GUI stack the .deb does rather
+        # than a second, quietly diverging closure.
+        script = (ROOT / "scripts/build-rpm.sh").read_text(encoding="utf-8")
+        self.assertIn("--require-hashes --only-binary=:all:", script)
+        self.assertIn("third_party/requirements-deb.txt", script)
+        self.assertIn("-iname 'LICENSE*'", script)
+        self.assertIn("-name '.DS_Store' -delete", script)
+        self.assertIn("-type d -exec chmod 0755", script)
+        self.assertIn("-type f -exec chmod 0644", script)
+        self.assertIn('SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-1782250551}"',
+                      script)
+        self.assertIn('touch -h -d "@$SOURCE_DATE_EPOCH"', script)
+        self.assertIn("usr/share/licenses/bedrock-on-linux/LICENSE", script)
+        # Generated requires would be satisfied by nothing on the target
+        # distributions, so the spec declares every dependency by hand.
+        self.assertIn("AutoReqProv:    no", script)
+        for requirement in ("python3-tkinter", "python3-cryptography",
+                            "/usr/bin/xrandr", "(curl or wget)"):
+            self.assertIn(requirement, script)
+        deb = (ROOT / "scripts/build-deb.sh").read_text(encoding="utf-8")
+        for metadata in ("customtkinter-5.2.2.dist-info",
+                         "darkdetect-0.8.0.dist-info",
+                         "packaging-26.2.dist-info",
+                         "python_xlib-0.33.dist-info",
+                         "six-1.17.0.dist-info"):
+            self.assertIn(metadata, deb)
+            self.assertIn(metadata, script)
+
+    def test_release_pipeline_builds_and_ships_the_rpm(self):
+        build = (ROOT / "scripts/build-release.sh").read_text(encoding="utf-8")
+        self.assertIn('bash "$SRC/scripts/build-rpm.sh"', build)
+        self.assertIn('required_failures+=(".rpm")', build)
+        workflow = (ROOT / ".github/workflows/build-app.yml").read_text(
+            encoding="utf-8")
+        self.assertIn("dpkg-dev rpm ", workflow)
+        # Uploaded to the publish job, attested, and attached to the release.
+        self.assertEqual(workflow.count("dist/bedrock-on-linux-*.rpm"), 3)
+
     def test_zipapp_embeds_license_and_bootstrap_pins_gui_stack(self):
         script = (ROOT / "scripts/build-release.sh").read_text(
             encoding="utf-8")
@@ -130,6 +170,30 @@ class ApplicationPackagingPolicyTests(unittest.TestCase):
             self.assertIn("Exec=bedrock-on-linux gui\n", entry)
             self.assertIn("Terminal=false\n", entry)
             self.assertIn("StartupWMClass=BedrockOnLinux\n", entry)
+
+    def test_desktop_entries_offer_a_launcher_free_play_action(self):
+        for relative in (
+                "data/bedrock-on-linux.desktop",
+                "flatpak/io.github.wyze3306.BedrockOnLinux.desktop"):
+            entry = (ROOT / relative).read_text(encoding="utf-8")
+            self.assertIn("Actions=Play;\n", entry)
+            self.assertIn("[Desktop Action Play]\n", entry)
+            self.assertIn("Exec=bedrock-on-linux play\n", entry)
+            # The action group must follow the main group it belongs to.
+            self.assertLess(entry.index("[Desktop Entry]"),
+                            entry.index("[Desktop Action Play]"))
+
+    def test_packagers_rewrite_the_launcher_exec_without_the_play_action(self):
+        # Both scripts rewrote every Exec= line, which would have redirected
+        # the Play action back into the launcher window.
+        installer = (ROOT / "scripts/install.sh").read_text(encoding="utf-8")
+        self.assertIn(
+            'sed "s|^Exec=bedrock-on-linux |Exec=$BIN/bedrock-on-linux |"',
+            installer)
+        appimage = (ROOT / "scripts/build-appimage.sh").read_text(
+            encoding="utf-8")
+        self.assertIn(
+            "sed '0,/^Exec=/s|^Exec=.*|Exec=bedrock-on-linux gui|'", appimage)
 
 
 class GuiStartupPolicyTests(unittest.TestCase):

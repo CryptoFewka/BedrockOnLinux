@@ -237,6 +237,21 @@ def _clock_check(runner, timeout):
     return NetworkCheck("clock", "host", None, detail)
 
 
+def clock_is_unsynchronized(runner=None, timeout=3.0):
+    """True only when the host positively reports an unsynchronized clock.
+
+    Xbox Live rejects XSTS requests whose signature falls outside the token
+    validity window, so a drifted clock surfaces as an account rejection.
+    Unavailable RTC/NTP information stays False: never blame the clock on a
+    host that could not be asked.
+    """
+
+    try:
+        return _clock_check(runner or subprocess.run, timeout).ok is False
+    except Exception:
+        return False
+
+
 def _virtual_interface_check(runner, timeout):
     try:
         result = _run_read_only(

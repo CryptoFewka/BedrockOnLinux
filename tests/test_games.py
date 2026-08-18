@@ -491,7 +491,7 @@ class GameArchiveTests(unittest.TestCase):
             archive = cache_dir / "Minecraft.zip"
             _write_archive(archive, b"old-build")
             original_replace = Path.replace
-            original_remove = games._remove_path
+            original_remove = games.remove_path
 
             def fresh_download(_url, destination, _label, _progress):
                 _write_archive(Path(destination), b"new-build")
@@ -521,7 +521,7 @@ class GameArchiveTests(unittest.TestCase):
                         Path, "replace", new=fail_archive_activation
                     ), \
                     mock.patch.object(
-                        games, "_remove_path",
+                        games, "remove_path",
                         side_effect=fail_first_game_rollback
                     ), \
                     mock.patch.object(games, "info"), \

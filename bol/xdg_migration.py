@@ -5,10 +5,14 @@ import fcntl
 import json
 import os
 import shutil
+import tempfile
 from pathlib import Path
 
 from .config import APP, DATA, HOME, LEGACY_DATA, UMU_DIR
 from .log import info, warn
+
+
+_STAGING_INFIX = ".xdg-migration-"
 
 
 def is_flatpak(environ=None, info_path=Path("/.flatpak-info")):
@@ -23,19 +27,58 @@ def _directory_is_empty(path):
         return False
 
 
+def _remove_staging_path(path):
+    """Delete one staging path without ever following a directory symlink."""
+    try:
+        if path.is_symlink() or path.is_file():
+            path.unlink(missing_ok=True)
+        elif path.exists():
+            shutil.rmtree(path, ignore_errors=True)
+    except OSError:
+        pass
+
+
+def _discard_stale_staging(destination):
+    """Drop staging trees an interrupted migration could not clean up.
+
+    Activation renames the staging tree onto the destination, so anything left
+    under this name is by construction an incomplete copy this module created
+    and never published.  The caller holds the exclusive migration lock, so no
+    concurrent copy can be using it.  Keeping such a leftover would otherwise
+    make every later start fail — in the Flatpak sandbox the launcher usually
+    receives the same PID, so the old PID-derived staging name collided on
+    every run and the app could never open again.
+    """
+    destination = Path(destination)
+    parent = destination.parent
+    prefix = f".{destination.name}{_STAGING_INFIX}"
+    try:
+        leftovers = [
+            entry for entry in parent.iterdir()
+            if entry.name.startswith(prefix)
+        ]
+    except OSError:
+        return
+    for leftover in leftovers:
+        warn(f"Discarding an interrupted migration copy: {leftover}")
+        _remove_staging_path(leftover)
+
+
 def _copy_tree_transactionally(source, destination, prepare=None):
     """Copy a directory without exposing a half-copied destination."""
     source = Path(source)
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    staging = destination.with_name(
-        f".{destination.name}.xdg-migration-{os.getpid()}"
-    )
-    if staging.exists() or staging.is_symlink():
-        raise RuntimeError(f"stale migration staging path exists: {staging}")
+    _discard_stale_staging(destination)
+    # A unique staging name keeps two launchers (and a reused sandbox PID) from
+    # ever colliding on the same path.
+    staging = Path(tempfile.mkdtemp(
+        prefix=f".{destination.name}{_STAGING_INFIX}",
+        dir=destination.parent,
+    ))
     activated = False
     try:
-        shutil.copytree(source, staging, symlinks=True)
+        shutil.copytree(source, staging, symlinks=True, dirs_exist_ok=True)
         if prepare is not None:
             prepare(staging)
         os.replace(staging, destination)
@@ -43,10 +86,7 @@ def _copy_tree_transactionally(source, destination, prepare=None):
     finally:
         # Remove partial staging trees so ENOSPC remains recoverable.
         if not activated:
-            if staging.is_symlink() or staging.is_file():
-                staging.unlink(missing_ok=True)
-            elif staging.exists():
-                shutil.rmtree(staging, ignore_errors=True)
+            _remove_staging_path(staging)
 
 
 def _reanchor_copied_paths(source, copied_root, settings_bytes,

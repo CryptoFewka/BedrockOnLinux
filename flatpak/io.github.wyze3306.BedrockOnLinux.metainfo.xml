@@ -70,6 +70,66 @@
   </content_rating>
 
   <releases>
+    <release version="2.1.4" date="2026-08-11">
+      <description>
+        <p>Fixes the game freezing when its window is hidden, and makes the
+           launcher reach the game from Steam Deck Game Mode.</p>
+        <ul>
+          <li>keeps the game running when its window is minimized or left on
+              another virtual desktop: it used to come back black and never
+              repaint, and turning on the legacy renderer was the only way
+              out</li>
+          <li>starts the game directly when the launcher is opened in Steam
+              Deck Game Mode, which shows one window at a time, so a single
+              Steam entry reaches Minecraft</li>
+          <li>stops the packaged launcher from refusing to start in Game Mode,
+              where it mistook Gamescope's display for a software renderer</li>
+        </ul>
+      </description>
+    </release>
+    <release version="2.1.3" date="2026-08-09">
+      <description>
+        <p>Restores multi-threaded performance, lets the game start without
+           the launcher window, and plays offline when Xbox Live is
+           unavailable.</p>
+        <ul>
+          <li>builds the engine with Wine's in-process synchronization
+              (ntsync) backend, which had been compiled out: every wait became
+              a wineserver round-trip, so chunk generation stalled, the GPU
+              idled and server tick rates collapsed</li>
+          <li>adds a direct launch shortcut, so Minecraft starts from the
+              desktop, from Steam and from Steam Deck Game Mode without the
+              launcher window in between</li>
+          <li>starts single-player and LAN play when no Microsoft account is
+              linked or Xbox Live cannot be reached, instead of refusing to
+              launch at all</li>
+          <li>ships an <code>.rpm</code> for the Fedora-based distributions
+              and publishes nightly builds again</li>
+        </ul>
+      </description>
+    </release>
+    <release version="2.1.2" date="2026-08-03">
+      <description>
+        <p>Restores Friends worlds over the internet and fixes Microsoft
+           sign-out, the version picker and content importing.</p>
+        <ul>
+          <li>stops forcing a GnuTLS priority file that made Wine negotiate an
+              unsupported TLS 1.3, which broke every in-game connection and
+              left Friends worlds reporting <code>world is full</code> or
+              publishing as LAN-only;</li>
+          <li>names an unsynchronized system clock when Xbox Live rejects the
+              account, instead of blaming the Xbox profile;</li>
+          <li>removes the durable Microsoft refresh token from the Wine prefix
+              on sign-out, and repairs the sign-out button itself;</li>
+          <li>scrolls the version picker with the wheel and places it correctly
+              at 150% and 200% UI scaling;</li>
+          <li>rejects archive members escaping the destination directory when
+              importing add-ons, worlds and templates;</li>
+          <li>recovers an interrupted first-run data migration and a
+              <code>wineboot</code> that cannot resolve the RNG forward.</li>
+        </ul>
+      </description>
+    </release>
     <release version="2.1.1" date="2026-07-26">
       <description>
         <p>Fixes custom-skin selection, the in-game Achievements catalog and

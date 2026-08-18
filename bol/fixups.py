@@ -436,7 +436,7 @@ def bump_stack_reserve(exe: Path, target=0x1000000):
             f.write(struct.pack("<Q", target))
         ok(f"Stack reserve raised {cur // 1024} KB → {target // 1024} KB "
            "(settings/pause crash fix)")
-    except OSError as e:                           # never block a launch over this
+    except (OSError, struct.error, IndexError) as e: # never block a launch over this
         warn(f"Could not raise the stack reserve: {e}")
 
 

@@ -1,4 +1,4 @@
-# Tier 3: build the BedrockOnLinux application artifacts (.deb, AppImage,
+# Tier 3: build the BedrockOnLinux application artifacts (.deb, .rpm, AppImage,
 # portable .pyz, Flatpak) from source, consuming this fork's attested engine and
 # OpenSSL-XCurl set, then attest + publish them. Completes the traceable chain
 # source -> engine/xcurl (attested) -> installable app (attested).
@@ -62,7 +62,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            dpkg-dev patchelf squashfs-tools zsync desktop-file-utils file \
+            dpkg-dev rpm patchelf squashfs-tools zsync desktop-file-utils file \
             python3 python3-pip python3-venv python3-tk \
             build-essential ca-certificates curl xz-utils \
             flatpak flatpak-builder
@@ -127,6 +127,10 @@ jobs:
       - name: Build the application artifacts
         env:
           BOL_APPIMAGE_BUILD_CACHE: ${{ runner.temp }}/appimage-cache
+          # A nightly builds every artifact from the default branch, so its
+          # Flatpak must come from the checkout too — the manifest's pinned tag
+          # is behind that branch between releases.
+          BOL_RELEASE_CHANNEL: ${{ inputs.channel || 'release' }}
         run: |
           scripts/build-release.sh
           echo "VER=$(grep -m1 '^VERSION = ' bol/config.py | cut -d'"' -f2)" >> "$GITHUB_ENV"
@@ -139,6 +143,7 @@ jobs:
           retention-days: 1
           path: |
             dist/bedrock-on-linux_*.deb
+            dist/bedrock-on-linux-*.rpm
             dist/bedrock-on-linux-*.pyz
             dist/BedrockOnLinux-*-x86_64.AppImage
             dist/BedrockOnLinux-*-x86_64.flatpak
@@ -173,6 +178,7 @@ jobs:
         with:
           subject-path: |
             dist/bedrock-on-linux_*.deb
+            dist/bedrock-on-linux-*.rpm
             dist/bedrock-on-linux-*.pyz
             dist/BedrockOnLinux-*-x86_64.AppImage
             dist/BedrockOnLinux-*-x86_64.flatpak
@@ -218,6 +224,62 @@ jobs:
             echo "BOM_XCURL=${xcurl_rev}"
           } >> "$GITHUB_ENV"
 
+          # Release notes = the curated CHANGELOG.md section for this version,
+          # then the bill of materials. GitHub's own "What's Changed" (merged
+          # pull requests + new contributors) is appended by the publish step's
+          # generate_release_notes, so the human-written part never has to
+          # restate it. A release whose section is missing is a packaging bug:
+          # fail here rather than publish the bare boilerplate that used to be
+          # the entire body.
+          # A nightly rolls off whatever "## Unreleased" holds, which is empty
+          # right after a release; only a versioned release must have a section.
+          section="$ver"; required=1
+          if [ "$channel" = "nightly" ]; then section="Unreleased"; required=0; fi
+          python3 - "$section" "$required" CHANGELOG.md release-notes.md <<'PY'
+          import re, sys
+
+          section, required, changelog, out = sys.argv[1:]
+          with open(changelog, encoding="utf-8") as stream:
+              text = stream.read()
+          # "## 2.1.2 — 2026-08-03" or "## Unreleased", up to the next "## ".
+          # The header rest stays on its own line ([^\n]*, never . under
+          # DOTALL), and (?![\w.]) keeps "2.1.1" from matching "2.1.10".
+          pattern = re.compile(
+              r"^## %s(?![\w.])[^\n]*\n(.*?)(?=^## |\Z)" % re.escape(section),
+              re.MULTILINE | re.DOTALL)
+          match = pattern.search(text)
+          body = match.group(1).strip() if match else ""
+          if not body:
+              if required == "1":
+                  raise SystemExit(
+                      f"CHANGELOG.md has no content under '## {section}'; "
+                      "add the section before releasing")
+              body = ("Rolling pre-release built from the default branch. See "
+                      "the commit history for what changed since the last "
+                      "stable release.")
+          with open(out, "w", encoding="utf-8") as stream:
+              stream.write(body + "\n")
+          PY
+          {
+            echo
+            echo "## Build provenance"
+            echo
+            echo "Application artifacts built from source, consuming this"
+            echo "fork's attested, pinned engine and OpenSSL-XCurl set."
+            echo
+            echo "Bill of materials (pinned + reproducible):"
+            echo "- Managed engine: ${eng_rev} (sha256 ${eng_sha})"
+            echo "- WineGDK source: ${wg_commit} (prefix sha256 ${wg_prefix})"
+            echo "- vkd3d-proton: 3.0.1-nv-dgc (output-hashes sha256 ${vkd3d_hashes})"
+            echo "- OpenSSL-XCurl set: ${xcurl_rev}"
+            echo
+            echo "Verify any file with:"
+            echo
+            echo '```'
+            echo "gh attestation verify <file> --repo ${GITHUB_REPOSITORY}"
+            echo '```'
+          } >> release-notes.md
+
       - name: Roll the nightly tag to the current commit
         if: ${{ env.RELEASE_TAG == 'nightly' }}
         run: |
@@ -238,20 +300,14 @@ jobs:
           name: ${{ env.RELEASE_NAME }}
           prerelease: ${{ env.RELEASE_PRERELEASE }}
           make_latest: ${{ env.RELEASE_PRERELEASE == 'false' }}
-          body: |
-            Application artifacts built from source, consuming this fork's
-            attested, pinned engine and OpenSSL-XCurl set.
-
-            Bill of materials (pinned + reproducible):
-            - Managed engine: ${{ env.BOM_ENGINE }}
-            - WineGDK source: ${{ env.BOM_WINEGDK }}
-            - vkd3d-proton: ${{ env.BOM_VKD3D }}
-            - OpenSSL-XCurl set: ${{ env.BOM_XCURL }}
-
-            Verify any file with:
-            gh attestation verify <file> --repo ${{ github.repository }}
+          # Curated CHANGELOG section + bill of materials, written by the
+          # "Compute release metadata" step; generate_release_notes appends
+          # GitHub's merged-pull-request and new-contributor list under it.
+          body_path: release-notes.md
+          generate_release_notes: true
           files: |
             dist/bedrock-on-linux_*.deb
+            dist/bedrock-on-linux-*.rpm
             dist/bedrock-on-linux-*.pyz
             dist/BedrockOnLinux-*-x86_64.AppImage
             dist/BedrockOnLinux-*-x86_64.flatpak

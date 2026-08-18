@@ -419,10 +419,20 @@ class OnlinePreauthPayloadTests(unittest.TestCase):
             root = Path(td)
             msa = root / "msa"
             cache = root / "winegdk-preauth"
+            prefix = root / "pfx"
             msa.mkdir()
             cache.mkdir()
+            prefix.mkdir()
             (msa / "token.json").write_text(
                 json.dumps({"refresh_token": "old-account"}))
+            (prefix / "system.reg").write_text(
+                "WINE REGISTRY Version 2\n"
+                ";; All keys relative to REGISTRY\\Machine\n\n"
+                "[Software\\\\Wine\\\\WineGDK] 1\n"
+                "#time=1\n"
+                '"RefreshToken"="old-account"\n'
+                '"KeepMe"="yes"\n\n'
+            )
             old_payload = self.payload()
             auth._store_online_preauth(cache / "device.json", old_payload)
             key = b"device-private-key"
@@ -432,7 +442,11 @@ class OnlinePreauthPayloadTests(unittest.TestCase):
             (cache / ".device-crash.tmp").write_text("old account tokens")
 
             with mock.patch.object(auth, "DATA", root), \
-                    mock.patch.object(auth, "MSA_DIR", msa):
+                    mock.patch.object(auth, "MSA_DIR", msa), \
+                    mock.patch.object(auth, "active_prefix",
+                                      return_value=prefix), \
+                    mock.patch.object(auth, "prefix_operation_lock"), \
+                    mock.patch("bol.prefix.require_prefix_idle"):
                 self.assertTrue(auth.msa_logout())
 
             self.assertFalse((msa / "token.json").exists())
@@ -442,6 +456,11 @@ class OnlinePreauthPayloadTests(unittest.TestCase):
             self.assertEqual((cache / "device-id.txt").read_text(), device_id)
             self.assertRegex((cache / ".account-epoch").read_text().strip(),
                              r"^[0-9a-f]{32}$")
+            registry = (prefix / "system.reg").read_text()
+            self.assertNotIn('"RefreshToken"=', registry)
+            self.assertIn('"KeepMe"="yes"', registry)
+            self.assertEqual(
+                stat.S_IMODE((prefix / "system.reg").stat().st_mode), 0o600)
 
             # Even if an old cache is restored after a crash, its legacy epoch
             # cannot be consumed by the next account.
@@ -450,6 +469,95 @@ class OnlinePreauthPayloadTests(unittest.TestCase):
                     mock.patch.object(auth, "warn"), \
                     mock.patch.object(auth, "info"):
                 self.assertFalse(auth.xbl_preauth(""))
+
+    def test_logout_registry_failure_preserves_account_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            msa = root / "msa"
+            cache = root / "winegdk-preauth"
+            msa.mkdir()
+            cache.mkdir()
+            token = json.dumps({"refresh_token": "must-survive"})
+            payload = self.payload()
+            epoch = "a" * 32
+            (msa / "token.json").write_text(token)
+            payload["_account_epoch"] = epoch
+            (cache / "device.json").write_text(json.dumps(payload))
+            (cache / ".account-epoch").write_text(epoch + "\n")
+
+            with mock.patch.object(auth, "DATA", root), \
+                    mock.patch.object(auth, "MSA_DIR", msa), \
+                    mock.patch.object(auth, "prefix_operation_lock"), \
+                    mock.patch.object(
+                        auth, "wine_reg_remove_refresh_token",
+                        side_effect=OSError("simulated registry failure")):
+                with self.assertRaisesRegex(
+                        auth.BolError, "Wine prefix; sign-out was cancelled"):
+                    auth.msa_logout()
+
+            self.assertEqual((msa / "token.json").read_text(), token)
+            self.assertTrue((cache / "device.json").is_file())
+            self.assertEqual(
+                (cache / ".account-epoch").read_text(), epoch + "\n")
+
+    def test_logout_lock_failure_changes_no_credential_store(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            msa = root / "msa"
+            msa.mkdir()
+            token = json.dumps({"refresh_token": "must-survive"})
+            (msa / "token.json").write_text(token)
+            registry_clear = mock.Mock()
+            cache_purge = mock.Mock()
+
+            with mock.patch.object(auth, "DATA", root), \
+                    mock.patch.object(auth, "MSA_DIR", msa), \
+                    mock.patch.object(
+                        auth, "prefix_operation_lock",
+                        side_effect=auth.BolError("prefix is active")), \
+                    mock.patch.object(
+                        auth, "wine_reg_remove_refresh_token", registry_clear), \
+                    mock.patch.object(
+                        auth, "_purge_account_preauth", cache_purge):
+                with self.assertRaisesRegex(auth.BolError, "prefix is active"):
+                    auth.msa_logout()
+
+            registry_clear.assert_not_called()
+            cache_purge.assert_not_called()
+            self.assertEqual((msa / "token.json").read_text(), token)
+
+    def test_logout_cache_failure_does_not_restore_registry_token(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            msa = root / "msa"
+            msa.mkdir()
+            (msa / "token.json").write_text(
+                json.dumps({"refresh_token": "still-canonical"}))
+            registry_clear = mock.Mock(return_value=True)
+
+            with mock.patch.object(auth, "DATA", root), \
+                    mock.patch.object(auth, "MSA_DIR", msa), \
+                    mock.patch.object(auth, "prefix_operation_lock"), \
+                    mock.patch.object(
+                        auth, "wine_reg_remove_refresh_token", registry_clear), \
+                    mock.patch.object(
+                        auth, "_purge_account_preauth",
+                        side_effect=OSError("simulated cache failure")):
+                with self.assertRaisesRegex(
+                        auth.BolError, "account cache; sign-out was cancelled"):
+                    auth.msa_logout()
+
+            registry_clear.assert_called_once_with()
+            self.assertTrue((msa / "token.json").is_file())
+
+    def test_remove_registry_token_is_noop_before_prefix_boot(self):
+        with tempfile.TemporaryDirectory() as td:
+            prefix = Path(td) / "not-created"
+            with mock.patch.object(auth, "active_prefix",
+                                   return_value=prefix), \
+                    mock.patch.object(auth, "update_prefix_registry") as update:
+                self.assertTrue(auth.wine_reg_remove_refresh_token())
+            update.assert_not_called()
 
     def test_fallback_rechecks_cache_expiry_after_failed_post(self):
         from datetime import datetime, timezone
@@ -669,8 +777,10 @@ class NativeAuthCancellationTests(unittest.TestCase):
             root = Path(td)
             cache = root / "winegdk-preauth"
             msa = root / "msa"
+            prefix = root / "pfx"
             cache.mkdir()
             msa.mkdir()
+            prefix.mkdir()
             epoch = "a" * 32
             (cache / ".account-epoch").write_text(epoch + "\n")
             native = auth.NativeAuth()
@@ -683,8 +793,15 @@ class NativeAuthCancellationTests(unittest.TestCase):
                 auth.msa_logout()
                 return {"refresh_token": "must-not-survive"}
 
+            # Without an active_prefix() override msa_logout() reaches the
+            # machine's real prefix: it would attempt a registry write on it,
+            # and the failure that follows makes the sign-out fail closed
+            # before it can rotate the generation this test asserts on.
             with mock.patch.object(auth, "DATA", root), \
                     mock.patch.object(auth, "MSA_DIR", msa), \
+                    mock.patch.object(auth, "active_prefix",
+                                      return_value=prefix), \
+                    mock.patch.object(auth, "prefix_operation_lock"), \
                     mock.patch.object(auth, "http_post_form",
                                       side_effect=post), \
                     mock.patch.object(auth.time, "sleep"), \

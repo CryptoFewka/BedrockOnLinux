@@ -3,12 +3,12 @@
 # Two things make this more than a plain Python app:
 #   1. The GUI is Tkinter, which org.freedesktop.Platform does not ship —
 #      a self-contained Tcl + Tk + CPython is bundled.
-#   2. The game runs through umu-launcher → pressure-vessel, a sub-sandbox
-#      created via the Flatpak portal — hence --talk-name=org.freedesktop.Flatpak,
+#   2. The game runs through umu-launcher → pressure-vessel, which builds its
+#      container as a Flatpak sub-sandbox — hence --talk-name=org.freedesktop.Flatpak,
 #      --allow=devel and --allow=multiarch (the Lutris/Bottles/Heroic recipe).
 #
 # Local test build: scripts/build-flatpak.sh (swaps the app source for the
-# working tree). Submission steps + permission rationale: flatpak/README.md.
+# working tree); add --release to build this manifest as published.
 app-id: io.github.wyze3306.BedrockOnLinux
 runtime: org.freedesktop.Platform
 runtime-version: '25.08'
@@ -38,9 +38,21 @@ finish-args:
   # Read-only access to the pre-XDG location for one-time migration. Using the
   # xdg-data alias here would shadow the private XDG destination read-only.
   - --filesystem=~/.local/share/bedrock-on-linux:ro
-  # umu/pressure-vessel spawns its Steam Linux Runtime sub-sandbox through the
-  # Flatpak portal; Wine needs ptrace (devel) and 32-bit code (multiarch)
+  # No launcher code talks to the portal; the caller is the bundled Steam Linux
+  # Runtime. pressure-vessel-wrap sees /.flatpak-info, switches from bubblewrap
+  # to sub-sandbox mode, and its steam-runtime-launch-client then asks for the
+  # container with org.freedesktop.Flatpak.Development.Spawn. Revoking the name
+  # leaves the GUI, downloads and sign-in working and breaks only the game
+  # launch, which is what makes the permission look unused (issue #157).
+  # Check it with:
+  #   flatpak run --command=gdbus io.github.wyze3306.BedrockOnLinux call \
+  #     --session --dest org.freedesktop.Flatpak \
+  #     --object-path /org/freedesktop/Flatpak/Development \
+  #     --method org.freedesktop.DBus.Peer.Ping
+  # That prints "()"; adding --no-talk-name=org.freedesktop.Flatpak before
+  # --command turns it into ServiceUnknown, which is the failure users see.
   - --talk-name=org.freedesktop.Flatpak
+  # Wine needs ptrace (devel) and 32-bit code (multiarch)
   - --allow=devel
   - --allow=multiarch
 
@@ -196,5 +208,5 @@ modules:
       #   git rev-parse vX.Y.Z^{commit}
       - type: git
         url: https://github.com/Wyze3306/BedrockOnLinux.git
-        tag: v2.0.0
-        commit: 6e929009f43deb0c35730ac5f0031ac179e7f53e
+        tag: v2.1.4
+        commit: 2605b04ecd21250f7c550add56a56003b4fa824a

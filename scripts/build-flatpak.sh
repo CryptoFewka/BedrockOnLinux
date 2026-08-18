@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Build the BedrockOnLinux Flatpak.
 #
-#   scripts/build-flatpak.sh             # local dev: app module = working tree
+#   scripts/build-flatpak.sh             # local dev + nightly candidate: the
+#                                        # app module is this working tree
 #   scripts/build-flatpak.sh --resolve-only  # generate/check local manifest only
 #   scripts/build-flatpak.sh --release   # exact Flathub manifest (needs the
-#                                        # git tag referenced in the manifest)
+#                                        # git tag referenced in the manifest,
+#                                        # and a checkout equal to it)
 #
 # Output: dist/BedrockOnLinux-<ver>-x86_64.flatpak. Uses the flatpak-builder
 # binary if present, else the no-root org.flatpak.Builder Flatpak.
@@ -74,14 +76,29 @@ else
   # Local build: swap the app module's pinned git source for this working tree.
   python3 -c 'import yaml' 2>/dev/null || {
     echo "needs PyYAML (e.g. sudo apt install python3-yaml)" >&2; exit 1; }
-  python3 - "$MANIFEST" "$DEV_MANIFEST" "$SRC" <<'PY'
+  # Composing AppStream metadata needs appstreamcli; a plain dev host may have
+  # no such helper, but CI and org.flatpak.Builder do. Keep the metainfo
+  # whenever it can actually be composed, so a candidate bundle built from the
+  # working tree carries the same store metadata as the released one.
+  # BOL_FLATPAK_APPSTREAM=0/1 overrides the probe.
+  case "${BOL_FLATPAK_APPSTREAM:-auto}" in
+    auto) APPSTREAM="no"; command -v appstreamcli >/dev/null && APPSTREAM="yes" ;;
+    0) APPSTREAM="no" ;;
+    1) APPSTREAM="yes" ;;
+    *)
+      echo "BOL_FLATPAK_APPSTREAM must be 0, 1 or unset" >&2
+      exit 2
+      ;;
+  esac
+  python3 - "$MANIFEST" "$DEV_MANIFEST" "$SRC" "$APPSTREAM" <<'PY'
 import ast
 from pathlib import Path
 import sys
 import yaml
 
-src, dst, checkout = sys.argv[1:]
+src, dst, checkout, appstream = sys.argv[1:]
 checkout = Path(checkout).resolve()
+keep_metainfo = appstream == "yes"
 with open(src, encoding="utf-8") as source:
     manifest = yaml.safe_load(source)
 
@@ -108,6 +125,9 @@ required = [
     checkout / "data/icon.png",
     checkout / "flatpak/io.github.wyze3306.BedrockOnLinux.desktop",
 ]
+if keep_metainfo:
+    required.append(
+        checkout / "flatpak/io.github.wyze3306.BedrockOnLinux.metainfo.xml")
 for path in required:
     if not path.exists():
         raise SystemExit(f"local Flatpak source missing: {path}")
@@ -126,15 +146,22 @@ app["sources"] = [
     {"type": "file", "path": "io.github.wyze3306.BedrockOnLinux.desktop",
      "dest": "flatpak"},
 ]
-# Drop the metainfo in dev: flatpak-builder would run appstream compose, whose
-# /usr/libexec helper is not on a plain host. It is validated separately.
-app["build-commands"] = [command for command in app["build-commands"]
-                         if "metainfo" not in command]
+if keep_metainfo:
+    app["sources"].append(
+        {"type": "file",
+         "path": "io.github.wyze3306.BedrockOnLinux.metainfo.xml",
+         "dest": "flatpak"})
+else:
+    # Without appstreamcli, flatpak-builder's appstream compose stage fails on
+    # a plain host. Drop the metainfo there; it is validated separately.
+    app["build-commands"] = [command for command in app["build-commands"]
+                             if "metainfo" not in command]
 with open(dst, "w", encoding="utf-8") as output:
     yaml.safe_dump(manifest, output, sort_keys=False)
 print(f"local manifest -> {dst}")
 print(f"  VERSION={metadata['VERSION']}  "
-      f"WINEGDK_BUILD_REV={metadata['WINEGDK_BUILD_REV']}")
+      f"WINEGDK_BUILD_REV={metadata['WINEGDK_BUILD_REV']}  "
+      f"metainfo={'kept' if keep_metainfo else 'dropped (no appstreamcli)'}")
 PY
   BUILD_MANIFEST="$DEV_MANIFEST"
 fi

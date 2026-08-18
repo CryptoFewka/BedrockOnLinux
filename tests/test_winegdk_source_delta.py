@@ -35,6 +35,9 @@ ACHIEVEMENTS_PATCH = (
 CONTEXT_CALLBACK_PATCH = (
     DELTA / "0004-combase-implement-context-callback.patch"
 )
+XSTORE_PATCH = (
+    DELTA / "0006-xgameruntime-stop-faking-xstore-answers.patch"
+)
 SOURCE_SUMS = DELTA / "SOURCE-SHA256SUMS"
 CHANGED_FILES = {
     "dlls/combase/combase.c",
@@ -60,6 +63,9 @@ CHANGED_FILES = {
     "dlls/xgameruntime/GDKComponent/System/User/DeviceAuth.h",
     "dlls/xgameruntime/GDKComponent/System/User/Token.c",
     "dlls/xgameruntime/GDKComponent/System/User/Token.h",
+    "dlls/xgameruntime/GDKComponent/System/Threading/XAsync.c",
+    "dlls/xgameruntime/GDKComponent/System/Threading/XAsync.h",
+    "dlls/xgameruntime/GDKComponent/System/XStore.c",
     "dlls/xgameruntime/GDKComponent/InitInternalGDKC.c",
     "dlls/xgameruntime/GDKComponent/System/XGame.c",
     "dlls/xgameruntime/GDKComponent/System/XSystem.c",
@@ -116,6 +122,10 @@ class WineGdkSourceDeltaTests(unittest.TestCase):
             self._constant("VENDORED_CLIENT_SURFACE_PATCH_SHA256"),
         )
         self.assertEqual(
+            hashlib.sha256(XSTORE_PATCH.read_bytes()).hexdigest(),
+            self._constant("VENDORED_XSTORE_PATCH_SHA256"),
+        )
+        self.assertEqual(
             hashlib.sha256(SOURCE_SUMS.read_bytes()).hexdigest(),
             self._constant("SOURCE_SHA256SUMS_SHA256"),
         )
@@ -134,11 +144,12 @@ class WineGdkSourceDeltaTests(unittest.TestCase):
         followup = FOLLOWUP_PATCH.read_text()
         achievements = ACHIEVEMENTS_PATCH.read_text()
         context_callback = CONTEXT_CALLBACK_PATCH.read_text()
+        xstore = XSTORE_PATCH.read_text()
         self.assertTrue(text.startswith(f"From {WINEGDK_SOURCE_COMMIT} "))
         changed = {
             left for left, right in re.findall(
                 r"^diff --git a/(\S+) b/(\S+)$",
-                text + followup + achievements + context_callback,
+                text + followup + achievements + context_callback + xstore,
                 re.MULTILINE,
             )
             if left == right
@@ -329,6 +340,43 @@ class WineGdkSourceDeltaTests(unittest.TestCase):
             ),
         )
 
+        xstore_additions = "\n".join(
+            line[1:] for line in xstore.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        )
+        xstore_deletions = "\n".join(
+            line[1:] for line in xstore.splitlines()
+            if line.startswith("-") and not line.startswith("---")
+        )
+        # Neither store query may fabricate an answer any more: no async is
+        # begun, so the caller's block and its unknown task queue stay untouched.
+        self.assertEqual(xstore_additions.count("E_GAMESTORE_NETWORK_ERROR"), 4)
+        self.assertIn("no store service available, failing the", xstore_additions)
+        for fabricated in (
+            'XAsyncBegin( asyncBlock, NULL, store_QueryGameLicenseAsync',
+            'XAsyncBegin( asyncBlock, NULL, store_QueryAssociatedProductsAsync',
+            'XAsyncComplete( data->async, S_OK, 144 )',
+            'memset( data->buffer, 0, data->bufferSize )',
+            'p[64] = 1;  /* isActive = true */',
+        ):
+            self.assertIn(fabricated, xstore_deletions)
+        for begun in ("XAsyncBegin(", "XAsyncGetResult(", "XAsyncComplete("):
+            self.assertNotIn(begun, xstore_additions)
+        # A queue this DLL does not own may still be the native sidecar's.
+        for routed in (
+            "WineGDKGetNativeThreading",
+            "IXThreadingImpl_XTaskQueueDuplicateHandle",
+            "IXThreadingImpl_XTaskQueueSubmitDelayedCallback",
+            "IXThreadingImpl_XTaskQueueCloseHandle",
+            "stateImpl->queueIsNative = TRUE",
+            "belongs to neither task queue implementation",
+        ):
+            self.assertIn(routed, xstore_additions)
+        self.assertIn(
+            "is not a Wine XTaskQueue, using process queue",
+            xstore_deletions,
+        )
+
         context_additions = "\n".join(
             line[1:] for line in context_callback.splitlines()
             if line.startswith("+") and not line.startswith("+++")
@@ -369,6 +417,11 @@ class WineGdkSourceDeltaTests(unittest.TestCase):
             text.index('apply "$VENDORED_ACHIEVEMENTS_PATCH"'),
             text.index('apply --check "$VENDORED_CONTEXT_CALLBACK_PATCH"'),
         )
+        self.assertIn('apply --check "$VENDORED_XSTORE_PATCH"', text)
+        self.assertLess(
+            text.index('apply "$VENDORED_CLIENT_SURFACE_PATCH"'),
+            text.index('apply --check "$VENDORED_XSTORE_PATCH"'),
+        )
         self.assertNotIn("VENDORED_PICKER_COMPLETION_PATCH", text)
 
     def test_container_builder_applies_hash_locked_followup(self):
@@ -408,6 +461,15 @@ class WineGdkSourceDeltaTests(unittest.TestCase):
         self.assertLess(
             text.index('apply "$VENDORED_ACHIEVEMENTS_PATCH"'),
             text.index('apply --check "$VENDORED_CONTEXT_CALLBACK_PATCH"'),
+        )
+        self.assertIn(
+            'readonly VENDORED_XSTORE_PATCH_SHA256='
+            f'"{hashlib.sha256(XSTORE_PATCH.read_bytes()).hexdigest()}"',
+            text,
+        )
+        self.assertLess(
+            text.index('apply "$VENDORED_CLIENT_SURFACE_PATCH"'),
+            text.index('apply --check "$VENDORED_XSTORE_PATCH"'),
         )
         self.assertNotIn("VENDORED_PICKER_COMPLETION_PATCH", text)
 
@@ -512,6 +574,7 @@ class WineGdkSourceDeltaTests(unittest.TestCase):
             ACHIEVEMENTS_PATCH,
             CONTEXT_CALLBACK_PATCH,
             CLIENT_SURFACE_PATCH,
+            XSTORE_PATCH,
         ):
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
             self.assertIn(digest, text, path.name)
@@ -543,6 +606,10 @@ class WineGdkSourceDeltaTests(unittest.TestCase):
             '"native5/0005-winex11-use-client-surface-origin.patch"',
             text,
         )
+        self.assertIn(
+            '"native5/0006-xgameruntime-stop-faking-xstore-answers.patch"',
+            text,
+        )
         self.assertNotIn("0005-windows.storage", text)
 
         arch_loop = text.index('for arch in "${ARCHES[@]}"; do',
@@ -554,6 +621,13 @@ class WineGdkSourceDeltaTests(unittest.TestCase):
         loop_end = text.index("\ndone", marker)
         self.assertLess(arch_loop, marker)
         self.assertLess(marker, loop_end)
+
+        xstore_marker = text.index(
+            '"no store service available, failing the"',
+            arch_loop,
+        )
+        self.assertLess(arch_loop, xstore_marker)
+        self.assertLess(xstore_marker, loop_end)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@
 import hashlib
 import fcntl
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -28,11 +29,23 @@ from .config import (
     UMU_REPO,
     UMU_RUN_SHA256,
     UMU_VERSION,
+    WINEGDK_BUILD_REV,
     WINEGDK_OUT,
 )
 from .log import BolError, die, info, ok, warn
 from .proton import proton_path
-from .util import download
+from .util import download, sha256_file
+
+# Records the engine revision a managed prefix was last built/refreshed with,
+# so an engine upgrade can refresh the prefix's cached Windows system DLLs
+# instead of running the new runtime against a stale, mixed prefix.
+ENGINE_REV_MARKER = ".bol-engine-rev"
+
+# Engine DLL directory -> prefix system directory it populates.
+_MANAGED_RUNTIME_ARCH_DIRS = (
+    ("files/lib/wine/x86_64-windows", "drive_c/windows/system32"),
+    ("files/lib/wine/i386-windows", "drive_c/windows/syswow64"),
+)
 
 def ensure_umu(force=False):
     binp = UMU_DIR / "umu-run"
@@ -299,24 +312,62 @@ def seed_managed_bootstrap_cryptbase(prefix: Path):
     return _install_cryptbase_in_prefix(pfx)
 
 
-def boot_prefix(prefix=None):
-    """Ensure Wine created system32 and its persistent registry hives."""
-    pfx = Path(prefix or active_prefix())
-    _prepare_managed_prefix_layout(pfx)
-    if prefix_ready(pfx):
-        repair_managed_prefix_user32(pfx)
-        return True
-    # Refuse a known-bad graphics session before Wine can open a device.
-    from .gpu_safety import require_safe_graphics_session
-    require_safe_graphics_session()
-    info("Initialising the Wine prefix (first run) …")
-    native_cryptbase = seed_managed_bootstrap_cryptbase(pfx)
+def repair_bootstrap_cryptbase(prefix: Path):
+    """Fetch the verified RNG payload when missing, then seed it again.
+
+    Only used to recover a wineboot which already aborted on the unresolved
+    ``advapi32.SystemFunction036`` forward: without a usable cryptbase.dll,
+    every Wine service dies on its first RtlGenRandom call and the prefix can
+    never complete.
+    """
+    from .fixups import ensure_openssl_xcurl_set
+    try:
+        ensure_openssl_xcurl_set()
+    except Exception as exc:  # network/IO problems must not mask the retry
+        warn(f"Could not refresh the verified RNG components ({exc}).")
+    return seed_managed_bootstrap_cryptbase(prefix)
+
+
+# Wine resolves advapi32.SystemFunction036 (RtlGenRandom) through cryptbase.
+# Both spellings below mean the same thing: no usable cryptbase.dll, so every
+# wineboot service aborts and the prefix initialisation can only time out.
+_RNG_ABORT_SIGNATURE = re.compile(
+    r"unimplemented function advapi32\.dll\.SystemFunction036|"
+    r"(?:module|function) not found for forward "
+    r"'cryptbase\.SystemFunction036'",
+    re.IGNORECASE,
+)
+
+
+def _log_size(path: Path):
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _wineboot_hit_rng_abort(log_path: Path, offset=0):
+    """Whether this attempt's own log section shows the cryptbase RNG abort.
+
+    An aborting prefix repeats the same lines for its whole timeout, so only
+    the beginning of this attempt's section is needed to recognise it.
+    """
+    try:
+        with log_path.open("rb") as log:
+            log.seek(max(0, offset))
+            section = log.read(4 << 20)
+    except OSError:
+        return False
+    return bool(_RNG_ABORT_SIGNATURE.search(
+        section.decode("utf-8", "replace")))
+
+
+def _run_wineboot(pfx: Path, log_path: Path, native_cryptbase):
+    """Run one ``wineboot -u``; return None, or why it did not complete."""
     cmd, env = proton_umu_cmd("wineboot", prefix=pfx)
     cmd.append("-u")
     env = headless_setup_env(env, native_cryptbase=native_cryptbase)
     env.setdefault("WINEDEBUG", "-all")
-    LOGS.mkdir(parents=True, exist_ok=True)
-    log_path = LOGS / "native-login.log"
     failure = None
     try:
         with log_path.open("a") as log:
@@ -340,19 +391,62 @@ def boot_prefix(prefix=None):
     finally:
         # Offline registry updates require wineboot services to be gone.
         stop_prefix_procs(pfx, grace=5)
+    return failure
+
+
+def boot_prefix(prefix=None):
+    """Ensure Wine created system32 and its persistent registry hives."""
+    pfx = Path(prefix or active_prefix())
+    _prepare_managed_prefix_layout(pfx)
+    if prefix_ready(pfx):
+        if managed_prefix_engine_is_stale(pfx):
+            # The engine changed since this prefix was built; its cached
+            # Windows system DLLs no longer match the managed runtime.
+            refresh_managed_prefix_runtime(pfx)
+            _record_managed_engine_rev_if_managed(pfx)
+        repair_managed_prefix_user32(pfx)
+        return True
+    # Refuse a known-bad graphics session before Wine can open a device.
+    from .gpu_safety import require_safe_graphics_session
+    require_safe_graphics_session()
+    info("Initialising the Wine prefix (first run) …")
+    native_cryptbase = seed_managed_bootstrap_cryptbase(pfx)
+    LOGS.mkdir(parents=True, exist_ok=True)
+    log_path = LOGS / "native-login.log"
+    retried = False
+    while True:
+        attempt_offset = _log_size(log_path)
+        failure = _run_wineboot(pfx, log_path, native_cryptbase)
+        if not failure:
+            end = time.time() + 30
+            while time.time() < end and not prefix_ready(pfx):
+                time.sleep(1)
+            if prefix_ready(pfx):
+                _record_managed_engine_rev_if_managed(pfx)
+                repair_managed_prefix_user32(pfx)
+                return True
+        if retried or not _wineboot_hit_rng_abort(log_path, attempt_offset):
+            break
+        retried = True
+        # The engine's first run creates the prefix from Proton's template and
+        # can replace a file seeded before it existed, so re-seed and retry
+        # once instead of leaving a prefix that can only time out.
+        warn("Wine could not resolve its random-number generator "
+             "(advapi32.SystemFunction036 → cryptbase). Reinstalling the "
+             "verified RNG component and retrying the prefix once.")
+        native_cryptbase = repair_bootstrap_cryptbase(pfx)
+        if not native_cryptbase:
+            warn("No verified cryptbase.dll is available for this prefix. "
+                 "Connect to the network and re-run 'Install / Update' so the "
+                 "online-login components can be downloaded.")
+            break
     if failure:
         warn(f"Wine prefix initialisation failed: wineboot {failure}. "
              f"Details: {log_path}")
         return False
-    end = time.time() + 30
-    while time.time() < end and not prefix_ready(pfx):
-        time.sleep(1)
-    if not prefix_ready(pfx):
-        warn("Wine prefix initialisation finished without valid system.reg, "
-             f"user.reg, and system32 state. Details: {log_path}")
-        return False
-    repair_managed_prefix_user32(pfx)
-    return True
+    warn("Wine prefix initialisation finished without valid system.reg, "
+         f"user.reg, and system32 state. Details: {log_path}")
+    return False
 
 
 def _environ_uses_prefix(environ, prefix):
@@ -385,14 +479,6 @@ def require_prefix_idle(prefix: Path, action="modify the Wine prefix"):
             "this prefix. Close Minecraft or use 'Force stop Minecraft' first."
         )
     return True
-
-
-def _sha256_path(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def repair_managed_prefix_user32(prefix=None):
@@ -438,10 +524,10 @@ def repair_managed_prefix_user32(prefix=None):
             "run Install / Update to rebuild it."
         )
 
-    source_hash = _sha256_path(source)
+    source_hash = sha256_file(source)
     if target.is_file() and not target.is_symlink():
         try:
-            if _sha256_path(target) == source_hash:
+            if sha256_file(target) == source_hash:
                 return False
         except OSError:
             pass
@@ -464,7 +550,7 @@ def repair_managed_prefix_user32(prefix=None):
     staged = Path(staged_name)
     try:
         shutil.copy2(source, staged, follow_symlinks=False)
-        if _sha256_path(staged) != source_hash:
+        if sha256_file(staged) != source_hash:
             raise BolError(
                 "The managed user32.dll repair copy failed integrity checking."
             )
@@ -473,6 +559,162 @@ def repair_managed_prefix_user32(prefix=None):
         staged.unlink(missing_ok=True)
     ok("Managed Wine runtime repaired (user32.dll).")
     return True
+
+
+def _managed_runtime_guards(pfx, engine):
+    """True only for the managed prefix paired with the managed engine."""
+    if os.environ.get("BOL_WINEPREFIX", "").strip():
+        return False
+    if engine is None:
+        return False
+    try:
+        return Path(pfx).resolve(strict=False) == PFX.resolve(strict=False) \
+            and Path(engine).resolve(strict=False) == \
+            WINEGDK_OUT.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return False
+
+
+def _engine_rev_marker(pfx):
+    return Path(pfx) / ENGINE_REV_MARKER
+
+
+def read_managed_engine_rev(pfx):
+    """Return the engine revision recorded in the prefix, or None."""
+    try:
+        return _engine_rev_marker(pfx).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+
+def _write_managed_engine_rev(pfx, rev):
+    try:
+        _engine_rev_marker(pfx).write_text(rev + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _record_managed_engine_rev_if_managed(pfx):
+    if _managed_runtime_guards(pfx, proton_path()):
+        _write_managed_engine_rev(pfx, WINEGDK_BUILD_REV)
+
+
+def managed_prefix_engine_is_stale(prefix=None):
+    """Whether the managed prefix was built by a different engine revision.
+
+    A missing marker counts as stale so installs upgraded in place (whose
+    prefix predates the marker) are refreshed once. Custom prefixes and custom
+    engines are never considered stale and are left untouched.
+    """
+    pfx = Path(prefix or PFX)
+    if not _managed_runtime_guards(pfx, proton_path()):
+        return False
+    return read_managed_engine_rev(pfx) != WINEGDK_BUILD_REV
+
+
+def _dll_differs(source, target):
+    if target.is_symlink() or not target.is_file():
+        return True
+    try:
+        return sha256_file(target) != sha256_file(source)
+    except OSError:
+        return True
+
+
+def _replace_managed_dll(source, target):
+    """Atomically refresh one prefix DLL from the engine; return if changed."""
+    source_hash = sha256_file(source)
+    if target.is_file() and not target.is_symlink():
+        try:
+            if sha256_file(target) == source_hash:
+                return False
+        except OSError:
+            pass
+    backup = target.with_name(target.name + ".bol-runtime-backup")
+    if not (backup.exists() or backup.is_symlink()):
+        if target.is_symlink():
+            backup.symlink_to(os.readlink(target))
+        elif target.exists():
+            if not target.is_file():
+                raise BolError(
+                    "The managed prefix has a non-regular runtime file: "
+                    "%s" % target.name)
+            shutil.copy2(target, backup, follow_symlinks=False)
+    fd, staged_name = tempfile.mkstemp(
+        prefix=".bol-runtime-", dir=target.parent)
+    os.close(fd)
+    staged = Path(staged_name)
+    try:
+        shutil.copy2(source, staged, follow_symlinks=False)
+        if sha256_file(staged) != source_hash:
+            raise BolError(
+                "The managed runtime refresh failed integrity checking for "
+                "%s." % target.name)
+        os.replace(staged, target)
+    finally:
+        staged.unlink(missing_ok=True)
+    return True
+
+
+def refresh_managed_prefix_runtime(prefix=None):
+    """Refresh the managed prefix's Windows system DLLs from the engine.
+
+    An engine upgrade swaps the WineGDK tree but reuses the existing prefix,
+    whose cached system32/syswow64 DLLs were populated by the previous engine.
+    Running the new pure-WoW64 runtime against those stale DLLs faults
+    Minecraft's account/menu path with an unhandled page fault (issue #135).
+    Copy every DLL the current engine ships over the prefix's existing system
+    DLLs, leaving the user profile (drive_c/users — worlds, settings, login)
+    untouched. Only the managed prefix on the managed engine is modified.
+    """
+    engine = proton_path()
+    pfx = Path(prefix or PFX)
+    if not _managed_runtime_guards(pfx, engine):
+        return False
+    if pfx.is_symlink():
+        raise BolError(
+            "The managed Wine prefix is an unsafe symbolic link; "
+            "run Install / Update to rebuild its local layout.")
+    try:
+        resolved_root = pfx.resolve(strict=True)
+        operations = []
+        for engine_rel, prefix_rel in _MANAGED_RUNTIME_ARCH_DIRS:
+            src_dir = Path(engine) / engine_rel
+            dst_dir = pfx / prefix_rel
+            if not src_dir.is_dir() or not dst_dir.is_dir():
+                continue
+            if dst_dir.is_symlink():
+                raise BolError(
+                    "The managed Wine prefix has an unsafe system link; "
+                    "run Install / Update to rebuild it.")
+            dst_dir.resolve(strict=True).relative_to(resolved_root)
+            # Deliberate boundary: only refresh DLLs the prefix ALREADY has.
+            # The engine's windows dir holds Wine's full builtin set; a
+            # prefix's system dir is the subset wineboot installed, and Wine
+            # loads the rest straight from the engine dir. Injecting
+            # engine-only DLLs here would disturb that redirection, so a DLL
+            # the prefix lacks is intentionally left absent (issue #135).
+            for source in sorted(src_dir.glob("*.dll")):
+                target = dst_dir / source.name
+                if (target.exists() or target.is_symlink()) \
+                        and _dll_differs(source, target):
+                    operations.append((source, target))
+    except BolError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise BolError(
+            "The managed Wine prefix has an unsafe system layout; "
+            "run Install / Update to rebuild it.") from exc
+
+    if not operations:
+        return False
+    require_prefix_idle(pfx, "refresh the managed Wine runtime")
+    changed = False
+    for source, target in operations:
+        changed |= _replace_managed_dll(source, target)
+    if changed:
+        ok("Managed Wine runtime refreshed to %s." % WINEGDK_BUILD_REV)
+    return changed
 
 
 def stop_prefix_procs(prefix: Path, grace=5, kill_grace=2):
