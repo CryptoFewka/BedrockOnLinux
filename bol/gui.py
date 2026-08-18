@@ -10,6 +10,7 @@ import subprocess
 import re
 import sys
 import threading
+import urllib.parse
 import zipfile
 from pathlib import Path
 
@@ -71,6 +72,26 @@ _DIALOG_MAX_PHYSICAL_SIZE = (760, 640)
 def _desktop_error(message):
     warn(message)
     desktop_notify(message)
+
+
+def _open_web_url(url):
+    """Hand a link that came from downloaded content to the browser.
+
+    Changelog bodies and the Microsoft device-code response are fetched over
+    the network, so their links are externally controlled. xdg-open dispatches
+    whatever scheme a desktop handler claims, so only the two schemes that mean
+    "a web page" are passed on.
+    """
+    try:
+        scheme = urllib.parse.urlsplit(str(url)).scheme.lower()
+    except ValueError:
+        scheme = ""
+    if scheme not in ("http", "https"):
+        warn(f"Refusing to open a link that is not http(s): {url!r}")
+        return False
+    subprocess.Popen(["xdg-open", str(url)],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return True
 
 
 _X11_SOCKET_NAME = re.compile(r"^X([0-9]+)$")
@@ -1552,9 +1573,8 @@ def gui():
         d.bind("<Escape>", lambda _event: on_close())
         row = ctk.CTkFrame(d, fg_color="transparent")
         row.pack(anchor="center", pady=(24, 8))
-        mkbtn(row, "Sign In to your Microsoft account", lambda: subprocess.Popen(
-            ["xdg-open", url], stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL), kind="primary",
+        mkbtn(row, "Sign In to your Microsoft account",
+            lambda: _open_web_url(url), kind="primary",
             font=font(16, "bold"), height=42, width=280, text_color=T.FG).pack(side="left")
 
         ctk.CTkLabel(d, text="Scan this QR or open the link and enter this code:",
@@ -2911,11 +2931,7 @@ def gui():
                 idx = widget.index(f"@{event.x},{event.y}")
                 for tag in widget.tag_names(idx):
                     if tag.startswith("url:"):
-                        url = tag[4:]
-                        subprocess.Popen(
-                            ["xdg-open", url],
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL)
+                        _open_web_url(tag[4:])
                         break
 
             def on_link_enter(event):
