@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 
 import os
+import signal
+import subprocess
 import tempfile
 import unittest
 from contextlib import ExitStack
@@ -17,7 +19,11 @@ class ReadyLaunchHarness:
     def _exercise_ready_launch(self, root, popen, arm, disarm,
                                prefix_idle=True, mark=None, preauth=True,
                                lock_fds=(), managed_engine=True,
-                               umu_env=None, account=None, on_started=None):
+                               umu_env=None, account=None, on_started=None,
+                               extra_settings=None, environ=None,
+                               diagnosis=(), swap_guard=False,
+                               signed_out=False, notices=None,
+                               editor=False, manifest=None):
         content = root / "content"
         logs = root / "logs"
         data = root / "data"
@@ -25,9 +31,39 @@ class ReadyLaunchHarness:
         logs.mkdir(exist_ok=True)
         data.mkdir(exist_ok=True)
         (content / "Minecraft.Windows.exe").write_bytes(b"MZ")
+        if manifest is not None:
+            (content / "AppxManifest.xml").write_text(manifest,
+                                                      encoding="utf-8")
         settings = {"game_dir": str(content)}
+        settings.update(extra_settings or {})
+        # Discord presence opens a socket of its own: every launch test gets
+        # a stand-in, and the presence tests below assert on what it was told.
+        self.presence = mock.MagicMock()
+        self.presence_calls = []
+        # So does Xbox Live presence, for a better reason: the real one reads
+        # the pre-auth payload of whoever runs the tests and spends the run
+        # posting "active" and "inactive" with their account.
+        self.xbl = mock.MagicMock()
+        self.xbl_calls = []
+        # What touched the settings file, and in which order: the game must
+        # start from a file that has been repaired and set up, and nothing
+        # may rewrite it before the game is gone again (#175).
+        self.options_calls = []
+
+        def record(name, result=None):
+            def side_effect(*args, **kwargs):
+                self.options_calls.append(name)
+                return result
+            return side_effect
+
+        def guard(command, _env):
+            if not swap_guard:
+                return list(command), False
+            return ["systemd-run", "--user", "--scope", "--"] + list(command), \
+                True
+
         patches = (
-            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.dict(os.environ, dict(environ or {}), clear=True),
             mock.patch.object(launch, "CONTENT", content),
             mock.patch.object(launch, "LOGS", logs),
             mock.patch.object(launch, "DATA", data),
@@ -59,18 +95,64 @@ class ReadyLaunchHarness:
             mock.patch.object(launch, "ensure_login_deps"),
             mock.patch.object(launch, "xbl_preauth", return_value=preauth),
             mock.patch.object(launch, "bump_stack_reserve"),
+            mock.patch.object(launch, "hide_signin_button"),
+            mock.patch.object(launch, "apply_branding"),
             mock.patch.object(launch, "proton_umu_cmd",
                               return_value=(["fake-umu"], dict(umu_env or {}))),
-            mock.patch.object(launch, "patch_options"),
-            mock.patch.object(launch, "diagnose", return_value=[]),
+            mock.patch.object(launch, "patch_options",
+                              side_effect=record("patch_options")),
+            mock.patch.object(launch, "snapshot_game_options",
+                              side_effect=record("snapshot")),
+            mock.patch.object(launch, "restore_truncated_game_options",
+                              side_effect=record("restore_truncated", [])),
+            # Neither the machine's own prefix nor its systemd may be reached
+            # from a launch test: the first is a real settings file, the
+            # second would start a real probe scope.
+            mock.patch.object(launch, "find_options_file", return_value=None),
+            mock.patch.object(launch, "set_aside_game_frame_limit",
+                              side_effect=record("set_aside_frame_limit")),
+            mock.patch.object(launch, "restore_game_frame_limits",
+                              side_effect=record("restore_frame_limits", [])),
+            mock.patch.object(launch, "guard_game_command", side_effect=guard),
+            # Nor the machine's own graphics cards.
+            mock.patch.object(launch, "apply_gpu_choice", return_value=None),
+            mock.patch.object(launch, "hybrid_gpu_problem", return_value=None),
+            # Nor a watcher reading the machine's own game settings, nor one
+            # bridging the machine's own virtual desktop setting.
+            mock.patch.object(launch.fullscreen_fix, "start"),
+            mock.patch.object(launch.virtual_desktop, "start"),
+            # Nor the memory of whatever Minecraft Education runs here.
+            mock.patch.object(launch.msal_flights, "start"),
+            mock.patch.object(launch, "seed_default_servers"),
+            # Nor the player's real worlds: a backup is a copy of them.
+            mock.patch.object(launch.saves, "before_launch",
+                              side_effect=self._before_launch),
+            # Nor the real game's resource pack cache.
+            mock.patch.object(launch.packcache, "prune",
+                              return_value=(0, 0)),
+            # Nor the machine's own Steam Linux Runtime, which would build
+            # its locales for real.
+            mock.patch.object(launch.slr_locales, "configure",
+                              side_effect=self._configure_locales),
+            mock.patch.object(launch.saves, "ran_signed_out",
+                              return_value=signed_out),
+            mock.patch.object(launch, "diagnose",
+                              return_value=list(diagnosis)),
             mock.patch.object(launch, "_prefix_stably_idle_after_wrapper",
                               return_value=prefix_idle),
             mock.patch.object(launch, "arm_gpu_launch", side_effect=arm),
+            # Nor the machine's own list of running instances.
+            mock.patch.object(launch, "_open_instance",
+                              side_effect=self._open_instance),
             mock.patch.object(
                 launch, "mark_gpu_wrapper_returned",
                 side_effect=mark or (lambda _token: True)),
             mock.patch.object(launch, "disarm_gpu_launch", side_effect=disarm),
             mock.patch.object(launch.subprocess, "Popen", side_effect=popen),
+            mock.patch.object(launch.discord, "start_session",
+                              side_effect=self._announce_presence),
+            mock.patch.object(launch.xbl_presence, "start_session",
+                              side_effect=self._announce_xbl_presence),
             mock.patch.object(launch, "info"),
             mock.patch.object(launch, "ok"),
             mock.patch.object(launch, "warn"),
@@ -82,11 +164,39 @@ class ReadyLaunchHarness:
             # what the auth steps were told, not only on the launch result.
             self.launch_mocks = {
                 name: getattr(launch, name)
-                for name in ("warn", "wine_reg_set_refresh_token",
-                             "ensure_login_deps", "xbl_preauth")
+                for name in ("warn", "info", "wine_reg_set_refresh_token",
+                             "ensure_login_deps", "xbl_preauth",
+                             "hide_signin_button", "apply_branding",
+                             "msa_refresh", "seed_default_servers",
+                             "_prefix_stably_idle_after_wrapper",
+                             "proton_umu_cmd")
             }
+            self.launch_mocks["msal_flights.start"] = launch.msal_flights.start
             return launch._launch_once(lock_fds=lock_fds,
-                                       on_started=on_started)
+                                       on_started=on_started,
+                                       notices=notices, editor=editor)
+
+    def _open_instance(self, *args, **kwargs):
+        self.instance_calls = getattr(self, "instance_calls", [])
+        self.instance_calls.append((args, kwargs))
+        return launch._InstanceSession()
+
+    def _configure_locales(self, env):
+        self.locales_env = dict(env)
+        env.update(getattr(self, "locales_update", {}))
+        return None
+
+    def _before_launch(self, _settings):
+        self.options_calls.append("before_launch")
+        return "release", "1.26.52.3"
+
+    def _announce_presence(self, *args, **kwargs):
+        self.presence_calls.append((args, kwargs))
+        return self.presence
+
+    def _announce_xbl_presence(self, *args, **kwargs):
+        self.xbl_calls.append((args, kwargs))
+        return self.xbl
 
     def _warnings(self):
         return [str(call.args[0])
@@ -207,6 +317,33 @@ class GraphicsEngineLaunchTests(ReadyLaunchHarness, unittest.TestCase):
         launch._require_vkd3d_config(env, "force_raw_va_cbv")
         self.assertEqual(env["VKD3D_CONFIG"],
                          "force_raw_va_cbv,breadcrumbs")
+
+    def test_ray_tracing_is_on_unless_settings_say_otherwise(self):
+        env = {"VKD3D_CONFIG": "force_raw_va_cbv"}
+        launch._configure_ray_tracing(env, {})
+        self.assertEqual(env["VKD3D_CONFIG"], "force_raw_va_cbv")
+
+    def test_ray_tracing_clears_an_inherited_nodxr(self):
+        # A VKD3D_CONFIG exported by the session must not quietly hide the
+        # Ray Traced graphics mode the switch says is available.
+        env = {"VKD3D_CONFIG": "nodxr;breadcrumbs"}
+        launch._configure_ray_tracing(env, {"ray_tracing": True})
+        self.assertEqual(env["VKD3D_CONFIG"], "breadcrumbs")
+
+    def test_ray_tracing_off_leaves_no_empty_vkd3d_config(self):
+        env = {"VKD3D_CONFIG": "nodxr"}
+        launch._configure_ray_tracing(env, {"ray_tracing": True})
+        self.assertNotIn("VKD3D_CONFIG", env)
+
+    def test_disabled_ray_tracing_keeps_the_other_vkd3d_options(self):
+        env = {"VKD3D_CONFIG": "force_raw_va_cbv"}
+        launch._configure_ray_tracing(env, {"ray_tracing": False})
+        self.assertEqual(env["VKD3D_CONFIG"], "force_raw_va_cbv,nodxr")
+
+    def test_disabled_ray_tracing_is_idempotent(self):
+        env = {"VKD3D_CONFIG": "nodxr,force_raw_va_cbv"}
+        launch._configure_ray_tracing(env, {"ray_tracing": False})
+        self.assertEqual(env["VKD3D_CONFIG"], "nodxr,force_raw_va_cbv")
 
     def test_x11_neutralises_inherited_winewayland_and_enables_noopwr(self):
         env = {"PROTON_ENABLE_WAYLAND": "1"}
@@ -675,6 +812,30 @@ class GraphicsEngineLaunchTests(ReadyLaunchHarness, unittest.TestCase):
                 observed["env"]["DXVK_SHADER_CACHE_PATH"], str(cache))
             self.assertTrue(cache.is_dir())
 
+    def test_launch_hands_ray_tracing_to_the_game_by_default(self):
+        """An inherited nodxr cannot silently remove the Ray Traced mode."""
+        observed = {}
+
+        class Process:
+            @staticmethod
+            def wait(timeout):
+                return 0
+
+        def popen(*_args, **kwargs):
+            observed.update(kwargs)
+            return Process()
+
+        with tempfile.TemporaryDirectory() as td:
+            self._exercise_ready_launch(
+                Path(td),
+                popen,
+                lambda: "owned-token",
+                lambda _token: True,
+                umu_env={"VKD3D_CONFIG": "nodxr"},
+            )
+
+        self.assertEqual(observed["env"]["VKD3D_CONFIG"], "force_raw_va_cbv")
+
     @staticmethod
     def _successful_popen(observed):
         class Process:
@@ -736,6 +897,62 @@ class GraphicsEngineLaunchTests(ReadyLaunchHarness, unittest.TestCase):
         self.launch_mocks["xbl_preauth"].assert_not_called()
         self.launch_mocks["ensure_login_deps"].assert_not_called()
         self.assertNotIn("WINEGDK_PREAUTH_DEVICE", observed["env"])
+
+    def test_education_is_kept_away_from_the_xbox_account(self):
+        """Minecraft Education signs in with a school or work account of its
+        own (#351): the Xbox account, its pre-auth, its presence and the
+        Bedrock title-screen patches have nothing to do with it."""
+        observed = {}
+        manifest = ('<Package><Identity Name="Microsoft.MinecraftEducation'
+                    'Edition" Version="1.26.3300.0" /></Package>')
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(
+                self._exercise_ready_launch(
+                    Path(td), self._successful_popen(observed),
+                    lambda: "owned-token", lambda _token: True,
+                    manifest=manifest,
+                ),
+                0,
+            )
+
+        for name in ("msa_refresh", "wine_reg_set_refresh_token",
+                     "ensure_login_deps", "xbl_preauth",
+                     "hide_signin_button", "apply_branding",
+                     "seed_default_servers"):
+            with self.subTest(step=name):
+                self.launch_mocks[name].assert_not_called()
+        self.assertEqual(self.xbl_calls, [])
+        self.assertNotIn("WINEGDK_PREAUTH_DEVICE", observed["env"])
+        # Not "offline mode": nothing is missing, the game signs in itself.
+        self.assertNotIn("offline mode", "\n".join(self._warnings()))
+        said = [str(call.args[0]) for call
+                in self.launch_mocks["info"].call_args_list if call.args]
+        self.assertIn(launch.EDUCATION_SIGNIN_NOTICE, said)
+        # Its sign-in is kept out of Windows' account broker, which Wine
+        # does not have, for as long as the game runs.
+        start = self.launch_mocks["msal_flights.start"]
+        start.assert_called_once()
+        exe, pids, alive = start.call_args.args
+        self.assertTrue(exe.endswith("Minecraft.Windows.exe"))
+        self.assertTrue(callable(pids) and callable(alive))
+
+    def test_bedrock_still_gets_the_xbox_account_and_its_patches(self):
+        observed = {}
+        manifest = ('<Package><Identity Name="Microsoft.MinecraftUWP" '
+                    'Version="1.26.5203.0" /></Package>')
+        with tempfile.TemporaryDirectory() as td:
+            self._exercise_ready_launch(
+                Path(td), self._successful_popen(observed),
+                lambda: "owned-token", lambda _token: True,
+                manifest=manifest,
+            )
+
+        self.launch_mocks["wine_reg_set_refresh_token"].assert_called_once()
+        self.launch_mocks["xbl_preauth"].assert_called_once()
+        self.launch_mocks["hide_signin_button"].assert_called_once()
+        self.launch_mocks["apply_branding"].assert_called_once()
+        self.launch_mocks["seed_default_servers"].assert_called_once()
+        self.launch_mocks["msal_flights.start"].assert_not_called()
 
     def test_unusable_preauth_payload_is_withheld_from_the_engine(self):
         for preauth, expected in ((True, True), (False, False)):
@@ -886,6 +1103,259 @@ class SingleWindowSessionTests(unittest.TestCase):
             self.assertTrue(launch.single_window_session({}))
 
 
+class SteamGameWindowTaggerTests(unittest.TestCase):
+    """Issue #199: in Game Mode the game window needs Steam's own identity.
+
+    Gamescope attributes a window either from its STEAM_GAME property or by
+    walking the owning process up to Steam's reaper. Started through the
+    Flatpak portal, Minecraft has neither, so the launcher stamps the property
+    on the window itself once the game has opened it.
+    """
+
+    DECK_ENV = {"SteamAppId": "2716672805",
+                "SteamGameId": "11668020851441139712"}
+    GAME_EXE = "/games/1.26.44.3/Minecraft.Windows.exe"
+
+    def _tagger(self, env=None, environ=None, single_window=True, tag=None,
+                clock=None, deadline=180.0):
+        return launch._steam_game_window_tagger(
+            {"DISPLAY": ":1"} if env is None else env,
+            self.GAME_EXE,
+            environ=self.DECK_ENV if environ is None else environ,
+            single_window=single_window,
+            deadline=deadline,
+            clock=(lambda: 0.0) if clock is None else clock,
+            tag=tag)
+
+    def test_the_window_is_tagged_with_the_inherited_application_id(self):
+        calls = []
+
+        def tag(app_id, wm_class, display=None, skip=()):
+            calls.append((app_id, wm_class, display, set(skip)))
+            return (20971521,)
+
+        attempt = self._tagger(tag=tag)
+        with mock.patch.object(launch, "info") as told:
+            self.assertFalse(attempt())
+        self.assertEqual(
+            calls, [("2716672805", "minecraft.windows.exe", ":1", set())])
+        self.assertIn("2716672805", told.call_args[0][0])
+
+    def test_a_window_it_already_tagged_is_never_tagged_twice(self):
+        skips = []
+
+        def tag(_app_id, _wm_class, display=None, skip=()):
+            skips.append(set(skip))
+            return (20971521,) if not skip else ()
+
+        attempt = self._tagger(tag=tag)
+        with mock.patch.object(launch, "info") as told:
+            attempt()
+            attempt()
+            attempt()
+        self.assertEqual(skips, [set(), {20971521}, {20971521}])
+        told.assert_called_once()
+
+    def test_a_window_the_game_replaces_is_tagged_again(self):
+        found = iter([(1,), (), (2,)])
+
+        attempt = self._tagger(tag=lambda *_a, **_k: next(found))
+        with mock.patch.object(launch, "info") as told:
+            for _ in range(3):
+                self.assertFalse(attempt())
+        # Reported once: the second window is the same fact, not a new one.
+        told.assert_called_once()
+
+    def test_it_keeps_watching_until_the_game_opens_its_window(self):
+        found = iter([(), (), (7,)])
+        attempt = self._tagger(tag=lambda *_a, **_k: next(found))
+        with mock.patch.object(launch, "info") as told, \
+                mock.patch.object(launch, "warn") as complained:
+            for _ in range(3):
+                self.assertFalse(attempt())
+        told.assert_called_once()
+        complained.assert_not_called()
+
+    def test_a_launch_that_never_opens_a_window_says_so_once(self):
+        now = [0.0]
+        attempt = self._tagger(tag=lambda *_a, **_k: (), clock=lambda: now[0],
+                               deadline=180.0)
+        with mock.patch.object(launch, "warn") as told:
+            self.assertFalse(attempt())
+            told.assert_not_called()
+            now[0] = 181.0
+            self.assertFalse(attempt())
+            self.assertFalse(attempt())
+        told.assert_called_once()
+        self.assertIn("2716672805", told.call_args[0][0])
+
+    def test_a_window_found_late_is_never_reported_as_missing(self):
+        now = [0.0]
+        found = iter([(), (7,), ()])
+        attempt = self._tagger(tag=lambda *_a, **_k: next(found),
+                               clock=lambda: now[0], deadline=10.0)
+        with mock.patch.object(launch, "info"), \
+                mock.patch.object(launch, "warn") as told:
+            attempt()
+            now[0] = 5.0
+            attempt()
+            now[0] = 60.0
+            attempt()
+        told.assert_not_called()
+
+    def test_a_broken_x_connection_never_takes_the_launch_down(self):
+        def explode(*_args, **_kwargs):
+            raise OSError("display gone")
+
+        attempt = self._tagger(tag=explode)
+        with mock.patch.object(launch, "warn") as told:
+            self.assertTrue(attempt())
+        told.assert_called_once()
+
+    def test_a_launch_steam_did_not_start_is_left_alone(self):
+        for environ in ({}, {"SteamAppId": "0"}, {"SteamAppId": "default"}):
+            with self.subTest(environ=environ):
+                self.assertIsNone(self._tagger(environ=environ))
+
+    def test_an_ordinary_desktop_session_is_left_alone(self):
+        # Nothing there reads STEAM_GAME, and the window is presented anyway.
+        self.assertIsNone(self._tagger(single_window=False))
+
+    def test_a_launch_without_an_x_display_is_left_alone(self):
+        for env in ({}, {"DISPLAY": "  "},
+                    {"DISPLAY": ":1", "PROTON_ENABLE_WAYLAND": "1"}):
+            with self.subTest(env=env):
+                self.assertIsNone(self._tagger(env=env))
+
+    def test_the_session_shape_is_probed_when_the_caller_does_not_say(self):
+        with mock.patch.object(launch, "single_window_session",
+                               return_value=False) as probe:
+            self.assertIsNone(launch._steam_game_window_tagger(
+                {"DISPLAY": ":1"}, self.GAME_EXE, environ=self.DECK_ENV))
+        probe.assert_called_once_with()
+
+
+class SteamWindowTaggingDuringLaunchTests(ReadyLaunchHarness,
+                                          unittest.TestCase):
+    """The tagger runs on the same tick that waits on the game process."""
+
+    GAME_MODE = {"SteamAppId": "2716672805", "DISPLAY": ":1"}
+
+    def _play(self, environ=None, extra_settings=None,
+              gamescope_installed=False, attempts=(False, True)):
+        """One launch whose game process stays up for `len(attempts)` ticks."""
+        self.tagger_calls = []
+        remaining = list(attempts)
+
+        def attempt():
+            self.tagger_calls.append("tried")
+            return remaining.pop(0) if remaining else True
+
+        ticks = [subprocess.TimeoutExpired("umu", 1)] * len(attempts) + [0]
+
+        def popen(*_a, **_kw):
+            proc = mock.Mock()
+
+            def wait(timeout=None):
+                tick = ticks.pop(0)
+                if isinstance(tick, BaseException):
+                    raise tick
+                return tick
+
+            proc.wait.side_effect = wait
+            return proc
+
+        factory = mock.Mock(return_value=attempt)
+        which = (lambda name: "/usr/bin/gamescope"
+                 if gamescope_installed else None)
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(
+                    launch, "_steam_game_window_tagger", factory), \
+                mock.patch.object(launch.shutil, "which", which), \
+                mock.patch.object(launch, "_screen_wh", return_value=None):
+            self._exercise_ready_launch(
+                Path(td), popen,
+                arm=lambda: "owned-token",
+                disarm=lambda _token: True,
+                environ=self.GAME_MODE if environ is None else environ,
+                extra_settings=extra_settings,
+            )
+        return factory
+
+    def test_the_tagger_is_built_from_the_launch_env_and_the_game(self):
+        factory = self._play()
+        env, exe = factory.call_args[0]
+        self.assertEqual(env["DISPLAY"], ":1")
+        self.assertTrue(exe.endswith("Minecraft.Windows.exe"))
+
+    def test_it_is_retried_every_tick_until_it_reports_it_is_finished(self):
+        self._play(attempts=(False, False, True))
+        self.assertEqual(len(self.tagger_calls), 3)
+
+    def test_it_is_not_called_again_once_it_is_finished(self):
+        self._play(attempts=(True, False, False))
+        self.assertEqual(len(self.tagger_calls), 1)
+
+    def test_a_gamescope_of_our_own_owns_its_windows_and_is_left_alone(self):
+        # BOL_GAMESCOPE nests a compositor of our own: the game window lives
+        # on its display, not on the session's, and it needs no Steam identity
+        # to be presented there.
+        factory = self._play(extra_settings={"gamescope": "1"},
+                             gamescope_installed=True)
+        factory.assert_not_called()
+        self.assertEqual(self.tagger_calls, [])
+
+
+class RefusedLicenceLaunchTests(ReadyLaunchHarness, unittest.TestCase):
+    """#280: a launch Microsoft refused a licence for is a failed launch."""
+
+    def _play(self, diagnosis):
+        def popen(*_a, **_kw):
+            proc = mock.Mock()
+            proc.wait.return_value = 0
+            return proc
+
+        with tempfile.TemporaryDirectory() as td:
+            return self._exercise_ready_launch(
+                Path(td), popen,
+                arm=lambda: "owned-token",
+                disarm=lambda _token: True,
+                diagnosis=diagnosis,
+            )
+
+    def test_the_refusal_ends_the_launch_with_its_explanation(self):
+        from bol.gamesetup import LICENCE_REFUSED
+        with self.assertRaises(launch.BolError) as raised:
+            self._play([LICENCE_REFUSED,
+                        "No Microsoft account linked — offline mode."])
+        self.assertEqual(str(raised.exception), LICENCE_REFUSED)
+        self.assertIn("account.microsoft.com/devices/content",
+                      str(raised.exception))
+
+    def test_an_unreachable_licence_ends_the_launch_too(self):
+        from bol.gamesetup import LICENCE_UNREACHABLE
+        with self.assertRaises(launch.BolError) as raised:
+            self._play([LICENCE_UNREACHABLE])
+        self.assertEqual(str(raised.exception), LICENCE_UNREACHABLE)
+
+    def test_a_refused_store_session_ends_the_launch_too(self):
+        from bol.gamesetup import STORE_SESSION_REFUSED
+        with self.assertRaises(launch.BolError) as raised:
+            self._play([STORE_SESSION_REFUSED])
+        self.assertEqual(str(raised.exception), STORE_SESSION_REFUSED)
+
+    def test_a_licence_the_service_refused_ends_the_launch(self):
+        from bol.gamesetup import LICENCE_SERVICE_REFUSED
+        hit = LICENCE_SERVICE_REFUSED + " (HTTP 401). Link it again."
+        with self.assertRaises(launch.BolError) as raised:
+            self._play(["Out of memory (RAM/VRAM).", hit])
+        self.assertEqual(str(raised.exception), hit)
+
+    def test_any_other_diagnosis_leaves_the_launch_to_return(self):
+        self.assertEqual(self._play(["Out of memory (RAM/VRAM)."]), 0)
+        self.assertEqual(self._play([]), 0)
+
+
 class LaunchStartedHookTests(ReadyLaunchHarness, unittest.TestCase):
     """A launcher window steps aside once the game process exists."""
 
@@ -955,7 +1425,66 @@ class LaunchStartedHookTests(ReadyLaunchHarness, unittest.TestCase):
                                   return_value=0) as once:
             lock.return_value.__enter__.return_value = (71, 72)
             self.assertEqual(launch.launch(on_started=hook), 0)
-        once.assert_called_once_with((71, 72), on_started=hook)
+        once.assert_called_once_with((71, 72), on_started=hook,
+                                     notices=None, editor=False,
+                                     hidden=False)
+        # A game starts beside the ones other profiles are running.
+        lock.assert_called_once_with(join=True)
+
+
+class AutoInjectionLaunchTests(ReadyLaunchHarness, unittest.TestCase):
+    """Auto-injection belongs to the launch, not to the window that asked."""
+
+    def _play(self, settings, start_fails=False):
+        events = []
+
+        def popen(*_a, **_kw):
+            events.append("spawned")
+            proc = mock.Mock()
+            proc.wait.side_effect = lambda timeout=None: (
+                events.append("waited") or 0)
+            return proc
+
+        def start(passed):
+            events.append("auto-inject")
+            if start_fails:
+                raise RuntimeError("no thread")
+            self.injected_settings = passed
+            return mock.Mock()
+
+        self.injected_settings = None
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(launch, "start_auto_inject",
+                                  side_effect=start) as started:
+            rc = self._exercise_ready_launch(
+                Path(td), popen,
+                arm=lambda: "owned-token",
+                disarm=lambda _token: True,
+                extra_settings=settings,
+            )
+        return rc, events, started
+
+    def test_a_launcher_free_launch_still_injects(self):
+        """`bol play` is what a direct-launch shortcut and Game Mode run."""
+        rc, events, started = self._play({"injector_auto_enable": True})
+        self.assertEqual(rc, 0)
+        self.assertEqual(events, ["spawned", "auto-inject", "waited"])
+        started.assert_called_once()
+        self.assertTrue(self.injected_settings["injector_auto_enable"])
+
+    def test_the_watcher_is_offered_every_launch_and_declines_by_default(self):
+        rc, events, started = self._play({})
+        self.assertEqual(rc, 0)
+        self.assertEqual(events, ["spawned", "auto-inject", "waited"])
+        self.assertFalse(started.call_args.args[0].get("injector_auto_enable"))
+
+    def test_a_watcher_that_cannot_start_never_aborts_a_running_game(self):
+        rc, events, _started = self._play({"injector_auto_enable": True},
+                                          start_fails=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(events, ["spawned", "auto-inject", "waited"])
+        self.assertTrue(any("Automatic DLL injection" in warning
+                            for warning in self._warnings()))
 
 
 if __name__ == "__main__":
@@ -964,3 +1493,518 @@ if __name__ == "__main__":
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DiscordPresenceLaunchTests(ReadyLaunchHarness, unittest.TestCase):
+    """The play session is announced while the game runs, and only then."""
+
+    class _Process:
+        @staticmethod
+        def wait(timeout):
+            return 0
+
+    def _run(self, **kwargs):
+        with tempfile.TemporaryDirectory() as td:
+            return self._exercise_ready_launch(
+                Path(td), lambda *a, **k: self._Process(),
+                lambda: "token", lambda _token: True, **kwargs)
+
+    def test_the_running_build_is_what_discord_is_told(self):
+        self.assertEqual(
+            self._run(extra_settings={"mc_edition": "preview",
+                                      "mc_version": "1.26.40.1"}), 0)
+        self.assertEqual(len(self.presence_calls), 1)
+        (settings,), kwargs = self.presence_calls[0]
+        self.assertEqual(settings["mc_version"], "1.26.40.1")
+        self.assertEqual(settings["mc_edition"], "preview")
+        self.assertIsInstance(kwargs["started_at"], float)
+
+    def test_the_presence_is_taken_down_when_the_game_returns(self):
+        # Nobody may be left showing as in-game by a launcher that is done
+        # with the game: the teardown after it can take a while.
+        self.assertEqual(self._run(), 0)
+        self.presence.stop.assert_called_once_with()
+
+    def test_a_game_that_never_started_is_never_announced(self):
+        def popen(*_args, **_kwargs):
+            raise OSError("no such file")
+
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(OSError):
+                self._exercise_ready_launch(
+                    Path(td), popen, lambda: "token", lambda _token: True)
+        self.assertEqual(self.presence_calls, [])
+        self.presence.stop.assert_not_called()
+
+    def test_hide_signin_button_invoked_on_launch(self):
+        self.assertEqual(self._run(), 0)
+        self.launch_mocks["hide_signin_button"].assert_called_once()
+
+    def test_branding_applied_to_the_game_on_launch(self):
+        self.assertEqual(self._run(), 0)
+        self.launch_mocks["apply_branding"].assert_called_once()
+
+
+class XboxPresenceLaunchTests(ReadyLaunchHarness, unittest.TestCase):
+    """A signed-in session is published on Xbox Live while the game runs."""
+
+    class _Process:
+        @staticmethod
+        def wait(timeout):
+            return 0
+
+    def _run(self, **kwargs):
+        with tempfile.TemporaryDirectory() as td:
+            return self._exercise_ready_launch(
+                Path(td), lambda *a, **k: self._Process(),
+                lambda: "token", lambda _token: True, **kwargs)
+
+    def test_a_signed_in_session_is_published_then_taken_down(self):
+        self.assertEqual(self._run(extra_settings={"mc_version": "1.26.40.1"}),
+                         0)
+        self.assertEqual(len(self.xbl_calls), 1)
+        (settings,), _kwargs = self.xbl_calls[0]
+        self.assertEqual(settings["mc_version"], "1.26.40.1")
+        self.xbl.stop.assert_called_once_with()
+
+    def test_an_offline_session_tells_xbox_live_nothing(self):
+        # No pre-auth, no token to publish with (#160).
+        self.assertEqual(self._run(preauth=False), 0)
+        self.assertEqual(self.xbl_calls, [])
+
+
+
+
+class GameSettingsHandoverLaunchTests(ReadyLaunchHarness, unittest.TestCase):
+    """What a launch does to the game's own settings and process, in order.
+
+    The player's Max Framerate is set aside only once the settings file has
+    been repaired and before its copy is taken, so the copy is of the file
+    the game really starts from; it is put back only after the game is gone.
+    """
+
+    def _play(self, environ=None, swap_guard=False, signed_out=False,
+              notices=None, account=None):
+        self.commands = commands = []
+
+        def popen(command, **_kwargs):
+            commands.append(list(command))
+            self.options_calls.append("game")
+            proc = mock.Mock()
+            proc.wait.return_value = 0
+            return proc
+
+        with tempfile.TemporaryDirectory() as td:
+            return self._exercise_ready_launch(
+                Path(td), popen,
+                arm=lambda: "owned-token",
+                disarm=lambda _token: True,
+                environ=environ,
+                swap_guard=swap_guard,
+                signed_out=signed_out,
+                notices=notices,
+                account=account,
+            )
+
+    def test_a_paced_launch_sets_the_limit_aside_between_repair_and_copy(self):
+        self.assertEqual(self._play(environ={"BOL_FRAME_RATE": "60"}), 0)
+        self.assertEqual(
+            self.options_calls,
+            ["restore_truncated", "before_launch", "set_aside_frame_limit",
+             "snapshot", "game",
+             "restore_truncated", "patch_options", "restore_frame_limits"])
+
+    def test_the_worlds_are_backed_up_from_the_repaired_untouched_file(self):
+        # After a torn settings file is put back, so the backup is never of
+        # the torn one; before the launcher sets anything aside for the
+        # session, so restoring it never brings back a session's setting.
+        self.assertEqual(self._play(environ={"BOL_FRAME_RATE": "60"}), 0)
+        calls = self.options_calls
+        self.assertLess(calls.index("restore_truncated"),
+                        calls.index("before_launch"))
+        self.assertLess(calls.index("before_launch"),
+                        calls.index("set_aside_frame_limit"))
+
+    def test_a_session_played_signed_out_is_explained_to_the_window(self):
+        notices = []
+        self.assertEqual(self._play(signed_out=True, notices=notices), 0)
+        self.assertEqual(notices, [launch.saves.SIGNED_OUT_NOTICE])
+        self.assertIn(launch.saves.SIGNED_OUT_NOTICE, self._warnings())
+
+    def test_a_signed_in_session_leaves_nothing_to_explain(self):
+        notices = []
+        self.assertEqual(self._play(signed_out=False, notices=notices), 0)
+        self.assertEqual(notices, [])
+
+    def test_playing_with_no_account_linked_is_not_called_signed_out(self):
+        # That is the offline mode the launch already announced, not a
+        # version that failed to sign in.
+        notices = []
+        self.assertEqual(self._play(signed_out=True, notices=notices,
+                                    account={}), 0)
+        self.assertEqual(notices, [])
+
+    def test_an_unpaced_launch_writes_no_limit_but_still_puts_one_back(self):
+        # Nothing to hand over this time; a value an interrupted session
+        # left aside still has to find its way home.
+        self.assertEqual(self._play(environ={"BOL_FRAME_RATE": "0"}), 0)
+        self.assertNotIn("set_aside_frame_limit", self.options_calls)
+        self.assertEqual(self.options_calls[-1], "restore_frame_limits")
+
+    def test_an_unpaced_launch_puts_a_limit_left_aside_back_before_the_game(
+            self):
+        # Nothing holds it this session: left at Unlimited, the game would
+        # start with no limit at all (#314).
+        self.assertEqual(self._play(environ={"BOL_FRAME_RATE": "0"}), 0)
+        calls = self.options_calls
+        self.assertLess(calls.index("restore_frame_limits"),
+                        calls.index("snapshot"))
+        self.assertLess(calls.index("restore_frame_limits"),
+                        calls.index("game"))
+
+    def test_the_game_starts_inside_the_swap_guard_when_there_is_one(self):
+        self.assertEqual(self._play(swap_guard=True), 0)
+        self.assertEqual(self.commands,
+                         [["systemd-run", "--user", "--scope", "--",
+                           "fake-umu"]])
+
+    def test_the_game_starts_unwrapped_when_there_is_none(self):
+        self.assertEqual(self._play(swap_guard=False), 0)
+        self.assertEqual(self.commands, [["fake-umu"]])
+
+
+class StopRequestLaunchTests(ReadyLaunchHarness, unittest.TestCase):
+    """A SIGTERM or SIGHUP during the session waits for the game.
+
+    Powering off with Minecraft open stopped the launcher before its
+    teardown: the game closed two seconds later, but its GPU marker stayed
+    and the next boot refused PLAY. The signal is now only recorded
+    (bol/supervision.py), and these tests drive the wait loop with it.
+    """
+
+    def setUp(self):
+        self.addCleanup(self._reset)
+        self._reset()
+
+    @staticmethod
+    def _reset():
+        launch.supervision._state.update(
+            active=False, signum=None, since=None)
+        launch.supervision._session_over.set()
+
+    def _play(self, ticks, prefix_idle=True):
+        calls = []
+
+        def popen(*_a, **_kw):
+            proc = mock.Mock()
+
+            def wait(timeout=None):
+                tick = ticks.pop(0)
+                if callable(tick):
+                    tick = tick()
+                if isinstance(tick, BaseException):
+                    raise tick
+                return tick
+
+            proc.wait.side_effect = wait
+            calls.append("popen")
+            return proc
+
+        def arm():
+            calls.append("arm")
+            return "owned-token"
+
+        def mark(token):
+            calls.append("mark")
+            return True
+
+        def disarm(token):
+            calls.append("disarm")
+            return True
+
+        with tempfile.TemporaryDirectory() as td:
+            self._exercise_ready_launch(
+                Path(td), popen, arm=arm, disarm=disarm, mark=mark,
+                prefix_idle=prefix_idle, preauth=False)
+        return calls
+
+    @staticmethod
+    def _signal(signum, age=0.0):
+        def tick():
+            launch.supervision._on_signal(signum, None)
+            if age:
+                launch.supervision._state["since"] -= age
+            return subprocess.TimeoutExpired("umu", 1)
+        return tick
+
+    def test_the_game_closing_inside_the_grace_clears_its_marker(self):
+        calls = self._play([
+            self._signal(signal.SIGTERM),
+            self._signal(signal.SIGHUP),   # a session scope sends both
+            0,
+        ])
+        self.assertEqual(calls, ["arm", "popen", "mark", "disarm"])
+        # Held for launch() to deliver once the session is over.
+        self.assertEqual(launch.supervision._state["signum"], signal.SIGTERM)
+        self.presence.stop.assert_called_once_with(timeout=0)
+        self.assertTrue(any("asked to stop" in w for w in self._warnings()))
+
+    def test_a_game_that_outlives_the_grace_keeps_its_marker(self):
+        grace = launch.supervision.STOP_GRACE_S
+        calls = self._play(
+            [self._signal(signal.SIGTERM, age=grace + 1)]
+            + [subprocess.TimeoutExpired("umu", 1)] * 5)
+        self.assertEqual(calls, ["arm", "popen"])
+        # The game is still running: scanning for an idle prefix would only
+        # spend ten seconds of the shutdown saying so.
+        self.launch_mocks["_prefix_stably_idle_after_wrapper"] \
+            .assert_not_called()
+        self.assertTrue(any("did not close within" in w
+                            for w in self._warnings()))
+
+    def test_a_stop_before_the_game_starts_starts_no_game(self):
+        calls = []
+
+        def arm():
+            calls.append("arm")
+            launch.supervision._on_signal(signal.SIGTERM, None)
+            return "owned-token"
+
+        def disarm(token):
+            calls.append("disarm")
+            return True
+
+        def popen(*_a, **_kw):
+            calls.append("popen")
+            raise AssertionError("the game must not start")
+
+        with tempfile.TemporaryDirectory() as td, \
+                self.assertRaisesRegex(launch.BolError, "asked to stop"):
+            self._exercise_ready_launch(
+                Path(td), popen, arm=arm, disarm=disarm, preauth=False)
+        self.assertEqual(calls, ["arm", "disarm"])
+
+    def test_an_ordinary_session_is_untouched(self):
+        calls = self._play([subprocess.TimeoutExpired("umu", 1), 0])
+        self.assertEqual(calls, ["arm", "popen", "mark", "disarm"])
+        self.presence.stop.assert_called_once_with()
+        self.assertIsNone(launch.supervision._state["signum"])
+
+
+class EditorLaunchTests(ReadyLaunchHarness, unittest.TestCase):
+    """Bedrock Editor is the same game, asked for its Editor (#286)."""
+
+    def _commands(self, editor):
+        commands = []
+
+        def popen(command, **_kwargs):
+            commands.append(list(command))
+            proc = mock.Mock()
+            proc.wait.return_value = 0
+            return proc
+
+        with tempfile.TemporaryDirectory() as td:
+            self._exercise_ready_launch(
+                Path(td), popen, arm=lambda: "owned-token",
+                disarm=lambda _token: True, editor=editor)
+        return commands
+
+    def test_the_editor_uri_follows_the_executable(self):
+        self.assertEqual(self._commands(editor=True),
+                         [["fake-umu", launch.EDITOR_URI]])
+
+    def test_a_plain_launch_passes_the_game_nothing(self):
+        self.assertEqual(self._commands(editor=False), [["fake-umu"]])
+
+    def test_launch_hands_the_request_to_the_session(self):
+        with mock.patch.object(launch, "launch_lock") as lock, \
+                mock.patch.object(launch, "_launch_once") as once, \
+                mock.patch.object(launch.supervision, "end_session"):
+            lock.return_value.__enter__.return_value = ()
+            launch.launch(editor=True)
+        self.assertTrue(once.call_args.kwargs["editor"])
+
+
+class GraphicsCardLaunchTests(unittest.TestCase):
+    """The card chosen in Settings reaches the game's environment (#275)."""
+
+    def test_a_chosen_card_is_named_in_the_log(self):
+        card = mock.Mock()
+        card.name = "NVIDIA GeForce RTX 3050 Mobile"
+        with mock.patch.object(launch, "apply_gpu_choice",
+                               return_value=card) as apply, \
+                mock.patch.object(launch, "hybrid_gpu_problem") as advice, \
+                mock.patch.object(launch, "info") as said:
+            self.assertIs(launch._configure_gpu({}, {"gpu": "x"}), card)
+        apply.assert_called_once()
+        advice.assert_not_called()
+        self.assertIn("RTX 3050", said.call_args.args[0])
+
+    def test_with_no_choice_a_laptop_is_told_where_it_is(self):
+        with mock.patch.object(launch, "apply_gpu_choice", return_value=None), \
+                mock.patch.object(launch, "hybrid_gpu_problem",
+                                  return_value="two cards") as advice, \
+                mock.patch.object(launch, "warn") as warned:
+            self.assertIsNone(launch._configure_gpu(
+                {}, {}, environ={"DRI_PRIME": "1"}))
+        self.assertEqual(advice.call_args.args[1], {"DRI_PRIME": "1"})
+        warned.assert_called_once_with("two cards")
+
+    def test_a_broken_inventory_never_fails_a_launch(self):
+        with mock.patch.object(launch, "apply_gpu_choice",
+                               side_effect=OSError("sysfs")), \
+                mock.patch.object(launch, "warn") as warned:
+            self.assertIsNone(launch._configure_gpu({}, {}))
+        self.assertIn("default", warned.call_args.args[0])
+
+
+class XcurlLogTests(ReadyLaunchHarness, unittest.TestCase):
+    """The XCurl request log ends up beside the other logs (#163, #313)."""
+
+    def _play(self, diagnostics):
+        def popen(command, **kwargs):
+            # The shim writes it beside XCurl.dll, in the game's folder.
+            (Path(kwargs["cwd"]) / "xcurl.log").write_text("DONE rc=0\n")
+            proc = mock.Mock()
+            proc.wait.return_value = 0
+            return proc
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._exercise_ready_launch(
+                root, popen, arm=lambda: "owned-token",
+                disarm=lambda _token: True,
+                extra_settings={"diagnostics": diagnostics})
+            return ((root / "logs" / "xcurl.log").is_file(),
+                    (root / "content" / "xcurl.log").is_file())
+
+    def test_a_diagnostics_session_moves_it_to_the_logs_folder(self):
+        self.assertEqual(self._play(diagnostics=True), (True, False))
+
+    def test_an_ordinary_session_leaves_the_game_folder_alone(self):
+        self.assertEqual(self._play(diagnostics=False), (False, True))
+
+
+class InjectionOnWineD3DTests(unittest.TestCase):
+    """Injected clients draw through Direct3D 12, which Legacy bypasses (#291)."""
+
+    def _warned(self, settings):
+        with mock.patch.object(launch, "warn") as warn:
+            said = launch._warn_injection_on_wined3d(settings)
+        self.assertEqual(said, warn.called)
+        return said
+
+    def test_auto_injection_on_legacy_is_explained(self):
+        self.assertTrue(self._warned(
+            {"injector_auto_enable": True, "renderer": "opengl"}))
+        self.assertTrue(self._warned(
+            {"injector_auto_enable": True,
+             "custom_env": "PROTON_USE_WINED3D=1"}))
+
+    def test_nothing_is_said_otherwise(self):
+        self.assertFalse(self._warned(
+            {"injector_auto_enable": True, "renderer": "auto"}))
+        self.assertFalse(self._warned(
+            {"injector_auto_enable": False, "renderer": "opengl"}))
+        self.assertFalse(self._warned(None))
+
+
+class ParallelMsaRefreshTests(unittest.TestCase):
+    """The token refresh runs beside the prefix work, and is never dropped."""
+
+    def test_a_refreshed_token_is_saved_and_used(self):
+        saved = []
+        with mock.patch.object(launch, "msa_refresh",
+                               return_value={"refresh_token": "new",
+                                             "access_token": "a"}), \
+                mock.patch.object(launch, "msa_save_for_account_epoch",
+                                  side_effect=lambda data, epoch:
+                                  saved.append((data["refresh_token"], epoch))
+                                  or True):
+            future = launch._start_msa_refresh("old")
+            fresh, tok, unreachable = launch._finish_msa_refresh(
+                future, "old", "epoch-1")
+        self.assertEqual(tok, "new")
+        self.assertEqual(fresh["access_token"], "a")
+        self.assertFalse(unreachable)
+        self.assertEqual(saved, [("new", "epoch-1")])
+
+    def test_a_transport_failure_keeps_the_cached_token(self):
+        with mock.patch.object(launch, "msa_refresh",
+                               side_effect=OSError("offline")), \
+                mock.patch.object(launch, "warn"):
+            future = launch._start_msa_refresh("old")
+            fresh, tok, unreachable = launch._finish_msa_refresh(
+                future, "old", "epoch-1")
+        self.assertEqual((fresh, tok, unreachable), (None, "old", True))
+
+    def test_no_account_starts_nothing(self):
+        self.assertIsNone(launch._start_msa_refresh(None))
+        self.assertEqual(launch._finish_msa_refresh(None, None, "e"),
+                         (None, None, False))
+
+    def test_the_token_is_saved_even_when_the_prefix_fails(self):
+        saved = []
+
+        class Stop(Exception):
+            pass
+
+        with tempfile.TemporaryDirectory() as td:
+            game = Path(td)
+            (game / "Minecraft.Windows.exe").write_bytes(b"MZ")
+            patches = [
+                mock.patch.object(launch, "load_settings",
+                                  return_value={"game_dir": str(game)}),
+                mock.patch.object(launch, "proton_path", return_value=game),
+                mock.patch.object(launch, "_prepare_launch_engine"),
+                mock.patch.object(launch, "_warn_if_dgc_unavailable"),
+                mock.patch.object(launch, "_warn_if_inproc_sync_unavailable"),
+                mock.patch.object(launch, "_warn_if_performance_degraded"),
+                mock.patch.object(launch, "retire_idle_current_boot_marker"),
+                mock.patch.object(launch, "require_safe_graphics_session"),
+                mock.patch.object(launch, "msa_session_snapshot",
+                                  return_value=({"refresh_token": "old"},
+                                                "epoch-1")),
+                mock.patch.object(launch, "msa_refresh",
+                                  return_value={"refresh_token": "new"}),
+                mock.patch.object(launch, "msa_save_for_account_epoch",
+                                  side_effect=lambda data, epoch:
+                                  saved.append(data["refresh_token"]) or True),
+                mock.patch.object(launch, "boot_prefix", side_effect=Stop),
+            ]
+            for patch in patches:
+                patch.start()
+                self.addCleanup(patch.stop)
+            with self.assertRaises(Stop):
+                launch._launch_once()
+        self.assertEqual(saved, ["new"])
+
+
+class ContainerLocalesLaunchTests(ReadyLaunchHarness, unittest.TestCase):
+    """The kept locales follow the environment the game really starts with."""
+
+    def test_built_from_the_final_environment(self):
+        def popen(_cmd, **kwargs):
+            self.started_env = kwargs["env"]
+            proc = mock.Mock()
+            proc.wait.return_value = 0
+            return proc
+
+        with tempfile.TemporaryDirectory() as td:
+            self._exercise_ready_launch(
+                Path(td), popen, arm=lambda: "owned-token",
+                disarm=lambda _token: True,
+                umu_env={"LANG": "fr_FR.UTF-8"},
+                # The Advanced field is where another game language comes
+                # from, and it is applied last.
+                extra_settings={"custom_env": "LANG=de_DE.UTF-8"})
+        self.assertEqual(self.locales_env["LANG"], "de_DE.UTF-8")
+        self.assertEqual(self.started_env["LANG"], "de_DE.UTF-8")
+
+    def test_the_kept_copy_reaches_the_game(self):
+        self.locales_update = {"LOCPATH": "/kept/locales",
+                               "PRESSURE_VESSEL_GENERATE_LOCALES": "0"}
+        self.test_built_from_the_final_environment()
+        self.assertEqual(self.started_env["LOCPATH"], "/kept/locales")
+        self.assertEqual(
+            self.started_env["PRESSURE_VESSEL_GENERATE_LOCALES"], "0")

@@ -4,6 +4,2408 @@
 
 ### Fixed
 
+- **Three hardening gaps around the Store sign-in and the changelog.** A
+  link in either changelog tab now opens only if it is http or https: the
+  text comes off the network, and a `file:`, `smb:`, `ssh:` or `steam:` link
+  used to go straight to the desktop's handler for it. The Store keyring,
+  which holds the device credentials and the account's Passport session, is
+  now 0600: Xodus writes it 0644, so the sign-in runs under a 0077 umask and
+  an existing keyring is tightened the next time the launcher runs Xodus.
+  A `XODUS_LOG` set in the shell no longer reaches xodus-cli, which at trace
+  level logs decrypted token exchanges into `logs/store-*.log`;
+  `BOL_XODUS_LOG` turns its logging on, capped at debug (#379).
+- **openSUSE: "wineboot exited with status 1" now says why (#380).** A stock
+  Tumbleweed runs SELinux with `selinuxuser_execmod` off, which stops Wine
+  before it writes a word, and the Flatpak cannot install the
+  `selinux-policy-targeted-gaming` package that Steam's and Lutris's RPMs
+  pull in to turn it on. The launcher now detects this before it makes the
+  Wine prefix, names it when the prefix or the game fails, lists it in
+  `doctor`, and gives the command that fixes it. Wine's own errors are no
+  longer silenced in the prefix log.
+
+## 3.0.0 — 2026-11-14 (pre-release)
+
+A pre-release of the next major version. Add-ons, maps and texture packs
+install in one click from MCPEDL and CurseForge, LeviLamina mods have their
+own page, and the launcher has a new layout. Minecraft runs on Debian 12,
+Ubuntu 22.04 and Fedora 39 and on Apple silicon under Asahi Linux, starts
+sooner after PLAY, and unlocks achievements. The engine (native24, built on
+native23) spends less CPU between frames and keeps its speed on kernels
+without ntsync, and the camera follows the mouse sooner on Wayland desktops.
+Several profiles can play at once, a game can run hidden for tools that
+drive it, and "Report a problem" files a GitHub issue with the logs, with
+nothing personal in it. Stable 2.3.x installs are not
+offered this version: download it from this release to try it.
+
+### Added
+
+- **Several games at once, one per profile.** Profiles no longer take turns:
+  each can run its own Minecraft while the others play. The Profiles page
+  lists every running game, whichever window, shortcut or terminal started
+  it, with Hide, Show and Close, and `bedrock-on-linux instances` does the
+  same from a terminal. See [docs/INSTANCES.md](docs/INSTANCES.md).
+- **Hidden games.** "Play hidden" on a profile, or `play --hidden`, starts
+  Minecraft with its window kept off the screen, for a tool that drives the
+  game rather than a player. It can be shown at any time.
+- **Fixes without a new release.** The launcher can fetch a small signed
+  data file with what used to need a release: anchors for a Minecraft build
+  that rearranged its menus, a rebuilt downloader or sign-in runtime, and
+  notices when Microsoft's services are down. It is accepted only when its
+  signature matches a key built into the launcher, a downgraded file is
+  refused, every download it names is checked against a signed SHA-256, and
+  without it the launcher runs on what it shipped with. PLAY never waits on
+  it.
+- **You are told what the launcher connects to, and you choose.** Before the
+  first connection a notice lists every host, what is sent there and why,
+  and asks how updates are checked: automatically, only when you ask, or
+  never. Settings has a Network tab with the same list, `bedrock-on-linux
+  network` prints it, and the README has it too. No telemetry or identifier
+  is sent, to anyone.
+- **A release channel setting**: stable, or pre-releases as well.
+- **The version list shows what is already installed**
+  ([#376](https://github.com/Wyze3306/BedrockOnLinux/issues/376)). A build
+  on disk carries an *Installed* mark in the picker next to PLAY, read from
+  the game folders each time the list opens, so you can tell which versions
+  start at once and which would be downloaded.
+- **Report a problem.** A button at the foot of the menu, in Settings ▸
+  Tools and on the error shown when a launch fails, and `bedrock-on-linux
+  report` in a terminal. You write a title and a comment; the launcher adds
+  its version and install type, the pinned and installed components, your
+  Minecraft build, distribution, kernel, session, GPU and drivers, the
+  settings that change behaviour and the end of the logs. Every part goes
+  through one privacy pass that removes your user name and home folder,
+  host name, gamertag, XUID, e-mail, IP and MAC addresses, serial numbers,
+  tokens, and the names of your worlds, servers and profiles; a line that
+  might still name you is dropped. The window shows exactly what will be
+  sent, with a box to leave each part out, and names where it goes. Nothing
+  is sent before you press Send. Send files the issue in one click through
+  the project's report relay, `reports.linesia.net`, which keeps no copy and
+  does not log your address; GitHub's own issue form in your browser stays
+  available, and is the fallback when the relay cannot be reached. See
+  [docs/report-relay.md](docs/report-relay.md).
+- `bedrock-on-linux --version`.
+- **Add-ons, maps, texture packs and skins from MCPEDL and CurseForge.** A
+  new Add-ons & Maps page searches both (they are one catalogue now: every
+  CurseForge Bedrock project is mirrored on MCPEDL under the same name),
+  sorts by this week's or this month's popularity, downloads, updates or
+  date, and installs a project's file in one click, straight into the
+  folders the game reads. A pasted MCPEDL or CurseForge link opens that
+  project. Files come over HTTPS from MCPEDL's and CurseForge's servers
+  only; projects whose author hosts files elsewhere get a button to open
+  that link in the browser instead. The Library tab lists every pack and
+  world the game will find, whoever put it there, and removes them into a
+  trash kept for 30 days rather than deleting them.
+- **A new layout.** Every page is now one click away in a menu on the left
+  (Play, Add-ons & Maps, Mods, Profiles, Settings, What's New), with the
+  page shown lit up and named above it; the profile and the accounts sit at
+  its foot. It folds down to its icons, and folds by itself in a narrow
+  window. Pages sit flat on the window with one level of cards, and every
+  button looks like one. The game or edition is one pill next to PLAY,
+  with a badge per edition, opening a menu of them all. The home page has shortcuts to content, mods, importing a file
+  and the game folder, and shows this week's popular add-ons, maps and
+  texture packs (Settings > General turns that off).
+- **LeviLamina mods.** A Mods page browses the levimc.org catalogue and
+  installs, updates, imports and turns off mods per Minecraft build.
+
+- **Apple silicon under Asahi Linux.** Asahi's kernel uses 16 KiB memory
+  pages, and Wine and FEX-Emu need 4 KiB ones. With muvm installed, the
+  launcher now starts itself inside a muvm microVM, where muvm registers
+  FEX-Emu, and everything it runs from there gets 4 KiB pages, the host's
+  GPU, controllers and display, as Steam does on Asahi. Before, setup looked
+  for FEX-Emu on the host, found none (muvm registers it only inside the
+  microVM) and told the player to install what they already had. Inside
+  muvm the graphics check no longer counts RandR providers: the display it
+  reaches there is the host's, whose providers say nothing about the
+  microVM's GPU, and a count of zero refuses PLAY. Without muvm,
+  setup now says to install it. `BOL_NO_MUVM=1` keeps the launcher on the
+  host (#250).
+
+### Changed
+
+- **The game engine is less than half its size** (engine native24, not
+  published yet). Wine's modules are installed without their debugging
+  sections, which were two thirds of them, and Wine Mono, which nothing the
+  launcher runs uses, is left out with the import libraries. The code is
+  native23's.
+- **Minecraft gets back the memory of a second copy of itself.** A Store
+  build is decrypted into memory at every start and handed to Wine as a
+  staged copy; the first copy stayed open in the launch wrapper for the whole
+  session: 324 MB with 1.26.60, 423 MB with Preview 1.26.70, which could not
+  even be swapped out where the game is kept out of swap. It is closed once
+  the staged copy exists.
+- **The launcher no longer reads every process on the machine every two
+  seconds while the game runs.** It did so to find what the game's WebView2
+  leaves behind once Minecraft closes, and that reading includes the game's
+  own process. While the game is up, only the game is looked at.
+- **PLAY checks the game engine once instead of three times.** Setup, the
+  launch after it and the graphics payload each hashed the Wine runtime and
+  the vkd3d DLLs again; a check already made in the same run stands for as
+  long as none of those files has changed on disk.
+- **The six Xbox Live tokens of a sign-in are requested together.** On a
+  start with no session left from earlier, they were asked for one after the
+  other. `BOL_PREAUTH_SERIAL=1` goes back to one request at a time.
+- **A .deb, .rpm or Flatpak install keeps its compiled Python.** Those
+  installs are read-only and ship no bytecode, so each start compiled the
+  whole launcher again; it is now kept in the user's cache directory
+  (0.32 s down to 0.16 s to load the window's code on the development
+  machine).
+- **The previous boot's kernel log is read once per boot** by the graphics
+  safety check, not at every PLAY, once it has been found clean. The current
+  boot's is still read every time.
+- The offline registry updates of a launch only look for running Wine
+  processes when they have something to write.
+- **The Profiles page was rebuilt.** One card per profile with its Xbox
+  account, build and folder, Play and Play hidden in view, and Folder,
+  Rename and Delete in a menu.
+- **Launcher updates are checked, tried and reversible.** Every install kind
+  now goes through the same steps: the download must match its SHA-256 (a
+  release that states none is refused), the new launcher is started once
+  before it replaces anything, and an AppImage or .pyz keeps the previous
+  file and returns to it if the new one does not start. An AppImage uses a
+  delta download when `appimageupdatetool` is installed. A Nix install is
+  pointed at its flake instead of at a download.
+
+### Fixed
+
+- **Minecraft Education's sign-in window shows the form.** It stayed an empty
+  card. Education signs in through Wine's Internet Explorer, and two bugs in
+  its JavaScript engine left the pages blank. The first `createElement` call
+  on a page returned the function instead of an element, so the Office
+  sign-in page Education opens first lost its form; engine native26 fixes the
+  call (WineGDK patch 0019). The Microsoft account page also needs an `Intl`
+  object, which native25 added (patch 0018), with `String.localeCompare`
+  (#351).
+
+- **Minecraft Education no longer sends a school account to Windows' account
+  broker.** Right after the e-mail address, sign-in stopped on "Something
+  went wrong [4nsvw]". The sign-in library in Education sends school accounts
+  to the Web Account Manager, which Wine does not have, and offers no setting
+  to turn that off. While Education runs, the launcher now turns the switch
+  off in the game's memory, so the account signs in through the game's own
+  window. It only does so after checking the bytes of a build it knows
+  (1.26.33.0), and it cannot reach the game inside the Flatpak (#351).
+  Engine native27 fixes what came next: the sign-in window asked Wine's
+  Internet Explorer for its own window, got nothing, and stopped on
+  "Something went wrong [9zj22]" (WineGDK patch 0020).
+
+- **"Could not initialise the Wine prefix" says why.** The dialog only
+  pointed at a log file. It now gives what wineboot did (timed out, exited
+  with a status, left no registry) and the last lines of the log, and asks
+  for a report, which carries the whole log.
+
+- **PLAY in the window starts beside games already running.** With two
+  profiles playing, PLAY refused a third game: "shared Minecraft files are
+  in use by another BedrockOnLinux profile". It ran the full setup, which
+  needs those files alone, even for a build already on disk. A build that is
+  installed now starts beside the others, as a profile started from the
+  Profiles page does; one that still has to be downloaded says that the
+  other games must be closed first.
+
+- **The first-run network question is a real dialog.** It opened as a
+  column wedged between the navigation rail and the page, with the text
+  squeezed into it; update and notice banners landed in the same place. The
+  question is now a dialog over the window with one card per choice and the
+  list of hosts inside it, and banners sit under the page title.
+
+- **A certificate download that fails no longer stops the launch**
+  ([#374](https://github.com/Wyze3306/BedrockOnLinux/issues/374)). On
+  networks where `curl.se` is out of reach, setup ended at "Download failed
+  after 5 attempts: https://curl.se/ca/cacert.pem". The launcher now gives
+  the game this system's own certificate bundle, which holds the same roots,
+  and tries the download again on a later launch.
+- Buttons on the Profiles page and in the profile menu were cut off ("ew
+  Window", "ename") wherever the desktop's font was wider than the fixed
+  widths they were given. Nothing there has a fixed width any more.
+- **Importing a .mcaddon installs its packs.** Most add-ons are a zip of
+  .mcpack files rather than of the packs' folders, and the import stopped
+  at "No manifest.json". Packs inside an add-on are unpacked too, a world
+  bundled with one is imported as a world, a world zipped inside a folder
+  of its own is lifted out so the game lists it, packs named through their
+  translations (`pack.name`) get their real name, and colour codes no
+  longer end up in folder names.
+
+- **The game starts close to two seconds sooner after PLAY.** Before Wine
+  starts, xodus-cli finds the game's files in the downloaded package, fetches
+  the licence and decrypts the executable, and two of those steps spent most
+  of their time on 4 KiB reads and writes, each handed to another thread.
+  They now go through a block cache and 4 MiB buffers. From xodus-cli's
+  start to the hand-over to Wine, in real launches of 1.26.52: 4.3 s down
+  to 2.4 s (medians), with CPU time down from 2.5 s to 0.6 s. The decrypted
+  executable is byte for byte the same.
+- **Minecraft downloads and starts on Debian 12, Ubuntu 22.04 and the
+  distributions built on it (Linux Mint 21, Pop!_OS 22.04, Zorin OS 17) and
+  Fedora 39.** xodus-cli, which downloads the game and decrypts it at every
+  launch, was linked against glibc 2.39 and stopped there on "version
+  `GLIBC_2.39' not found", so only the Flatpak worked. It is now linked
+  against glibc 2.31, the same floor as the game engine. It still needs
+  WebKitGTK 4.1, from the system's package manager on these releases
+  (`libwebkit2gtk-4.1-0` on Debian and Ubuntu): the bundled replacement is
+  built on Debian 13 and needs its glibc, and the launcher now says to
+  install the package instead of saying nothing helps, and keeps a system
+  WebKitGTK it would otherwise have swapped for the bundle (#264).
+- **Less CPU spent waiting between frames with vsync on.** With a Max
+  Framerate set in Minecraft, the launcher swaps the game's own limiter,
+  which holds a whole CPU core under Wine, for vkd3d-proton's. That one
+  still ends every wait spinning, about a fifth of a core at 60 FPS: more
+  than the game's own main thread uses in the menu. When vsync is on and the
+  Max Framerate is at least the display's refresh rate, vsync already keeps
+  the game at that rate, so the launcher now only turns the game's limiter
+  off and adds none of its own. Measured on a 60 Hz display: the same
+  60 FPS, and the game's CPU use in the menu down from 40% to 22% of a core
+  (#202). On a Wayland desktop and in gamescope the launcher now paces
+  vsync itself, for the reason under *The camera follows the mouse sooner*.
+- **Fullscreen fills the screen with *Keep the mouse inside the window*
+  on.** That setting runs the game in a Wine virtual desktop, where the
+  game's title bar is one Wine draws. Switching to fullscreen took the bar
+  away, but the picture stayed where it was: a white band along the top, and
+  the bottom of the picture, the hotbar with it, below the screen. The game
+  draws into an X window of its own, which Wine creates below the title bar
+  and afterwards only resizes; the engine's fix for #78 keeps it from moving
+  it. The helper the launcher runs inside Wine for that setting
+  (`src/desktop-bridge.c`) now reports where the game's client area starts,
+  and the launcher moves the picture there, in both directions. Measured in
+  a virtual 1600×900 screen: after F11 the picture moved from 4,30 to 3,3 in
+  the game's window and the white band is gone (#202).
+- **Engine native23 (pre-release).** vkd3d-proton's frame limiter, which
+  the launcher uses for a cap below the display's refresh rate and for
+  BOL_FRAME_RATE, ended every wait with a 1 ms spin plus a sixth of the
+  frame; under Wine a 0.5 ms tail is enough. Its thread drops from about a
+  fifth of a core to a twentieth at 60 FPS, and from 30% to 16-21% at
+  141 FPS, with steadier frame times (#202). The engine also falls back to
+  fsync on kernels without ntsync, takes two Wine calls the game makes on
+  every frame off its main thread (#202), and serves the XGameEvent class
+  that Xbox Live grades achievements from (#152).
+- **The camera follows the mouse sooner on Wayland desktops and in
+  gamescope.** There Minecraft draws through Xwayland, which reports each
+  frame as presented as soon as it passes it on, so with vsync on frames
+  queued up unseen and each one reached the screen about four refreshes
+  after the game drew it: 139 ms from moving the mouse to seeing the
+  picture move at 60 Hz. The launcher now paces the game just under the
+  display's refresh rate (59.88 FPS at 60 Hz), which keeps that queue
+  empty: 75 ms. It costs vkd3d-proton's limiter, a twentieth of a CPU core
+  at 60 FPS with engine native23, and one repeated frame every 8 seconds.
+  **Settings ▸ Advanced ▸ Limit frame rate to the display** turns it off.
+  A `VKD3D_FRAME_RATE` with decimals, which Proton used to turn into no limit
+  at all, now reaches vkd3d-proton too. Measurements in
+  `docs/INPUT-LATENCY.md` (#202).
+
+- **The ntsync warning knows about the engine's fsync fallback.** The check
+  before PLAY now counts an engine built with WineGDK patch `0014` (engine
+  native23 and later) as fast on a kernel without `/dev/ntsync`, as long as
+  the kernel has `futex_waitv` (Linux 5.16), and names `PROTON_NO_FSYNC` when
+  that is what turns the fallback off. Measured with ntsync hidden from the
+  game: the wineserver used 5% of a core in a world instead of 1.5%, and
+  with `0014` it went back to the ntsync level while the game ran at 250 to
+  255 FPS.
+
+## 2.3.1 — 2026-11-11
+
+Other players keep their own skins on servers, the Realms button of the title
+screen works again, and closing Minecraft ends the session. A shortcut can now
+update Minecraft before starting it, and Linesia is listed under Featured
+Servers.
+
+### Added
+
+- **A shortcut can keep Minecraft up to date.** With **Settings ▸ General ▸
+  Update Minecraft when started from a shortcut** on, a direct launch
+  shortcut (or `bedrock-on-linux play`) installs the newest build of the
+  edition you play before starting it, instead of staying on the build picked
+  in the launcher. `bedrock-on-linux play --update` does it once. It is off
+  by default, because a server that has not updated yet refuses a newer game,
+  and if the update cannot be made the installed build starts as usual (#328).
+
+### Fixed
+
+- **Other players keep their own skins.** On servers, players and NPCs that
+  joined after you sometimes showed up with a random default skin and kept
+  it. The game asks Windows how much memory it is using to decide whether it
+  can afford more skins, and Wine left that answer unwritten, so now and then
+  the game believed it was almost out of memory. The engine (`native22`) now
+  gives the real figure. Found and fixed by @ItsClairton (#292).
+
+- **The Realms button of the title screen opens the Realms page again.** It
+  answered "An error has occurred. Going back to the previous screen...". The
+  launcher's own patch of the game's interface, the one that takes the "You
+  need a Microsoft account" notice off the Servers and Realms tabs, handed the
+  Realms pages a value of the wrong kind, and they stopped on it. The patch
+  is rewritten, and a game patched by an earlier launcher is fixed at the next
+  PLAY (#337).
+
+- **Closing Minecraft ends the session again.** A couple of minutes into a
+  game, its WebView2 starts `MicrosoftEdgeUpdate.exe`, which never exits under
+  Wine, and Proton waits for every Wine process before it returns. So after
+  the game window closed, the launcher still considered Minecraft running and
+  PLAY refused to start it again. Once the game has been closed for a few
+  seconds, the launcher now closes that updater (and any WebView2 process
+  left behind) itself.
+
+### Changed
+
+- **Linesia SkyFaction is listed under Featured Servers, like a real partner
+  server.** It used to sit among your own servers as a bare address. It now
+  has a tile with its icon in the Featured Servers section, and its page shows
+  a banner, a description, the server's address and Activities cards for what
+  there is to discover there (SkyFaction, Warzone, Industry, The Great Sea),
+  with the same Play button as before. The game gets its featured servers from Microsoft, so there is no
+  list on disk to add to: the Servers-tab entry the launcher already writes is
+  still what you join through, and the Servers tab is patched to show it as a
+  featured server. If a Minecraft update changes the Servers tab too much for
+  the patch, the launcher says so and Linesia goes back under your own servers.
+
+- **The yellow text under the Minecraft logo is about Linux now.** The title
+  screen picks one of the launcher's own splash lines ("I use Arch, btw!",
+  "Wine not?", "sudo make me a sandwich!", …) instead of Mojang's. The
+  original list is kept next to it as `splashes.json.bol-orig`.
+
+## 2.3.0 — 2026-11-08
+
+Signing in works again on the current Minecraft, and the downloader keeps its
+Microsoft sessions alive instead of stopping two months after the Store
+sign-in. The in-game sign-in patches apply to Minecraft 1.26.60 and later, a
+rotated online-play token is no longer thrown away, and scrolling Settings no
+longer moves the game to another graphics card. Python 3.15 is supported.
+
+### Fixed
+
+- **The Microsoft Store sign-in no longer hangs silently after the
+  password** (#366). When Microsoft's page handed back its tokens without
+  a field xodus-cli never uses, the reply was dropped and the window sat on
+  *Please wait* for ever. Those fields are optional now, and
+  `logs/store-login.log` records each sign-in page that loads and any reply
+  it could not use, so a sign-in that still stops says where.
+
+- **Minecraft starts and downloads again after about two months of use**
+  ([#367](https://github.com/Wyze3306/BedrockOnLinux/issues/367)). PLAY and
+  downloads stopped on `not implemented: Exchange token supports only singular
+  token right now Fault(Fault)`. The downloader keeps two Microsoft sign-ins
+  from the Store sign-in, one for this computer that Microsoft issues for 60
+  days and one for the account, for 90, and it renewed neither: once the
+  computer's ran out, Microsoft refused every request it signed and the
+  downloader crashed on the refusal. The computer's is now signed in again
+  when it has expired, or when Microsoft refuses it anyway, and the request
+  tried once more; the account's is renewed in its last week without a new
+  sign-in. Neither registers another device. If Microsoft still refuses, or
+  the account's sign-in ran out unused, the launcher says so and asks you to
+  sign in to the Microsoft Store account again, instead of "No known cause"
+  or a Rust panic. Without a connection, PLAY still says that a connection
+  is what is missing.
+
+- **Scrolling Settings no longer changes the graphics card on the way past**
+  ([#363](https://github.com/Wyze3306/BedrockOnLinux/issues/363)). A wheel
+  turn over the *Graphics card* list while scrolling the Advanced tab picked
+  the next card and saved it, so a desktop with an NVIDIA card could start
+  Minecraft on the processor's integrated GPU, at single-digit frame rates,
+  with nothing to say why. The lists and number fields in Settings now take
+  the wheel only once clicked; otherwise it scrolls the page.
+
+- **A revoked online-play sign-in is no longer shown as signed in** (#331,
+  #360). The
+  background Xbox warm-up refreshed Microsoft's token but discarded its
+  rotated replacement, leaving a revoked token on disk while the account row
+  stayed green. Minecraft then opened without an Xbox user and its broken
+  in-game sign-in ended at an error such as *Drowned*. The replacement token
+  is now saved atomically, and an explicit `invalid_grant` response marks the
+  account as needing attention and offers **Sign in again**. Network and
+  transient service failures do not sign the player out. Relinking retires
+  only the refused online-play session; the Store/download account is kept.
+
+- **Minecraft Preview reads its own settings, not the stable game's.** Both
+  editions share one Wine prefix, but the launcher only ever looked in the
+  stable game's folder. Launching Preview capped it at the stable game's Max
+  Framerate, set that file's limit aside instead of Preview's (leaving
+  Preview's own limiter to hold a CPU core), decided the display cap and
+  fullscreen fix from the stable game's vsync and fullscreen settings, and
+  never added the default servers to Preview's list. Each folder is also seen
+  once now, not twice through Proton's `users/<login>` link.
+
+- **The online-multiplayer safety warning stays off for signed-in players.**
+  The launcher only switched it off in the signed-out profile's settings,
+  while a signed-in game reads its account's own file, so the warning kept
+  coming back. Every profile's file is patched now, Preview's included.
+  Worlds, packs and skins imported from the launcher while Preview is
+  selected also go to Preview's folder rather than the stable game's.
+
+- **PLAY from the launcher works on Python 3.15** (#356). Python 3.15 imports
+  parts of its standard library lazily, and once PySide6 had replaced the
+  import function those names never resolved: PLAY stopped on
+  `'lazy_import' object is not callable`. The launcher now turns lazy
+  imports off before it imports anything, as Python 3.14 behaved.
+- **The in-game sign-in patches apply to Minecraft 1.26.60 and Preview
+  1.26.70 again.** Their UI bundle calls its hooks directly, which moved it
+  past both anchors: the Servers tab went back to "You need a Microsoft
+  account", the in-game Sign-in link to "Failed to log in", and `doctor`
+  said `sign-in ui: NOT PATCHED`.
+
+## 2.2.10 — 2026-10-27
+
+Minecraft starts and downloads again after Microsoft changed its sign-in
+token, and Minecraft Preview 1.26.70 starts on the new engine, native21.
+PLAY reaches the game sooner and says why when Microsoft refuses the
+licence, PlayStation controllers work in the game, and old server resource
+packs no longer fill the disk.
+
+### Fixed
+
+- **PLAY reaches the game about a second sooner.** Every launch rewrote a
+  handful of values in the Wine registry and rescanned the whole of
+  `system.reg` for each one, about 100,000 lines in a played-in prefix: over
+  a second on its own. The file is now read into its sections once. The
+  Microsoft token refresh, a round trip that nothing needs until the Xbox
+  sign-in, also runs while the prefix is prepared instead of before it.
+  Measured from PLAY to the game process: about 2.4 s before, 1 s after.
+
+- **A missing system locale that costs seconds at every start is named.**
+  The Steam Linux Runtime always needs `en_US.UTF-8` beside the player's own
+  locale, and when the system lacks one it rebuilds them all at each launch:
+  3 to 6 seconds more before the game window on a French desktop with only
+  `fr_FR.UTF-8` installed. PLAY now says which locale is missing and how to
+  add it once.
+
+- **Minecraft Preview 1.26.70 starts**
+  ([#274](https://github.com/Wyze3306/BedrockOnLinux/issues/274)). It asks
+  for a newer Gaming Services than the engine reports and quit at once,
+  without a window or a message, on some launches and not others: the switch
+  that skips that check was read through uninitialised variables. Engine
+  native21 reads it correctly and no longer refuses such a build at all; it
+  notes the difference in the log and lets the game start. Measured: the
+  Preview's window opened on 7 launches out of 7, against 0 out of 5
+  before.
+
+- **A licence Microsoft refuses is reported instead of PLAY doing nothing**
+  ([#345](https://github.com/Wyze3306/BedrockOnLinux/issues/345)). When the
+  licensing service answered with something other than a licence, the game
+  never started and the launcher came back without a word. PLAY now ends
+  with the refusal, Microsoft's reason when the downloader gives one, and
+  what to do about it.
+
+- **The launcher no longer hides while the game runs on an ordinary
+  desktop** ([#293](https://github.com/Wyze3306/BedrockOnLinux/issues/293)).
+  It took any `GAMESCOPE*` property on the display's root window for Steam
+  Game Mode and stepped aside, but the Steam client leaves its own
+  `GAMESCOPECTRL_*` properties there on a normal desktop too. Only the
+  properties Gamescope itself writes count now.
+
+- **Injected clients on the Legacy renderer**
+  ([#291](https://github.com/Wyze3306/BedrockOnLinux/issues/291)). Flarial
+  and similar clients draw through Direct3D 12, which the Legacy
+  compatibility renderer does not use, so their menu never appeared. PLAY now
+  says so when automatic injection is on with Legacy.
+
+- **Minecraft starts and downloads again**
+  ([#322](https://github.com/Wyze3306/BedrockOnLinux/issues/322)). Since
+  2026-10-12 every PLAY ended at once with `request error: error decoding
+  response body for url (https://licensing.mp.microsoft.com/v7.0/licenses/content)`.
+  Microsoft changed the format of the sign-in token the licence request
+  carries, and the licensing service refused the old way of sending it
+  (`401 InvalidMsaTicketFormat`), so the content key that decrypts the game
+  never arrived. The downloader now sends the token in the form the service
+  accepts. A refused licence request also says why now, with the HTTP status
+  and Microsoft's reason, instead of "error decoding response body".
+
+- **DualSense and DualShock 4 controllers work in the game**
+  ([#57](https://github.com/Wyze3306/BedrockOnLinux/issues/57)). In the
+  game, a PlayStation controller only moved the mouse with its touchpad,
+  with or without Steam Input: Wine handed Minecraft the controller's raw
+  Sony input, which the game does not read as a gamepad. The settings the
+  launcher used to turn that off only work with Proton's own Wine, not with
+  the engine the launcher installs. PLAY now sets the option this engine
+  reads, so the controller goes through SDL and reaches the game as an
+  Xbox-style gamepad (or, with Steam Input on, only Steam's virtual pad
+  does). `BOL_HIDRAW=all` turns it off.
+
+- **The fullscreen fix, the virtual-desktop bridge and DLL injection run
+  on systems without libunwind**
+  ([#324](https://github.com/Wyze3306/BedrockOnLinux/issues/324)). These
+  small Windows programs run with the engine's Wine beside the game, but
+  without the engine's own libraries, so on a system that has no
+  `libunwind.so.8` of its own, such as Guix, each one stopped at once with
+  "could not load ntdll.so". A fullscreen start then stayed stretched or
+  framed. They now get the same libraries as the game.
+
+- **A refused Microsoft sign-in is no longer blamed on the Xbox profile**
+  ([#331](https://github.com/Wyze3306/BedrockOnLinux/issues/331)). When
+  Microsoft refuses the sign-in saved on the computer, PLAY said "Xbox Live
+  rejected this Microsoft account" and sent people to xbox.com to fix a
+  profile Xbox Live had never been asked about. It now says the saved
+  sign-in was refused and to sign out and sign in again.
+
+- **Drop-down lists are readable in the light theme**
+  ([#332](https://github.com/Wyze3306/BedrockOnLinux/issues/332)). On a
+  dark desktop, the list a drop-down opens, such as **Graphics card**, kept
+  the desktop's dark background under the light theme's dark text. Those
+  lists, right-click menus and tooltips now take the launcher's own colours,
+  in either theme and on any desktop.
+
+- **Old versions of server resource packs no longer pile up.** Every pack
+  version a server sends stays unpacked in the prefix's
+  `Temp/Minecraft Bedrock/minecraftpe/packcache`. On Windows the system's
+  cleanup of temporary files keeps that in check; under Wine nothing does.
+  After a week of play, one prefix held 4.8 GB in 300,000 files, 28 versions
+  of a single server's UI pack among them. Before each launch, the launcher
+  now removes a pack version when a newer version of the same pack is cached
+  and the old one has not been written to for 7 days, the age Windows gives
+  temporary files. The newest version of every pack stays, so nothing a
+  server sends today is lost. On that prefix this frees 4.2 GB once the
+  week has passed.
+
+### Packaging
+
+- **Engine native21.** It differs from native20 only in xgameruntime's
+  Gaming Services version check (WineGDK patch `0012`). Built and attested
+  by the release workflow: archive
+  `e98512e74b1c3f930fdd213b24ac4a01abfa3a6336276076a509530c540b2b13`.
+- The Minecraft downloader is the reviewed `64d39eb87a56-p7`, and the
+  release workflow checks that it is published before it releases the
+  launcher. Downloader updates are built for review first, then published
+  together with the launcher once they are merged.
+
+## 2.2.9 — 2026-10-09
+
+Your worlds are now backed up before another Minecraft version opens
+them, the graphics card the game runs on can be chosen, and the `.deb` and
+`.rpm` update themselves. Fullscreen starts are no longer stretched, the
+Microsoft sign-in draws on systems without a usable EGL, and a new install
+finds its online-login components again.
+
+### Added
+
+- **The `.deb` and `.rpm` update themselves**
+  ([#294](https://github.com/Wyze3306/BedrockOnLinux/issues/294)). **Update
+  now**, and `bedrock-on-linux update`, used to send a package install to the
+  releases page to download the new file by hand. When the release's own
+  package installed the launcher, which the package database says, the
+  launcher now downloads the new `.deb` or `.rpm` and checks it against the
+  release's SHA-256 list. It then installs it with `apt-get` or `dnf` (zypper
+  and plain `rpm` too) behind the system's password prompt, and offers to
+  restart. A cancelled prompt leaves the package downloaded and says how to
+  install it by hand. A package someone else built, such as a distribution's,
+  is still left to its package manager.
+
+- **A BetterRTX preset manager**
+  ([#166](https://github.com/Wyze3306/BedrockOnLinux/issues/166)).
+  **Settings ▸ Tools ▸ BetterRTX** and `bedrock-on-linux betterrtx` list the
+  presets published on bedrock.graphics, install one or a `.rtpack` into the
+  selected Minecraft version, and restore the game's own ray tracing
+  shaders. A preset replaces three compiled materials, and the game loads
+  only materials of its own format. The launcher reads that format from the
+  game's files and from the preset's before writing anything, and refuses a
+  preset made for another version: today's presets are format 25, made for
+  1.26.40, and 1.26.52 loads format 26. The originals are kept beside the
+  build, and nothing is written while the game runs.
+
+- **Settings ▸ Advanced ▸ Graphics card picks the GPU Minecraft renders on**
+  ([#275](https://github.com/Wyze3306/BedrockOnLinux/issues/275)). A laptop
+  starts every program on its integrated GPU unless told otherwise, so the
+  game could run on an Intel iGPU beside an idle GeForce. The setting lists
+  the computer's cards, read from sysfs without loading a graphics driver. A
+  chosen card is asked for with the variables GNOME and KDE set for *Launch
+  using Discrete Graphics Card*: Mesa's device selection, which then shows
+  the game that card alone, `DRI_PRIME`, and NVIDIA's offload layer for a
+  GeForce. Left on *Automatic* on a laptop whose display runs on its
+  integrated GPU beside a discrete one, PLAY says where the choice is.
+
+- **Bedrock Editor opens from the launcher**
+  ([#286](https://github.com/Wyze3306/BedrockOnLinux/issues/286)). Mojang's
+  world-building tool is part of the game, started with the protocol URI a
+  Windows shortcut to `minecraft:?Editor=true` hands it. **Settings ▸ Tools ▸
+  Open Bedrock Editor**, the *Open Bedrock Editor* action of the app menu entry
+  and `bedrock-on-linux play --editor` now start the selected version that way,
+  Store builds included: the URI follows the decrypted executable.
+
+- **Your worlds, settings and servers follow you from one Minecraft version
+  to the next, and can be restored.** Every Minecraft build already opened the
+  same data, but nothing showed it, and a version change could leave it looking
+  lost. Three things are fixed:
+  - **Automatic backups.** Before a version other than the last one opens your
+    data, PLAY copies everything you made in that edition (worlds, settings,
+    the Servers tab, skins and packs) into a backup. The copy matters: a world
+    a newer version has opened is upgraded for good, and one an older version
+    opens may not load. The last five are kept, and **Settings ▸ Versions ▸
+    Backups of your worlds** restores any of them. A restore first backs up
+    what it replaces, so it can be undone.
+  - **Preview starts from your worlds.** Minecraft Preview keeps a data folder
+    of its own: Mojang separates it on purpose, so that a world it upgrades
+    never reaches the stable game. It used to open empty. The first Preview
+    launch now offers to copy your Minecraft worlds, settings and servers into
+    it. It is a copy, and the originals stay with Minecraft. The same section
+    can make the copy later.
+  - **A session played signed out is explained.** A Minecraft version that
+    does not sign in opens the signed-out profile, which has none of your
+    worlds, settings or servers, and that reads as "everything stayed on the
+    old version". When the game ran that way while your account's data was
+    there to be missed, the launcher says so once the game closes: nothing was
+    lost, and it all comes back once the game signs in.
+
+### Fixed
+
+- **A new install finds its online-login components again.** The OpenSSL
+  XCurl set, which carries Minecraft's PlayFab traffic and the RNG DLL the
+  Wine prefix starts with, is downloaded from the release it was uploaded
+  to. The launcher looked for it among the 30 newest releases only, and
+  after 30 more were published it ended with "asset
+  'openssl-xcurl-set-504bb166e4e7.tar.gz' not published yet" on every
+  computer that had not downloaded it before. It now searches every
+  release, and so do the Microsoft Store downloader and its WebKitGTK
+  runtime, which were next in line.
+
+- **A game set to fullscreen that comes up windowed is switched to
+  fullscreen** ([#316](https://github.com/Wyze3306/BedrockOnLinux/issues/316)).
+  Sometimes Minecraft reached its menu in its windowed mode although its
+  settings asked for fullscreen, its framed window as large as the screen. The
+  window manager's title bar and border then showed as a strip along the top
+  and the left, the rest of the picture ran off the screen, and the game
+  behaved as a window. Once the menu is up, the helper that already resizes a
+  fullscreen start (#283) now recognises that frame and presses F11 for the
+  player. The game's own switch then resizes its picture. Checked on a
+  virtual display: a windowed game sized to the screen went fullscreen and
+  reallocated its picture at 1600×900. A window that the window manager keeps
+  below its own title bar, as a normal maximized window is, is left alone.
+
+- **The AppImage starts Store builds without a Python on the system.** Every
+  Minecraft from the Store starts through a small script between xodus-cli
+  and Wine. It began with `#!/usr/bin/env python3`, which looks for the
+  system's Python. The AppImage carries its own and puts nothing on `PATH`,
+  so on a system without Python the game could not start. The script now
+  names the launcher's own interpreter. It falls back to `env python3` only
+  when that path cannot be written in a `#!` line.
+
+- **The Xbox Live DLLs from a third party are checked before they go into
+  the game.** `libHttpClient.GDK.dll` and `XCurl.dll` come from a release
+  tagged `v0.0.0` in another project's repository. Files can be uploaded to
+  that tag again, and the launcher copied whatever it served into the game,
+  where it runs. They are now pinned to the SHA-256 of the files every
+  install has used since June, as is the MinGW libcurl package of the
+  GE-Proton path. A changed file is refused instead of installed, and copies
+  already in the cache that match keep being used.
+
+- **A build on disk starts whatever the build index says.** The list of
+  Minecraft builds comes from a third party's index (GdkLinks), and PLAY read
+  it even for a build already installed. A build the index stopped listing
+  was swapped for the newest one, with a download nobody asked for. With the
+  index out of reach and no copy of it cached, PLAY failed outright. An
+  installed build now starts without the index, and the version picker lists
+  the builds on disk whether the index names them or not.
+
+- **An interrupted restore can no longer cost a world.** Restoring a backup
+  copies it in beside the current data, then swaps the two folders with two
+  renames. A launcher stopped between the renames left the player's data
+  under a temporary name. If the game then started, it made a fresh, empty
+  Users folder in its place, and the next restore deleted the player's data
+  as a leftover. PLAY now finishes or undoes an interrupted swap before the
+  game opens the folder. The player's data goes back, and anything the game
+  saved in the fresh folder is kept as a backup that says so. On the
+  previous code, the test that reproduces this loses the world.
+
+- **A program that crashed no longer reads as a GPU fault.** The kernel
+  reports a crashed program as "traps: wineserver[4242] general protection
+  fault …", in the same words as one of its own faults. Within 40 lines of
+  ordinary amdgpu or i915 messages, one of those blocked PLAY as a GPU
+  failure until a reboot. Only the kernel's own faults count now.
+
+- **Moving the data folder to another drive fails cleanly.** A copy cut short
+  between two filesystems, by a full drive for instance, had its partial
+  copy moved back *into* the original folder (`games/games`). A deletion cut
+  short after a complete copy lost the files it had already deleted. Each
+  move now knows whether its copy completed, and undoes itself accordingly.
+  The world backups also move with the rest of the data now.
+
+- **Launcher updates are checked against the release before they are
+  installed.** The AppImage and the `.pyz` resumed an interrupted download
+  under a name that did not carry the version. An update to another release
+  could therefore finish with half of each, and nothing checked the result
+  before it replaced the running launcher. Each download is now named for
+  its release and checked against the release's SHA-256 list.
+
+- **Versions with a three-digit minor are named right.** The game's
+  manifest writes 1.21.120.4 as `1.21.12004.0`, and the launcher read
+  1.21.12.4 out of it. The patch number is its last two digits.
+
+- **`BOL_FRAME_RATE=inf` means no cap** instead of failing the launch with
+  an OverflowError.
+
+- **On an ARM computer, the launcher says what x86-64 programs need**
+  ([#250](https://github.com/Wyze3306/BedrockOnLinux/issues/250)). The
+  launcher is Python and starts anywhere, but the game, the Wine engine,
+  xodus-cli and the WebKitGTK runtime are x86-64. On ARM they run only through
+  an x86-64 emulator the kernel hands them to (FEX-Emu, Box64 or qemu-user,
+  registered with binfmt_misc). Without one, the first of them failed with
+  "Exec format error", which reached the player as a missing WebKitGTK or an
+  engine that would not start. Setup now stops first and says to install
+  FEX-Emu or Box64. `doctor` has a `cpu` line, which names the emulator when
+  there is one. Running through an emulator remains untested.
+
+- **Minimizing Minecraft with *Keep the mouse inside the window* on clears
+  the screen** ([#189](https://github.com/Wyze3306/BedrockOnLinux/issues/189)).
+  That setting runs the game in a Wine virtual desktop as large as the
+  screen, and the game's title bar is one Wine draws inside it. Its minimize
+  button shrank the game to a small bar in the desktop's corner, and the
+  desktop stayed over everything with the game's last frame on it. A small
+  helper run inside Wine (`src/desktop-bridge.c`) now tells the launcher when
+  the game is minimized. The launcher then minimizes the desktop's window,
+  as the window manager's own button would. When that window is back on
+  screen, from the taskbar like any other, the game is restored in it.
+  Checked with the game on a virtual display: the screen is clear while the
+  game is minimized, and the game comes back maximized and drawing.
+
+- **The Microsoft sign-in draws on systems whose EGL cannot open a display**
+  ([#273](https://github.com/Wyze3306/BedrockOnLinux/issues/273)). The
+  bundled WebKitGTK runtime was 2.52, which draws every page through EGL, even
+  without a GPU. Its page process aborted when the system's EGL could not open
+  a display (libglvnd with no EGL vendor installed, or a Mesa built without
+  EGL), and the window stayed open and blank. The runtime is now built from
+  WebKitGTK 2.54, which Debian published in trixie-security on 2 October. It
+  draws the page with no EGL display at all, and brings the security fixes of
+  the 2.54 series. A system WebKitGTK older than 2.54 is asked the same two
+  questions WebKitGTK asks its EGL; when there is no display, the sign-in uses
+  the bundled runtime instead, and `doctor` says so. Should a WebKitGTK still
+  give up, the line its page process prints closes the window and says what
+  to install. Reproduced on a virtual display with the EGL vendors hidden:
+  2.52 left a grey window, 2.54 drew Microsoft's page.
+
+- **The bundled WebKitGTK runtime follows a session to another runtime
+  directory.** The launcher points the runtime's helper processes at a
+  directory under `XDG_RUNTIME_DIR`, or under `/tmp` when that variable is
+  unset, by rewriting a path inside the library. The rewrite stayed in the
+  library, and the next launch looked only for the original path. A session
+  with another runtime directory, or none, then failed with "the bundled
+  WebKitGTK does not carry the expected helper path". The launcher now
+  recognises its own earlier rewrite and moves it again.
+
+- **The XCurl request log lands in the logs folder.** With *Advanced
+  diagnostics* on, the XCurl shim records one line per HTTP request the game
+  makes: curl's result, the HTTP status and the URL, plus the answers of the
+  social and Realms services. It wrote them into the game's folder, where
+  nobody looks for a log and where the file grew with every session. Each
+  session's `xcurl.log` now moves to the logs folder when the game closes, next
+  to `minecraft.log`. It is the file that tells a Realms Hub upload failing
+  with "check your internet connection"
+  ([#163](https://github.com/Wyze3306/BedrockOnLinux/issues/163)), or Realms
+  greyed out ([#313](https://github.com/Wyze3306/BedrockOnLinux/issues/313)),
+  apart from a request the service refused.
+
+- **Started in fullscreen, Minecraft is no longer stretched and the mouse
+  lines up** ([#283](https://github.com/Wyze3306/BedrockOnLinux/issues/283)).
+  The game shows its window maximized, creates its frame at that window's
+  size, 848 rows on a 900-row screen once the window manager has drawn its
+  title bar, and only then makes the window fullscreen. It records the new
+  size but never resizes its frame, so the picture was stretched over the
+  screen and every click landed where the unstretched picture had the button.
+  Toggling fullscreen in game fixed it until the next start. The game does
+  resize for any later change of size, so once its menu is up the launcher
+  now sends its window one, a row shorter and then the real size, through a
+  small helper run inside Wine (`src/fullscreen-nudge.c`). The helper is aimed
+  at the game's window, never at whatever has the keyboard, and only at a
+  window that covers its screen. Measured: the game then reallocated to
+  1600×899 and 1600×900, and its buttons are drawn at their native size again.
+  `BOL_FULLSCREEN_NUDGE=0` turns it off.
+
+- **Automatic DLL injection waits for the main menu**
+  ([#281](https://github.com/Wyze3306/BedrockOnLinux/issues/281)). It waited
+  for the game's window and the configured delay, but the window opens on the
+  loading screen, 13 seconds before the menu on a warm start and over a minute
+  before it on a cold one. A client was loaded mid-startup, which a manual
+  injection never does, and that is where Flarial's automatic injection lost
+  the mouse while its manual one did not. The game writes the feature flags
+  it fetches right after drawing its menu, and the injection now waits for
+  that too. Measured with a DLL that records when it is loaded: the window
+  appeared at 21:18:15, the injection used to come at about 21:18:21, and it
+  now came at 21:18:28, with the menu on screen at 21:18:29. A game that never
+  writes them is injected anyway, 150 seconds after its window.
+
+- **Starting Minecraft without a network says why it cannot**
+  ([#308](https://github.com/Wyze3306/BedrockOnLinux/issues/308)). A game
+  downloaded from the Microsoft Store stays encrypted on disk, and xodus-cli
+  fetches the key that decrypts it from Microsoft at every launch. With no
+  connection that ended in a Rust panic in the log and a game that closed at
+  once. The launch now ends as *Minecraft could not start*, saying that the
+  game needs an internet connection to start, single-player included. The
+  README no longer says single-player works offline.
+
+- **The Microsoft Store sign-in works where the system's WebKitGTK has no
+  TLS support** ([#249](https://github.com/Wyze3306/BedrockOnLinux/issues/249)).
+  WebKitGTK speaks TLS through a GIO module, glib-networking's, that GIO looks
+  for at run time. A Nix or Guix WebKitGTK reached outside the wrapper that
+  points GIO at it loads fine, and then the sign-in window shows only "TLS
+  support is not available". Before using the system's WebKitGTK, the
+  launcher now asks the GIO that library loads, in the environment xodus-cli
+  gets, whether it has a TLS backend. When it does not, it uses its bundled
+  WebKitGTK runtime, which carries its own, and `doctor` says so.
+
+- **`bedrock-on-linux optiscaler` works from the portable .pyz.** The .pyz
+  started the launcher's command line itself, which has no `optiscaler`
+  command, so `optiscaler install` answered "invalid choice", and an
+  OptiScaler installed some other way was not applied when the launcher
+  started. Every way of starting the launcher now goes through the same
+  entry point.
+
+- **The portable .pyz comes back after updating itself.** *Restart now*
+  took the .pyz for a launcher started with `python3 -m bol`, restarted it
+  that way, and Python could not find the launcher outside the archive: the
+  window closed and nothing came back.
+
+- **Switching profile under Nix or Guix no longer stops at a Python error.**
+  The new window was started by handing the `bedrock-on-linux` found on
+  `PATH` to Python, and the wrapper both install under that name is a shell
+  script. It is now run directly.
+
+- **The Legacy compatibility renderer keeps Minecraft's own Max Framerate**
+  ([#314](https://github.com/Wyze3306/BedrockOnLinux/issues/314)). Since
+  2.2.8 the launcher holds the player's limit through vkd3d-proton and sets
+  the game's own limiter aside for the session. Proton leaves vkd3d-proton
+  out altogether for the legacy renderer, so on the older GPUs that need it
+  nothing held the limit any more, and the game ran unpaced from its splash
+  screen on. There, the game now keeps pacing itself, as it did before 2.2.8.
+  A limit that a session cut short left set aside, by a hard reset or a
+  killed launcher, now goes back before the next game starts. Going back to
+  an older launcher did not restore it: those do not know where it was kept.
+
+- **The game may use swap again on machines with less than 6 GiB of RAM**
+  ([#314](https://github.com/Wyze3306/BedrockOnLinux/issues/314)). 2.2.8
+  keeps Minecraft's memory out of swap while it runs. Where the game and the
+  desktop do not fit in RAM together, that left the kernel nothing to reclaim
+  but program code and the page cache, the game's and the desktop's, and the
+  whole machine could freeze where the game used to slow down. The guard now
+  applies from 6 GiB of RAM, twice what Minecraft settles at with a world
+  loaded; below that, the game swaps as it did before 2.2.8.
+
+- **The update notice gives a Flatpak install the command that updates it**
+  ([#315](https://github.com/Wyze3306/BedrockOnLinux/issues/315)). The
+  README installs the Flatpak with `--user`. A new bundle installed without
+  it became a second, system-wide copy, and the menu kept starting the
+  per-user one, still at the old version. *Update now* now names the bundle
+  and the exact command, `flatpak install --user` or `--system` according to
+  where the running copy is installed. The README says how to remove a copy
+  installed the other way.
+
+- **Shutting down with Minecraft open no longer blocks the next PLAY.**
+  Every first launch after such a reboot was refused as an "Unsafe graphics
+  session" until the GPU incident was acknowledged. The launcher records each
+  game session so that a hard lock leaves a trace, and clears the record once
+  the game has closed. At poweroff, systemd stopped the launcher a moment
+  before the game, and the record outlived a game that had closed normally
+  two seconds later. A SIGTERM or SIGHUP received while Minecraft runs now
+  waits up to 20 seconds for the game to close, so the record is cleared,
+  and the launcher then stops with the signal it was sent. A session that
+  does not close within that time keeps its record, as before. Steam's
+  *Exit game* sends SIGINT and then SIGKILL four seconds later, and that is
+  unchanged: a record left that way is still cleared by the next PLAY in the
+  same boot. On a Wayland session the launcher window can still be closed
+  with its compositor before the game has closed.
+
+- **`BOL_ALLOW_UNSAFE_GPU=1` gets past an interrupted launch.** The override
+  let the safety check through, and then the launch stopped at the old
+  record anyway with "still marked interrupted", so the documented way
+  around the block never worked for it. The record is now replaced with a
+  warning that the start is at the player's own risk. The warning also names
+  any driver fault the record was hiding from the check. When Steam starts
+  the launcher, the refusal says where the variable goes in a shortcut:
+  `BOL_ALLOW_UNSAFE_GPU=1 %command%` at the start of its launch options. In
+  the Target field, Steam takes `env BOL_ALLOW_UNSAFE_GPU=1 …` as the name of
+  a program that does not exist, and the shortcut starts nothing.
+
+- **Answering Yes to "Minecraft could not start" starts Minecraft.** After
+  the acknowledgement, PLAY carries on by itself and runs every safety check
+  again. Before, the player had to press PLAY a second time. The refusal for
+  an interrupted launch no longer tells the player to reboot when they
+  already have, or to repair a driver nothing says is broken.
+
+- **Restarting into an update no longer blocks PLAY.** When an update
+  finished while Minecraft was running, *Restart now* replaced the launcher
+  on the spot. The game session it was watching never reached the step that
+  clears its GPU safety record, and the restarted launcher, which keeps the
+  same process ID, took that record for a session of its own still running:
+  every PLAY was refused as "still marked active in this launcher" until the
+  launcher was quit and started again. The restart is now offered once the
+  game has closed.
+
+### Packaging
+
+- **A `pyproject.toml`, for distributions to build the launcher with their
+  own Python tooling**
+  ([#306](https://github.com/Wyze3306/BedrockOnLinux/pull/306)). The wheel
+  installs the `bedrock-on-linux` command, the desktop entry and the icon,
+  which is now `data/bedrock-on-linux.png`, the name the icon theme uses;
+  `data/icon.png` stays as a link to it. Contributed by
+  [@apteryks](https://github.com/apteryks), who packages BedrockOnLinux for
+  Guix. On top of it, the wheel carries the DLL injector, declares the
+  modules the launcher would otherwise pip-install on first start, finds its
+  icon under the prefix it was installed to, and leaves updates to pip or to
+  the package manager instead of writing a .pyz over pip's script.
+
+- **The Nix flake gets PySide6 from the binary cache again**
+  ([#309](https://github.com/Wyze3306/BedrockOnLinux/pull/309)). It asked
+  for Python 3.12, and cache.nixos.org no longer carries PySide6 for it on
+  current nixos-unstable, so every update of nixpkgs meant building PySide6
+  from source. The flake now uses nixpkgs' default Python, 3.14, with
+  PySide6 6.11; the test suite passes on Python 3.14. Contributed by
+  [@silverhadch](https://github.com/silverhadch).
+
+- **`packaging` is no longer a dependency.** The CustomTkinter window
+  needed it, and nothing has imported it since the move to PySide6 in
+  2.2.2. It was still on the list of modules the launcher checks on
+  start, so on a host without it the launcher pip-installed its pinned
+  GUI toolkit on top of the one already installed. The AppImage, .deb,
+  .rpm and Flatpak no longer bundle it, and the flake and
+  `pyproject.toml` no longer ask for it.
+
+## 2.2.8 — 2026-10-04
+
+### Added
+
+- **Experimental OptiScaler integration for Minecraft RTX**
+  ([#276](https://github.com/Wyze3306/BedrockOnLinux/pull/276)).
+  `bedrock-on-linux optiscaler install` downloads a pinned, checksummed
+  OptiScaler v10 build — nothing is bundled — and attaches it to the active
+  Minecraft build, so the game's own DLSS input can feed XeSS or FSR, and
+  OptiFG frame generation, on GPUs that are not NVIDIA's. It copies the
+  game's own `nvngx_dlss.dll` to `nvngx.dll`, which is what makes Minecraft
+  offer its Upscaling switch under Wine. Off unless installed; `optiscaler
+  disable` and `uninstall` take it back out. See
+  [docs/OPTISCALER.md](docs/OPTISCALER.md). Contributed by
+  [@darrenintr](https://github.com/darrenintr).
+
+### Fixed
+
+- **Minecraft's own Max Framerate no longer holds a whole CPU core**
+  ([#173](https://github.com/Wyze3306/BedrockOnLinux/issues/173)). The
+  game waits for each frame's deadline by polling for window messages, and
+  under Wine every empty poll is a `sched_yield` between two `getrusage`
+  calls. Measured in a loaded world at 60 FPS, vsync on, on a 144 Hz display:
+  the main thread, the one that builds every frame, sat at 99% of a core,
+  about 70 points of it in the kernel. The launcher used to warn about this
+  only with vsync off, on the assumption that vsync makes the game wait in
+  its present call instead. It does not while the cap is below the display's
+  refresh rate. The launcher now holds the player's own limit through
+  vkd3d-proton, whose limiter sleeps. For the
+  length of a session the setting reads *Unlimited* in game, and the
+  player's value goes back into `options.txt` once the game has exited. A
+  value chosen in game during the session is kept instead. The frame rate
+  is the player's, only the wait is cheaper. `BOL_FRAME_RATE=0` leaves the
+  game to pace itself.
+
+- **The game's memory stays in RAM while it runs.** A desktop that runs short
+  of memory pages out what was touched least recently. In a game, that is
+  the world behind the player, and the whole game while its window is in the
+  background. Every page then comes back through a major fault on the thread
+  that needs it. Measured on a 16 GiB desktop with 13 GiB already in swap,
+  with the GPU at 7-20% throughout:
+  - 27,203 major faults in three seconds after coming back to the game;
+  - frames of up to 983 ms;
+  - one stretch of about 30 seconds without a single presented frame.
+
+  Where the user's systemd can enforce it, the launcher now starts the game
+  in a scope that may not use swap at all (`MemorySwapMax=0`, no privilege
+  needed), so reclaim falls on the page cache and on other programs. Whether
+  that works is probed at every launch through the game's own environment.
+  A Flatpak, a host without systemd, or a memory controller that is not
+  delegated starts the game exactly as before. `BOL_ALLOW_GAME_SWAP=1` turns
+  it off.
+
+- **A controller that Steam Input drives moves the launcher's highlight once
+  per press** ([#288](https://github.com/Wyze3306/BedrockOnLinux/issues/288)).
+  With Steam Input on — Game Mode on a Steam Deck, Big Picture anywhere — a
+  PlayStation controller reached the launcher twice: as itself, *Wireless
+  Controller*, and as the virtual *Microsoft X-Box 360 pad* Steam feeds on its
+  behalf. Every press counted twice, and turning Steam Input off fixed the
+  launcher only to lose the controller in the game. Steam names the
+  controllers it has taken over in the environment of everything it starts,
+  `SDL_GAMECONTROLLER_IGNORE_DEVICES`, so that programs keep its virtual pad
+  alone; the launcher now reads that list the way SDL does. Started outside
+  Steam, nothing changes.
+
+- **A licence Microsoft refuses at PLAY is shown in a dialog**
+  ([#280](https://github.com/Wyze3306/BedrockOnLinux/issues/280)). When the
+  account had reached its limit of ten Microsoft Store devices, the game did
+  not start and the launcher said why only in its activity log, so PLAY
+  looked as if it had done nothing. The launch now ends as *Minecraft could
+  not start*, with the reason and the page where devices are removed,
+  https://account.microsoft.com/devices/content; a shortcut that starts the
+  game without the window shows it as a desktop notification.
+
+- **Exporting works: structure blocks, worlds, the album**
+  ([#167](https://github.com/Wyze3306/BedrockOnLinux/issues/167)). Every
+  export Minecraft offers asks Windows for its save dialog,
+  `Windows.Storage.Pickers.FileSavePicker`, and the engine had none: the
+  request failed as a class that is not registered, and a structure block's
+  export — like *Export World* — stayed on its loading screen for ever, with
+  no file written. The engine (native19) now implements it: the dialog opens
+  where the game suggests, with the file name and the file type it asks for,
+  asks before replacing a file, and hands the chosen file back to the game.
+  The launcher registers the class in the Wine prefix before every launch,
+  since Wine would not add it to an existing one. Checked with a program that
+  asks for the dialog exactly the way Minecraft does: the file is created and
+  its path handed back, an existing file is left intact, and a dismissed
+  dialog returns nothing.
+
+- **A Microsoft Store sign-in that was only half kept is asked for again,
+  instead of ending the download on `NotFound`**
+  ([#260](https://github.com/Wyze3306/BedrockOnLinux/issues/260)). The
+  downloader keeps the Store session in a keyring, and a license request
+  reads the account from it as well as its tokens. The launcher counted the
+  tokens alone as a sign-in, so a keyring holding them without the account
+  started the download anyway, which died at 0 % on *called
+  `Result::unwrap()` on an `Err` value: NotFound*, on every mirror in turn.
+  Reproduced by deleting that one entry from a copy of a working keyring. The
+  launcher now requires both, and offers the Store sign-in when either is
+  missing.
+
+- **The Minecraft downloader follows Xodus upstream again.** It moves to
+  xodus-gaming/xodus@64d39eb, 24 commits past the one it was pinned to:
+  malformed and oversized licensing replies are handled instead of taking
+  the download down, a length underflow in the licence parser is guarded,
+  DisplayCatalog replies it could not parse are read, and the MSIXVC reader
+  behind every download and launch was reworked. The launcher's patches are
+  carried on top, and a fifth joins them for
+  [#260](https://github.com/Wyze3306/BedrockOnLinux/issues/260): a keyring
+  missing any part of the Store session — the device's or the account's —
+  now ends the download on *not logged in: … sign in again*, which the
+  launcher answers with the Store sign-in, instead of a panic. Checked here
+  end to end: licensing, a full download of 1.26.52.3, and the decryption
+  every launch goes through, which gives the same executable, byte for
+  byte, as the previous build. Xodus now needs Rust 1.98 to build.
+
+- **The launcher gives back disk space it never used again**
+  ([#289](https://github.com/Wyze3306/BedrockOnLinux/issues/289),
+  [#295](https://github.com/Wyze3306/BedrockOnLinux/issues/295)). Two kinds
+  of leftovers went unnoticed. Launchers before 2.1 downloaded every
+  Minecraft version as a zip of about 1.3 GB and kept it in their cache once
+  it was extracted; nothing has read one since Minecraft comes from Microsoft
+  through Xodus. And the first engine update set aside a copy of every
+  system DLL of the Wine prefix it refreshed — some 1,100 of Wine's own
+  files, 1.1 GB on the machine this was measured on — which nothing ever put
+  back. Both go at the next PLAY. Copies of DLLs that did not come from the
+  engine, such as DXVK's and vkd3d-proton's, are kept, and no world, pack or
+  setting is touched.
+
+- **The password prompt of the first Store sign-in is explained before it
+  appears** ([#297](https://github.com/Wyze3306/BedrockOnLinux/issues/297)).
+  Xodus registers the PC as a Microsoft Store device the first time, as
+  Windows does, and reads the firmware's system information for it
+  (manufacturer, model, serial number and UUID). Only root can read that
+  record, so it asks through pkexec, and the desktop showed a password
+  prompt for `cat /sys/firmware/dmi/entries/1-0/raw` that nothing explained.
+  The launcher now says what the prompt is and that cancelling it is fine:
+  the PC is then registered without that record, as it always is in the
+  Flatpak.
+
+- **The graphics-safety block says how to apply its override**
+  ([#301](https://github.com/Wyze3306/BedrockOnLinux/issues/301)). It ended
+  on a bare `BOL_ALLOW_UNSAFE_GPU=1`, which only works in the launcher's own
+  environment: `flatpak run` passes nothing from the calling shell into the
+  sandbox, and the custom environment variables in Settings only reach the
+  game. Typed into either, it changed nothing. The message now gives the
+  command line for the installation it runs from, such as
+  `flatpak run --env=BOL_ALLOW_UNSAFE_GPU=1 io.github.wyze3306.BedrockOnLinux`.
+
+- **GameInput follows the Minecraft build it serves**
+  ([#300](https://github.com/Wyze3306/BedrockOnLinux/issues/300)). The
+  camera's mouse movement and every controller reach Minecraft through
+  Microsoft's GameInput, which the launcher installs into the Wine prefix
+  from the game's own package. It did that once: a prefix kept the GameInput
+  of the build it was made for, through every Minecraft update after it,
+  where Windows brings GameInput up to the version each build ships. At PLAY
+  the launcher now compares the two and installs the game's when it is the
+  newer one. A newer GameInput than the game's is kept.
+
+- **A launch whose launcher was killed with its Flatpak or container is no
+  longer reported as still running**
+  ([#299](https://github.com/Wyze3306/BedrockOnLinux/issues/299)). The
+  graphics-safety record of a launch names the launcher by its process ID,
+  and a Flatpak or a container gives every session a namespace of its own, so
+  the next session's launcher usually has the very ID the last one recorded.
+  The launcher then took itself for the session it was blocked by, and asked
+  for it to be closed or force-stopped when nothing was left to stop. The
+  record now carries the process's start time as well, so that session reads
+  as what it is: interrupted during this boot.
+
+- **The launcher refuses to run through sudo**
+  ([#299](https://github.com/Wyze3306/BedrockOnLinux/issues/299)). As root
+  it read root's copy of the game, the sign-ins and the safety records:
+  `sudo bedrock-on-linux doctor --acknowledge-gpu-crash` found no incident to
+  acknowledge, because the incident was recorded in the user's data. Where
+  sudo keeps `HOME`, it left files that only root can change in the user's
+  data instead. Nothing in the launcher needs root, so it now says to run it
+  without sudo. `BOL_ALLOW_ROOT=1` overrides this.
+
+- **A Minecraft download that stops moving says so, and is retried**
+  ([#304](https://github.com/Wyze3306/BedrockOnLinux/issues/304)). A stalled
+  download looked like one about to finish: the bar sat on its last value
+  while xodus-cli asked Microsoft for the same data again without a word, or
+  waited on a disk it could not write to. A write error is now shown the moment
+  it happens, with what to do about a full disk; after 90 seconds without any
+  data the launcher says the download is waiting; after 10 minutes it stops that
+  attempt and starts again from Microsoft's other mirror.
+
+- **ChromeOS: the launcher window opens, and a crash on a virtual GPU points
+  at the setting that fixes it**
+  ([#302](https://github.com/Wyze3306/BedrockOnLinux/issues/302)). In
+  ChromeOS's Linux container, Qt's Wayland backend crashed the window on
+  ChromeOS's compositor; the launcher now draws it through XWayland there,
+  unless `QT_QPA_PLATFORM` says otherwise. And a game that dies of an access
+  violation on a virtio-gpu device, as Minecraft did on a Chromebook's Venus
+  driver ("Game closed (exit 84)"), is now diagnosed with the fix that worked
+  there: Settings ▸ Advanced ▸ Legacy compatibility renderer.
+
+- **An Intel GPU that recovered from a hang no longer blocks every launch
+  until a reboot** ([#301](https://github.com/Wyze3306/BedrockOnLinux/issues/301)).
+  The graphics-safety check read any "GPU HANG" from Intel's driver in the
+  kernel log as a fatal fault. The driver logs one for every hang it then
+  resets its way out of, and a laptop with a UHD 610 was refused with every
+  setting until it rebooted. A hang the driver recovered from is now a warning
+  at PLAY and in Doctor. A GPU the driver gave up on ("wedged", a failed
+  reset) still blocks, as do NVIDIA and AMD faults.
+
+- **The README says how to remove everything**
+  ([#295](https://github.com/Wyze3306/BedrockOnLinux/issues/295)). Removing
+  the app left the game, the Wine prefix, the engine and its runtime behind,
+  more than 8 GB for one reporter, and nothing said where they were. The new
+  *Uninstalling* section lists each location, what to save first (the worlds)
+  and the one Flatpak command that does it all.
+
+- **The mouse wheel no longer closes the game under the Wayland driver**
+  ([#296](https://github.com/Wyze3306/BedrockOnLinux/issues/296)). With
+  `BOL_INPUT=wayland` or `PROTON_ENABLE_WAYLAND=1`, the first turn of the
+  wheel ended the game with "listener function for opcode 9 of wl_pointer is
+  NULL". Wine's Wayland driver asked the compositor for the newest seat
+  version, whose wheel event its pointer handler has no place for when it is
+  built against the libwayland the engine is built with. The engine (native20)
+  now asks for the version before it, which delivers the wheel the way the
+  driver already handles.
+
+- **A launch interrupted by its launcher no longer blocks PLAY until a
+  reboot** ([#299](https://github.com/Wyze3306/BedrockOnLinux/issues/299)).
+  When the launcher was closed with its terminal, its Flatpak or its
+  container while the game ran, its safety record stayed "running", and every
+  launch was refused until the machine restarted; one Guix user deleted the
+  file by hand. PLAY now clears that record itself when its launcher is gone,
+  nothing of the session is left running and the boot is the same one, then
+  runs the kernel and display checks as before. A session whose launcher is
+  still alive, and one interrupted by a reboot, are handled as they were.
+
+- **The test suite passes in a packaging sandbox**
+  ([#303](https://github.com/Wyze3306/BedrockOnLinux/issues/303)). Guix
+  builds without `/bin/sh`, `/usr/bin/env` or a network, and with a long
+  temporary directory. Stand-in programs written by the tests relied on the
+  first two, so some tests reached out to GitHub and one waited forever; the
+  suite now runs to the end there.
+
+## 2.2.7 — 2026-09-17
+
+### Fixed
+
+- **Installing Steam after BedrockOnLinux works again**
+  ([#265](https://github.com/Wyze3306/BedrockOnLinux/issues/265)). On a
+  computer without Steam, the launcher created `~/.steam/steam` as an ordinary
+  folder, just to have somewhere to point Proton. Steam's installer needs that
+  exact path to be a link to its own data folder and cannot replace a folder,
+  so every Steam installed afterwards stopped at *Couldn't set up Steam data -
+  please contact technical support*, with nothing to say what was in the way.
+  Proton only reads the Steam client from that folder, so the launcher now
+  keeps its own in its data folder whenever no real Steam installation is
+  there, and removes the empty `~/.steam/steam` an earlier version left
+  behind. A folder with anything in it is never touched, and an installed
+  Steam is used exactly as before.
+
+- **The launcher opens again after its files were moved to another drive**
+  ([#255](https://github.com/Wyze3306/BedrockOnLinux/issues/255)). Moving the
+  data folder in Settings takes the worlds, settings and sign-in along and
+  leaves the engine, caches and logs in the old folder. At the next start the
+  launcher took those leftovers for data from before its switch to the
+  standard XDG folders and set out to migrate them into the new location —
+  creating a lock file next to the chosen folder first. For a drive mounted
+  under `/media/<user>/`, that is a folder only the system can write to, so
+  every start ended in *Could not migrate the legacy data safely … Permission
+  denied*, with the AppImage and the .deb alike; elsewhere it only printed a
+  misleading warning about two data folders. A location chosen in Settings is
+  no longer treated as a migration target.
+
+- **PLAY works when the launcher was opened from the application menu on
+  Cinnamon** ([#261](https://github.com/Wyze3306/BedrockOnLinux/issues/261)).
+  Started through `gtk-launch`, as Cinnamon's menu does, the launcher's
+  console output goes to a pipe that nothing reads any more once `gtk-launch`
+  has exited. Every log line is also written to that console, so the first
+  one after that failed with *Broken pipe* and stopped PLAY before it reached
+  the Microsoft sign-in. A console that has gone away is now let go of: its
+  output goes to `/dev/null`, the lines still appear in the launcher's
+  activity log, and the programs the launcher starts no longer inherit the
+  dead pipe either — writing to it would have killed them. Started from a
+  terminal, nothing changes. Diagnosed by
+  [@DevTheFool](https://github.com/DevTheFool).
+
+- **A system whose glibc is too old is told so, instead of being sent to
+  install WebKitGTK it already has**
+  ([#264](https://github.com/Wyze3306/BedrockOnLinux/issues/264)). The
+  Minecraft downloader, `xodus-cli`, needs glibc 2.39 or newer, which Ubuntu
+  22.04 and the distributions built on it — Pop!_OS, Zorin OS 17, Linux Mint
+  21 — do not have. The launcher only checked whether the program started,
+  and reported every failure as a missing WebKitGTK: players installed
+  `libwebkit2gtk-4.1-0`, sat through an 80 MB download of the bundled copy,
+  and got the same message again. The loader's own words now decide: an old
+  glibc is named with the version needed and the version installed, the
+  bundled copy — built against the same glibc — is no longer downloaded for
+  nothing, and the Flatpak, which brings its own runtime, is pointed to. Any
+  other failure of the bundled copy now quotes what the loader said.
+  Diagnosed by [@duzos](https://github.com/duzos).
+
+- **Repair no longer deletes your worlds**
+  ([#253](https://github.com/Wyze3306/BedrockOnLinux/issues/253)).
+  *Settings › Tools › Repair (reset Wine prefix)* promised that worlds and
+  settings are kept, then deleted the whole Wine prefix — and Minecraft keeps
+  every world, pack, skin, screenshot and its own settings inside it, under
+  `AppData/Roaming/Minecraft Bedrock`. Players who repaired lost their worlds
+  with no warning. Repair now keeps that folder, and the Preview's, and resets
+  only what Wine rebuilds on the next launch. Everything that decides whether
+  a world survives is a rename done before anything is deleted: the old prefix
+  is set aside, Minecraft's folders move into the new one, and only then is
+  the rest removed — so closing the launcher in the middle of a repair costs
+  no world either, and if a folder cannot be moved, the repair stops with the
+  prefix exactly as it was. Checked end to end on a real prefix: repaired,
+  rebuilt by Wine around the kept folder, world intact.
+
+- **The Flatpak starts Minecraft on X11 sessions again, Steam Deck Game Mode
+  included** ([#259](https://github.com/Wyze3306/BedrockOnLinux/issues/259)).
+  Before starting the game, the launcher asks the X server whether a real GPU
+  drives the display, and it asked through the `xrandr` program — which the
+  Flatpak's runtime does not include. Unable to ask, it refused PLAY with
+  *Unsafe graphics session: the launcher could not verify any X11 hardware
+  provider* on every X11 session: a healthy desktop (#245) as much as Game
+  Mode, where the allowance made for Gamescope was never reached because it
+  only applies once the providers have been counted. That is also why
+  launching with `DESKTOP_SESSION=gamescope` did not help. The launcher now
+  asks the X server directly through its RandR library when the program is
+  missing — the same question, still without opening the GPU. Checked in the
+  Flatpak runtime on an X11 desktop: refused before, one provider found and
+  PLAY allowed after.
+
+- **NixOS: importing content no longer crashes the launcher**
+  ([#263](https://github.com/Wyze3306/BedrockOnLinux/issues/263)). On GTK
+  desktops the file picker is GTK's own, and GTK aborts the whole program when
+  its file-chooser settings schema cannot be found — which, run from the
+  flake, it never could: *Settings schema 'org.gtk.Settings.FileChooser' is
+  not installed*. The flake's wrapper now adds GTK's schemas to
+  `XDG_DATA_DIRS`, as the workaround
+  [@tuxmanxd](https://github.com/tuxmanxd) found did by hand.
+
+- **A download blocked at the DNS level says so**
+  ([#252](https://github.com/Wyze3306/BedrockOnLinux/issues/252)). When this
+  computer cannot look up the Microsoft server the game comes from —
+  `assets1.xboxlive.com`, `assets2.xboxlive.com` — the download used to end on
+  the downloader's raw error, `ok: Custom { kind: Other, error: reqwest::Error
+  { … ConnectError("dns error" … } }`, with nothing to say that the sign-in
+  was fine and only that name failed. It now names the servers that could not
+  be looked up and why, and where to look: the connection itself, then
+  whatever filters `xboxlive.com` — a DNS ad blocker such as Pi-hole, AdGuard
+  Home or NextDNS, a router's parental controls, or a VPN. Every mirror is
+  still tried first, since each one is a different name.
+
+### Packaging
+
+- **The Flatpak moves to the GNOME 51 runtime and gives up its access to the
+  Flatpak service.** GNOME 49 is at the end of its life now that GNOME 51 is
+  out. The manifest granted `--talk-name=org.freedesktop.Flatpak`, on the
+  belief that pressure-vessel needs it to start the game's container
+  ([#157](https://github.com/Wyze3306/BedrockOnLinux/issues/157)). It does
+  not: inside Flatpak, pressure-vessel asks the
+  `org.freedesktop.portal.Flatpak` portal for a sub-sandbox, which every app
+  may do. That name was a way out of the sandbox that nothing used, and it is
+  gone; `--allow=per-app-dev-shm` takes its place, so the container shares
+  `/dev/shm` with the launcher, as it does in Heroic and Bottles. Checked in
+  the GNOME 51 build without the permission: the Steam Runtime container
+  starts through the portal, GDK-Proton runs a command in a fresh prefix,
+  Vulkan sees the NVIDIA GPU, and `xodus-cli` loads the runtime's WebKitGTK.
+  The bundled Python moves to 3.12.14 — the runtime's own is 3.14, which
+  PySide6 6.9 does not support — and its packages are now installed by pip
+  from the same pinned files, with cffi built from source. The `zstd` module
+  is dropped, since the runtime ships `zstd` and `unzstd`, and the store
+  listing gets the current screenshot and declares keyboard, mouse and
+  controller support.
+
+## 2.2.6 — 2026-09-16
+
+### Fixed
+
+- **Minecraft 1.26.50 and newer start again instead of crashing at 78–82 %**
+  ([#266](https://github.com/Wyze3306/BedrockOnLinux/issues/266),
+  [#269](https://github.com/Wyze3306/BedrockOnLinux/pull/269)). Every
+  1.26.50.4 and 1.26.51.1 launch died on the loading screen with an unhandled
+  page fault reading `0x68`, on Intel, AMD and NVIDIA alike, and so did the
+  1.26.50 Minecraft Previews (#154, #267, #270, #271, #272). The launcher
+  caused it, not the game or the engine: to hide the in-game Sign-in button it
+  moved the compiled UI archive, `ui.brarchive`, aside so that the loose
+  JSON-UI files next to it would load instead — and 1.26.50 no longer ships
+  those files. The game was left with no user interface at all and crashed
+  while building its first screen. The archive now stays where the game
+  expects it, and the button is hidden by editing the start screen inside the
+  archive itself; an untouched copy is kept beside it as
+  `ui.brarchive.bol-orig`, and is put back on its own if the edited archive
+  ever fails to read back. PLAY also repairs an install an earlier launcher
+  already broke — including one whose `__brarchive` folder was made read-only
+  to work around the crash — so nothing has to be moved back by hand. Builds
+  up to 1.26.45 keep the old behaviour. Contributed by
+  [@jtdubs](https://github.com/jtdubs).
+
+- **Friends, Realms and featured servers work again on Minecraft 1.26.50 and
+  newer** ([#266](https://github.com/Wyze3306/BedrockOnLinux/issues/266),
+  [#269](https://github.com/Wyze3306/BedrockOnLinux/pull/269)). With the crash
+  out of the way, 1.26.50 still came up half offline for a signed-in player:
+  Social showed no friends, the Realms tab spun forever with its buttons
+  disabled, and featured servers kept a greyed-out Play button. 1.26.50 moves
+  the game's Xbox Live services into a new library built against a newer
+  Microsoft GDK, and that library asks the Xbox runtime for its system
+  interface under an ID the engine did not recognise — refused, the services
+  never started. The engine now answers every revision of that interface the
+  game's libraries ask for; all of them only use the sandbox query it already
+  implemented. Checked on 1.26.51.1: Social counts the friends online, Realms
+  offers its invitations, and featured servers can be joined. This needs the
+  new engine, `wow64-archs-native18`, which the launcher downloads on its own.
+  Contributed by [@jtdubs](https://github.com/jtdubs).
+
+- **The in-game mouse no longer goes dead on machines with an AIO cooler, a
+  fan or RGB controller, or a similar USB gadget**
+  ([#262](https://github.com/Wyze3306/BedrockOnLinux/pull/262)). The cursor
+  moved, but Minecraft saw no hover and no clicks, while the keyboard kept
+  working.
+  Wine's HID bus opens every `/dev/hidraw` node the user can open, and the
+  devices that ship `uaccess` udev rules for their Linux tools can be.
+  Some of them send input reports longer than their own descriptor declares
+  (an NZXT 1e71:1714 declares 21 bytes and sends 64), and Wine copies the
+  whole report into a buffer sized from the descriptor, in winebus's
+  `deliver_next_report` and again in hidclass's `hid_device_queue_input`.
+  The heap corruption crashed `winedevice.exe` at every start, and that
+  process hosts the whole HID stack, Wine's virtual mouse included, so
+  GameInput had no mouse left to read. PLAY now writes winebus's per-device
+  `Hidraw` = 0 option for every hidraw device Wine could open that is not a
+  game controller: Minecraft gets its mouse and keyboard from Wine's virtual
+  devices, and controllers keep hidraw exactly as before. `doctor` lists the
+  devices it covers, and `BOL_HIDRAW=all` gives them back to Wine.
+  Contributed by [@Leif-Yggdrasil](https://github.com/Leif-Yggdrasil).
+
+- **The version picker can be told to check for a new build right now**
+  ([#268](https://github.com/Wyze3306/BedrockOnLinux/pull/268)).
+  The list of installable Minecraft builds is fetched once per launch and
+  then cached for up to 12 hours, so a build that Mojang shipped after that
+  fetch stayed invisible until the cache aged out on its own — restarting
+  the launcher changed nothing, because the ordinary path only refetches
+  once per launch too. The version picker now has a ↻ button that bypasses
+  the cache and re-checks the build index on the spot; `bedrock-on-linux
+  versions --refresh` does the same on the command line — the wall players
+  looking for 1.26.50.4 on the day it came out ran into (#266).
+  Contributed by [@Queuereel](https://github.com/Queuereel).
+
+- **Updating the game engine no longer needs room for every engine you ever
+  had.** Each engine revision is an ~860 MB download the launcher keeps in its
+  cache, and nothing ever removed one once a newer revision was pinned — a
+  machine that followed every update carried gigabytes of archives no launcher
+  would open again. An update has to fit the new archive and its 2.5 GB
+  unpacked engine before the old one goes, so on a nearly full disk those
+  leftovers turned this release's engine update into a launcher refusing its
+  own engine. The archives of other engine revisions are now removed before
+  the new one is downloaded; the archive of the engine in use stays.
+
+- **PLAY no longer redoes an Xbox Live sign-in it already just finished.**
+  Every launch minted a fresh device, user, XBL, XSTS and SISU token chain —
+  eight sequential requests to Microsoft/Xbox — even when the previous launch
+  had done exactly that a minute earlier and the tokens were still good for
+  hours. The background warm-up that runs while you're still looking at the
+  account row (`_warm_xbox_preauth`) already does this work; PLAY was simply
+  throwing it away and starting over, worth roughly ten seconds of the wait
+  before Minecraft's window appears. PLAY now reuses a cached token chain
+  when it still has a comfortable margin left, and only re-runs the chain
+  when that margin has run out or the tokens are missing outright.
+
+## 2.2.5 — 2026-08-31
+
+### Added
+
+- **Settings ▸ Versions: see every Minecraft build you have downloaded, and
+  remove the ones you are done with**
+  ([#214](https://github.com/Wyze3306/BedrockOnLinux/issues/214)). Each build
+  is downloaded into a folder of its own, which is what makes going back to
+  one instant — and what made them pile up, because nothing ever removed one
+  and nothing ever said they were still there. Three versions tried out is
+  three copies of a 2.5 GB game, and the only way back was `rm -rf` on a path
+  the launcher never showed. The new tab lists every build on disk with what
+  it weighs, marks the one in use, the one that lost its package and the one
+  installed before the move to the Microsoft Store, and removes any of them on
+  request. Nothing you made is in those folders: worlds, settings,
+  screenshots, skins and packs belong to the profile, so a build can be
+  removed and downloaded again without touching a single world — which the tab
+  says in as many words, because "delete this version" reads like something
+  else entirely. A finished download now also names what the builds beside it
+  are taking up, instead of leaving the total to be discovered on a full disk.
+  On the command line: `bedrock-on-linux versions --installed` lists them and
+  `bedrock-on-linux versions --remove <build>` removes one.
+
+- **PLAY says so when nothing is signed in for online play** (#240). The
+  launcher asks for two Microsoft sign-ins, and only one of them ever asks for
+  itself: the account that downloads Minecraft is offered at PLAY, the moment
+  it is needed. The account that plays online never was, so its absence
+  surfaced only inside the game, as Realms, servers and friends quietly
+  missing — with nothing in the launcher having mentioned a sign-in. Pressing
+  PLAY without it now warns first, says what offline mode costs, and offers
+  the sign-in on the spot; taking it resumes the launch on its own rather than
+  asking you to press PLAY again. Offline is still a legitimate way to play,
+  so it is a warning and not a refusal: *Play offline* carries straight on,
+  the warning can be turned off from itself, and Settings ▸ Accounts puts it
+  back. `bedrock-on-linux play` prints the same warning rather than launching
+  in silence.
+
+### Fixed
+
+- **Your Xbox friends can see you again while you play**
+  ([#238](https://github.com/Wyze3306/BedrockOnLinux/issues/238),
+  [#243](https://github.com/Wyze3306/BedrockOnLinux/issues/243),
+  [#244](https://github.com/Wyze3306/BedrockOnLinux/issues/244)). The
+  dressing room said "Offline" under your own gamertag, the social tab said
+  it too, and no friend could invite you or be joined. It was not the game
+  misreading anything: asked straight out, Xbox Live agreed. Minutes after a
+  full launch the presence service still answered `state: Offline`, last seen
+  twelve days earlier — nothing had ever told it Minecraft was running. That
+  write belongs to the Xbox services layer the engine cannot bring up under
+  Wine, so it never happened, and every reader downstream of it was correctly
+  reporting an account that really was offline. The launcher now sends the
+  heartbeat itself, for exactly as long as the game runs, using the Xbox Live
+  token it already holds for Friends and Social; Xbox names the title, so it
+  can say only that Minecraft is being played, and by whom. Stopping the game
+  takes it down again, and Xbox drops it by itself a few minutes later if the
+  launcher is killed, so nothing can be left permanently in-game. It is on by
+  default and Settings ▸ Accounts turns it off.
+
+- **`bedrock-on-linux doctor --network` now answers "why can't I join my
+  friend's world?"** (#243, #244). The reports were unanswerable: the account
+  being invisible, the friends list not loading, and the friend simply not
+  being in a joinable world all look identical from the outside, and every
+  host in the report resolved and handshook perfectly through all three. The
+  report now asks Xbox Live directly and prints what it says — how this
+  account looks to other people, whether its friends list reads at all, and
+  how many of those friends are in a multiplayer session at this moment. None
+  of the three fail the report: an account nobody can see is a real problem
+  but not a broken host, and an evening with nobody in a world is not a fault
+  at all. `doctor` also gained an offline `xbox presence` line saying whether
+  the next launch will publish anything.
+
+- **Downloading Minecraft no longer fails on the downloader's own package
+  cache** ([#241](https://github.com/Wyze3306/BedrockOnLinux/issues/241),
+  [#242](https://github.com/Wyze3306/BedrockOnLinux/issues/242)). The
+  download read back shorter than what had been written to it, gave up, and
+  the attempt after it installed nothing at all without saying why — on a disk
+  with 75 GiB free in one report and 700 GiB in the other, so the room the
+  message ruled out was never the problem. The downloader streams the package
+  through a cache file beside the game and reads that cache back through a
+  second handle to work out the package layout, and it counted the bytes the
+  runtime had *accepted* rather than the bytes that had reached the file. A
+  write is accepted the moment it is queued on a background thread, so a read
+  sent to the same pool could overtake it, find the file short and call the
+  package corrupt. Retrying could not order those two operations — it only
+  bought another go at the same coin toss, and the go that lost it while
+  listing the package files rather than while reading its header exited
+  reporting success with no game installed. The fix has been carried in this
+  repository since [#217](https://github.com/Wyze3306/BedrockOnLinux/issues/217)
+  and reached nobody: a patched downloader is published under a revision of
+  its own, and the launcher still asked for the unpatched one. It now asks for
+  the fixed build, and continuous integration refuses a patch that is not
+  named by the pin, so this cannot happen again quietly.
+
+- **The launcher no longer forgets which build you play, and downloads
+  another one**
+  ([#214](https://github.com/Wyze3306/BedrockOnLinux/issues/214),
+  [#220](https://github.com/Wyze3306/BedrockOnLinux/issues/220),
+  [#247](https://github.com/Wyze3306/BedrockOnLinux/issues/247),
+  [#248](https://github.com/Wyze3306/BedrockOnLinux/issues/248)).
+  The version picker shows a shortened label — `26.44` for build 1.26.44.3 —
+  and that label was what got saved as the selection. Nothing could read it
+  back: it names no build the installer can find, so setup reported the choice
+  as no longer listed and installed the newest build instead. Picking 26.45
+  and landing in 26.44 is the same fault seen from the front, and so is a
+  launcher that starts every session by downloading something. Playing an
+  older version, closing the launcher and opening it again therefore landed
+  on the newest one with nothing having said so, and the next PLAY downloaded
+  2.5 GB of a game that was never asked for. The selection is now the build itself,
+  labels written by earlier releases are still understood, and the picker
+  comes back to what you last played.
+
+- **A Microsoft sign-in stuck on "Please wait" no longer takes the launcher
+  with it**
+  ([#214](https://github.com/Wyze3306/BedrockOnLinux/issues/214)). The account
+  that downloads Minecraft is linked through Microsoft's own page, in a
+  webview `xodus-cli` owns. When that page stops making progress it prints
+  nothing and the process never exits — and the launcher waited on it for
+  ever, with `capture_output` holding every line it might have printed until
+  an exit that was not coming. What the player saw was worse than the stall:
+  PLAY still ran the whole setup, got as far as the download, found no account
+  and stopped — three times over in the report — and every later *Sign in* was
+  a button that did nothing at all, because the flag saying a sign-in was in
+  flight had no way left to be cleared. The page is not stuck by accident. A
+  token exchange that faults hands back a second address to open, and the
+  downloader opened it with no headers at all — none of the nine telling
+  `login.live.com` it is talking to Windows' own token broker rather than to
+  a browser. Without them Microsoft serves the ordinary consumer interrupt,
+  which is the "Please wait" and the greyed *OK*: a page that never reaches
+  the one address the sign-in is waiting to see, so it waits for ever. The
+  second leg of the sign-in is opened like the first now
+  (`third_party/xodus/patches/`, on its way upstream), and the launcher ships
+  the downloader built with it. The rest of this stands whatever the page
+  does: the sign-in is something the launcher holds rather than waits on. Its window can be closed from the
+  account menu or from Settings, which signals the whole webview process
+  group; PLAY says the window is open instead of starting a download that
+  cannot work; a sign-in that has been up a long time says so; and a second
+  one is never silently swallowed. Whatever the sign-in prints is streamed as
+  it arrives and kept in `logs/store-login.log`, so a stall that reaches
+  nobody's terminal still leaves something to read. The page's own cache and
+  storage — never the tokens, which live in the keyring — are cleared before
+  each sign-in and pinned inside the launcher's Xodus home, so a flow
+  abandoned half-way is not resumed into by the next one, and nothing of it
+  lands in `~/.local/share` again. Closing the window is reported as the
+  ordinary change of mind it is, rather than as a failure of the launcher.
+
+- **A download that fails now leaves something to read**
+  ([#242](https://github.com/Wyze3306/BedrockOnLinux/issues/242)). The same
+  install was reported three times over and every line anyone had was the
+  launcher's own: *the Minecraft download installed no game and printed no
+  reason for it*. Nothing was ever written down — the launcher kept the last
+  forty lines the downloader printed for the error message and dropped the
+  rest — and what it kept was mostly not output at all. The downloader draws
+  its progress bars by redrawing one line, padded to the width the terminal
+  reports, which for the launcher's terminal was none: a single redraw of
+  three bars arrived here as 16 MiB of padding around 438 characters of bar.
+  The sentence saying what actually went wrong could arrive in the middle of
+  one of those frames, written from another thread. Every attempt now goes to
+  `logs/store-download.log` the way a sign-in already goes to
+  `store-login.log`, the frames are recognised and taken out so what is left
+  is the message, and a downloader that has already exited is read to the end
+  — a panic is written exactly there.
+
+- **Closing the launcher while it was busy in the background could end the
+  process on a crash instead of an exit.** Settings ▸ Versions adds up what
+  each installed build weighs, and both changelogs are fetched over the
+  network; all three run on threads that belong to the window. Closing it
+  while one was still going destroyed that thread mid-run, which Qt answers
+  by aborting the process — no data lost, the launcher was on its way out,
+  but it left a crash where a clean exit belonged. The work is now let go of
+  rather than killed or waited for: the window closes at once, and the thread
+  finishes on its own. Waiting would have been the other answer and the wrong
+  one, since two of the three are network reads.
+
+- **The Microsoft sign-in window no longer dies where the desktop has
+  accessibility running**
+  ([#236](https://github.com/Wyze3306/BedrockOnLinux/issues/236)). Signing in
+  to download Minecraft went blank part-way through — reported on Ubuntu with
+  KDE, and recognised straight away as something other WebKitGTK windows do on
+  Arch and NixOS too — leaving nothing to go on but a `WebKitWebProcess`
+  coredump in the system journal, and a launcher that could only say the
+  sign-in had not completed. That page is drawn by a process of its own, and
+  WebKitGTK publishes it on the accessibility bus; its AT-SPI text interface
+  then maps an attribute run back onto UTF-8 offsets by indexing a table with
+  the end of that run, which the code above it allows to point past the end of
+  the text it belongs to. A single `GetAttributeRun` landing on such a run
+  reads off the end of the array and aborts the process on the spot, taking
+  the sign-in with it. Nobody asks for that: the caller is whichever
+  accessibility client happens to walk the window, and the fault is still
+  present in WebKit's own tree, so there is no version to update to. The
+  launcher now keeps that window off the accessibility bus, the same way it
+  already keeps it off the DMABUF renderer, and for every `xodus-cli` call
+  rather than the sign-in alone. Nothing else about the window changes — it is
+  simply no longer readable by assistive technology, which is a real loss
+  where it is needed: `BOL_WEBVIEW_A11Y=1` asks for the bridge back, a
+  `WEBKIT_A11Y_BUS_ADDRESS` you set yourself still wins, and the game is never
+  started with either.
+
+## 2.2.4 — 2026-08-25
+
+### Fixed
+
+- **The in-game sign-in was back, and it has never worked** (#227, #228,
+  #229). Two patches keep Minecraft's Play screen usable under Wine. One takes
+  down the *You need a Microsoft account* notice that blocks the Servers and
+  Realms tabs — it is there because the Xbox social layer never finishes
+  starting under Wine, not because the account is missing. The other removes
+  the sign-in link inside that notice, which reaches an interactive sign-in
+  the engine does not implement and can only ever answer *Failed to log in.
+  Error Code: Llama*; the account is linked from the launcher instead. Both
+  were anchored on names Minecraft's interface invents afresh every time it is
+  built. It was rebuilt, the names changed, and both patches quietly stopped
+  matching anything — so setup kept reporting success on an installation where
+  the Play screen still said the account was missing and offered a button that
+  could only fail. They are anchored on the account fields and on the sign-in
+  address now, neither of which a rebuild renames, and a build that moves past
+  even those is reported rather than passed over: setup says so, and `doctor`
+  gained a `sign-in ui` line telling you whether the installed build still
+  carries both.
+
+- **The Minecraft download died on the licence Microsoft issued for it.**
+  *The Minecraft download failed: called `Result::unwrap()` on an `Err` value:
+  Custom("unknown variant `Trial`, expected one of `Device`, `User`, `Full`,
+  `KeyHolder`")* is the downloader refusing the answer to its own licence
+  request. Microsoft describes the kind of entitlement a licence was granted
+  for — owned outright, tied to a device, time limited — and the downloader
+  knew four of those words, so the fifth one ended a download that had already
+  fetched the package and asked for the key to open it. Nothing anywhere reads
+  that word: the content key travels beside it, in the block the download
+  actually needs. It is a licence the account holds, refused over the label on
+  the envelope. The downloader now keeps a description it does not recognise
+  instead of throwing the licence away, and a licence it genuinely cannot read
+  ends the download with a sentence rather than a panic
+  (`third_party/xodus/patches/`, on its way upstream). Until that build is
+  published the launcher recognises the panic, says what happened in words
+  about a licence, and stops asking other mirrors for a package whose licence
+  was never theirs to give.
+
+- **The Minecraft download was losing a race against its own cache** (#217,
+  #200, #215). *The Minecraft download failed: ok: Header(Io(Custom { kind:
+  UnexpectedEof, error: "cache ended before cached_len" }))* reads like a
+  corrupt package, and it is nothing of the kind. The downloader streams the
+  package through a cache file in the game folder and reads that cache back to
+  find out what the package holds — writing through one handle, reading
+  through a second — but it counts the bytes it *handed to* the write, not the
+  bytes the write put there. Both run on the same pool of threads, so the read
+  can overtake the write, find the file short of what the counter claims, and
+  take that for a broken download. Measured against the shipped downloader,
+  the cache claimed as much as 17 KiB more than the file held, on an idle disk
+  with room to spare: nothing to do with the disk, the network or the account,
+  which is why it stops some machines every time and others never. The race is
+  fixed in the downloader itself now — `third_party/xodus/patches/`, on its
+  way upstream — and until that build is published the launcher runs the
+  download again when it sees the short read, which is what a race responds
+  to. A destination that really has run out of room is told apart by the
+  arithmetic and still refused outright.
+
+- **The Minecraft download counted past a hundred percent and kept going**
+  (#216). "Downloading Minecraft…  24346886100%" is one number short of a
+  whole story: the byte counts crossed into Qt through a signal that carries
+  a C++ `int`, and the package is 2.3 GiB. The total wrapped negative, the
+  guard meant to keep it positive turned it into 1, and the status line read
+  the download out as its own byte count times a hundred — above a bar that
+  stayed empty the whole way down, since a progress bar ignores a value
+  outside its range rather than clamping it. Both the signal and the bar now
+  hold the figures they are given, so the percentage is the download's and
+  the bar fills once across it.
+
+- **A build that lost its encrypted package had no way back.** The game
+  executable Microsoft ships is ciphertext, decrypted at every launch out of
+  the package file beside it, and a folder without that file still holds an
+  executable and a manifest — so it counted as installed. The download was
+  skipped as unnecessary, every launch died on the missing package, and the
+  message about it pointed at "Install / Update", which is a command-line
+  verb the launcher window has no tab for. A build that cannot be decrypted
+  is now no longer a build that is installed: PLAY downloads it again, and
+  the message says so.
+
+- **A Minecraft download that had nowhere to go said so in Rust** (#200).
+  Everything the download needs lands in the same folder — the 2.3 GiB package
+  it streams through, and the build decrypted out of it — so a disk with a few
+  hundred MiB left could not finish it, and neither of the two ways it failed
+  named the disk. Refused mid-package, it came back as *The Minecraft download
+  failed: ok: Header(Io(Custom { kind: UnexpectedEof, error: "cache ended
+  before cached_len" }))*; refused a moment later, as *The Minecraft download
+  reported success but installed no game*, which is the downloader printing
+  what it measured and exiting successfully anyway. The room is now checked
+  before the download starts — the package's own size, asked of the same
+  mirror it comes from — and a first install that cannot fit is refused with
+  both figures and the folder it needs them in. An update is left alone,
+  because only part of a build is fetched and that part cannot be predicted.
+
+- **Failures the downloader printed were replaced with a sentence that said
+  nothing.** It exits successfully on most of the paths that end a download
+  early, and only its non-zero exits were being read — so an account that does
+  not own Minecraft, a Store session that had expired, and a disk with no room
+  left all arrived as *reported success but installed no game*, with the
+  reason it had just printed thrown away. All of them are now named, whatever
+  it exited with, and anything else keeps the line it printed.
+
+- **A package cache left by an attempt that never finished quietly installed
+  nothing.** The downloader resumes from it and can conclude there is nothing
+  to fetch, leaving a folder with no game in it — and nothing can be resumed
+  from that file anyway, because it starts a fresh one every run. It is now
+  dropped before the download rather than only after a failure.
+
+- **The AppImage never opened on a system without a zstd runtime** (#205).
+  Qt links libzstd.so.1 from libQt6Core — plain compression, none of the
+  graphics stack an AppImage genuinely has to borrow from the host — and the
+  bundle was still asking for it, so a NixOS session running it through
+  appimage-run got a traceback where the launcher should have been:
+  *ImportError: libzstd.so.1: cannot open shared object file*. It now ships
+  inside the AppImage, beside Qt's own libraries, taken from the same pinned
+  Debian 11 package the rest of the build already trusts. The build also
+  walks everything the launcher's window loads and refuses to package an
+  AppImage that asks the host for anything but the documented X11/OpenGL
+  libraries, so the next Qt update cannot reintroduce this quietly.
+
+- **A missing system library now has a name instead of a traceback.** The
+  launcher imported the whole Qt stack before it had even read its arguments,
+  so one library the host was missing took every command down with it —
+  including `doctor`, which exists to explain exactly this, and which called
+  the toolkit *OK (GUI)* because the files were all there. Qt is now imported
+  when the window is asked for: the failure names the library to install,
+  `bedrock-on-linux play` and `bedrock-on-linux doctor` keep working without
+  it, and `doctor` reports a toolkit that is installed but cannot load. On a
+  portable .pyz or a bare checkout this also restores the first-launch
+  install of the GUI toolkit, which the old import order made unreachable.
+
+## 2.2.3 — 2026-08-23
+
+### Added
+
+- **The controller can drive the launcher again**. Navigating the window with
+  a gamepad was lost in the PySide6 rewrite: the ring it moved was built on Tk
+  internals and was removed with the toolkit, leaving Steam Game Mode and every
+  other couch setup back at a window that needs a mouse to get past. It is
+  back, written against Qt. A highlight follows the d-pad or the left stick, A
+  activates, B goes back, the shoulder buttons change tab, Start plays and the
+  right stick scrolls — across the dock, the version picker, the profile and
+  account menus, every Settings tab and any dialog that opens over the window.
+  Opening Settings or What's New takes the highlight with it, and a list, a tab
+  bar or a text field is handed the key press so it navigates the way Qt
+  already knows how to. Reading controllers never changed: the same
+  `/dev/input` reader that survived the rewrite feeds it, so there is still no
+  new dependency and hot-plug still needs no restart. Off with *Settings ▸
+  General ▸ Controller*, or `BOL_CONTROLLER=0` for one session.
+
+- **Discord now shows what you are playing.** Start Minecraft and your friends
+  see *Playing BedrockOnLinux* on Discord, with the build you are on, how long
+  you have been playing, and buttons that lead to the project and to its
+  Discord server. That is how a launcher like this one is found in the first
+  place — somebody notices a friend playing Bedrock on Linux and asks how — and
+  until now a play session said nothing about where the game had come from.
+  Nothing has to be installed for it: Discord's local socket is spoken to
+  directly, with no library, no account and no network call of the launcher's
+  own, and the only things it is ever told are the edition and the version —
+  never the account, the worlds, or the server being played on. It ends with
+  the game, and **Settings ▸ General ▸ Discord** turns it off. Inside the
+  Flatpak, Discord has to be running before the launcher is, because the
+  sandbox binds its socket at startup.
+
+### Fixed
+
+- **A fresh install could not fetch the game engine**, on 2.2.0, 2.2.1 and
+  2.2.2 alike. The engine archive those releases are pinned against was rebuilt
+  in place — same revision name, same file name, same URL — to carry a Wayland
+  driver of our own build. Different bytes at an address three published
+  releases had already shipped trusting: the launcher checks what it downloads
+  against a SHA-256 it carries, found bytes it had never been told about, and
+  refused the engine with *Prebuilt engine rejected (engine archive SHA-256
+  mismatch)* — on a first install, with nothing there to fall back on. The
+  engine now lives under a revision of its own, `wow64-archs-native17`, at its
+  own URL, and the archives the older releases point at are back to being left
+  alone. A revision names one set of bytes; a rebuild gets a new one rather
+  than overwriting a published archive.
+
+- **The version picker now takes the version you highlighted.** Arrowing down
+  the list and pressing Enter picked the first row that had survived the filter
+  instead of the highlighted one, so keyboard and controller users could ask
+  for one build and install another.
+
+## 2.2.2 — 2026-08-22
+
+### Added
+
+- **Both Microsoft sign-ins now live in one menu, top right.** The launcher
+  needs two, and until now it never said so: the one for playing online sat at
+  the top of the window, the one that downloads and updates Minecraft was
+  buried in *Settings ▸ Accounts*, and nothing anywhere explained that they
+  were different sessions at all. So a player who had signed in once — and
+  been told "Signed in" — could reach ▶ PLAY and be handed "you have to sign
+  in", about an account they had never been offered, with nothing in the
+  window to click. The pill in the corner now opens a small menu holding both,
+  each with what it is for, where it stands, and the one thing you can do
+  about it; the dot on the pill only goes green when both are in, and its
+  tooltip names them separately. The menu also says once why there are two.
+  *Settings ▸ Accounts* still works and stays in step.
+
+- **PLAY offers the download sign-in instead of failing.** Reaching the
+  download with no account for it was reported as "Minecraft could not
+  start" — true, and useless: nothing was broken and nothing had been
+  downloaded, the game simply had no account to be fetched with. It now asks
+  for that account, and resumes the launch on its own once it is there rather
+  than making you press PLAY again. Signing in to play online also offers the
+  download's sign-in straight afterwards, while you are still in the middle of
+  signing in, instead of letting you find out at PLAY.
+
+- **A server you can actually join, in the Servers tab.** Bedrock opens that
+  tab on the featured servers it sells, and a fresh install has nothing of its
+  own underneath, so joining anything meant finding an address elsewhere and
+  typing it in by hand — the game offers no way to import one. Linesia
+  SkyFaction (`play.linesia.net`, port 19132) is now written into the list the
+  game reads at startup, for every signed-in account. The list belongs to you:
+  seeding only ever adds, never reorders or removes, and deleting the entry in
+  game keeps it deleted.
+
+### Changed
+
+- **The launcher window is now built on Qt instead of Tk**. Everything is
+  where it was — the hero screen, the dock with the version picker, the
+  Stable/Preview toggle and ▶ PLAY, the sliding Settings and What's New
+  panes, the collapsible activity log — but none of it is drawn by
+  CustomTkinter any more. What that buys is mostly invisible and mostly
+  overdue: dialogs that centre themselves on the right monitor without the
+  launcher doing the arithmetic, DPI scaling handled by the toolkit rather
+  than by a manual 100/150/200% picker (which is why that setting is gone),
+  real toggle switches instead of checkboxes with rounded borders, and a
+  window that draws natively under Wayland instead of always going through
+  XWayland. Background work — setup, launching, sign-in, imports, DLL
+  injection, relocation, self-update — moved onto Qt threads reporting back
+  through signals, replacing the hand-rolled polling the Tk build needed to
+  avoid drawing from the wrong thread.
+
+- **The launcher now needs Qt's runtime libraries.** The `.deb`, `.rpm`,
+  AppImage and Flatpak all bundle the toolkit itself, so there is nothing new
+  to install by hand; the distribution packages simply depend on the X and
+  OpenGL libraries Qt loads at startup, in place of `python3-tk`. A portable
+  `.pyz` or a git checkout downloads it on first launch as it did for
+  CustomTkinter. `doctor` reports the toolkit under its new name.
+
+### Removed
+
+- **Controller navigation of the launcher window is gone for now**, the one
+  thing from 2.2.1 that did not survive the move to Qt. It was written
+  directly against Tk's widget tree — walking children, drawing the highlight
+  on a Canvas, binding through `tkinter.Misc.bind` — and none of that has an
+  equivalent to port to. Reading the pad itself is untouched and `doctor`
+  still reports which controllers it can see, so nothing about playing with a
+  controller changes; it is only the launcher window that needs a mouse again,
+  until a Qt-native replacement lands. Steam Game Mode is unaffected in the
+  usual case, since the window steps aside on its own there.
+
+- The **UI scale** setting (100/150/200%). Qt scales for the display's DPI on
+  its own, and a second scale factor on top of that fought it.
+
+- The **QR code** on the Xbox sign-in dialog. The code and the button that
+  opens the sign-in page are unchanged.
+
+### Fixed
+
+- **Closing the launcher window left it running.** The process stayed resident
+  with no window, every time, and a second launch added another one. The Qt
+  rewrite needs the event loop to outlive the window so that "close the
+  launcher when Minecraft starts" can hand the game off — but that makes
+  quitting an explicit act, and nothing was doing it.
+
+- **The `.deb` and `.rpm` could install and then not start at all.** Qt's xcb
+  plugin loads thirteen X libraries the packages never declared, plus libEGL,
+  and a missing one is not a Python error you can read: Qt aborts from C++
+  before the launcher's own reporting runs, so it vanished with nothing in the
+  terminal and nothing in the logs. Both packages now declare the whole set.
+
+- **Switching between Stable and Preview only worked if you restarted first**
+  (#201). The catalogue was fetched for whichever edition was selected at
+  startup, so the other one came back empty: the version stayed on the build
+  from the wrong edition, the picker refused to open, and ▶ PLAY quietly
+  launched what was already selected. The full catalogue is fetched every
+  session now.
+
+- **Minecraft was audible but invisible in Steam Deck Game Mode** (#199).
+  Gamescope only presents a window it can attribute to the application Steam
+  launched, and from the Flatpak neither route to that attribution reaches the
+  game — it starts through the portal, outside the process tree Steam
+  launched, and the property gamescope reads is set by Proton's fork of Wine
+  rather than the one this engine is built from. The launcher stamps it
+  itself now.
+
+- **The Microsoft Store sign-in did not survive closing the Flatpak** (#198),
+  and losing it was worse than a sign-out: with no device credentials on file
+  every command provisioned a *new* Store device, an account may hold ten, and
+  once they were gone the licensing service refused the game outright with
+  "Device group is full" — after which Minecraft could be neither downloaded
+  nor started until devices were removed by hand on account.microsoft.com. The
+  keyring now lives in the launcher's own storage, which persists in every
+  packaging; one left behind by an earlier release is taken along.
+
+- **A game directory missing its Store package took the launcher down with a
+  Rust panic** quoting a file and line number, and nothing about which file was
+  missing or that re-downloading is what brings it back. The directory looks
+  complete — every DLL, the manifest, a full-size executable — because on a
+  Store build the executable is ciphertext. It is named and explained now.
+
+- **Injecting a client DLL always reported "process not found".** The game is
+  started through the GDK loader, and Wine leaves the process name empty for
+  it, so the snapshot never matched. A nameless process is now identified
+  through the image path in its own PEB.
+
+- **The Flatpak had no icon** — not in the window, not in the title bar, not on
+  the hero screen. Its icon is installed under `/app` and the candidate list no
+  longer looked there.
+
+- **`doctor` offered to install a package that does not exist.** On Debian and
+  Ubuntu there is no `python3-pyside6` — it is split per Qt module — and it did
+  not need naming at all: the launcher installs the toolkit itself on first
+  run, exactly as it did for the previous one. It also stopped reporting a
+  perfectly working portable install as an unready system.
+
+- **The activity log mangled its own text.** Every download line arrived as
+  `-&gt; downloading …`, and any line holding a path with `&` or an error in
+  angle brackets came out the same way — on exactly the text people are asked
+  to paste into bug reports. The view also stopped following the newest line,
+  and the status line above it, once painted red by a failure, stayed red for
+  the rest of the session.
+
+- **Two sign-ins could be started at once.** Clicking *Sign in* twice handed
+  out two device codes for one sign-in, with the launcher waiting on the one
+  you were not shown. "Sign out?" could also be left armed on screen
+  indefinitely, where the next click answered it. Signing in also warms the
+  Xbox token chain again, so the first launch afterwards no longer pays for the
+  whole round trip.
+
+- **One unreachable edition emptied the whole version picker** — a Preview
+  outage took Stable down with it. And triggering the same background job twice
+  (two clicks on *Import content*, a quick Stable/Preview toggle) destroyed the
+  running thread underneath itself, which Qt turns into an abort.
+
+- Smaller things in the window: the log's **Clear** and **Copy** buttons were
+  clipped, three *Settings ▸ Tools* rows had lost their tooltips, and the
+  version picker's filter field did not take focus, so typing into a freshly
+  opened picker did nothing.
+
+
+## 2.2.1 — 2026-08-21
+
+### Added
+
+- **The launcher can be driven with a controller**. On a Steam Deck, in Game
+  Mode, or on any couch setup, the launcher window was the one screen with no
+  way past it: it deliberately still opens before the game, and reaching ▶ PLAY
+  needed a mouse. A highlight now follows the d-pad or the left stick, A
+  activates, B goes back, the shoulder buttons change tab, Start plays and the
+  right stick scrolls — through the version picker, the profile menu, sign-in,
+  every Settings tab and any dialog that opens over the window. Buttons are
+  read by position rather than by letter, so an Xbox pad and a PlayStation one
+  behave the same. The highlight appears only once a controller is used and
+  goes away again as soon as the mouse moves, so nothing changes for anyone who
+  never picks one up, and a short reminder of the main buttons sits above the
+  dock while a pad is connected. Controllers are read straight from
+  `/dev/input` — no new dependency, hot-plug included, and nothing to install,
+  since udev already grants the logged-in user access to joysticks. Input is
+  ignored while Minecraft is running, so a pad in hand during the game never
+  reaches the launcher behind it. Off with *Settings ▸ General ▸ Controller*,
+  or `BOL_CONTROLLER=0` for one session; `doctor` reports which controllers it
+  can see, and distinguishes "none connected" from one that is connected but
+  not readable.
+
+- **The launcher can close itself when the game starts**. *Settings ▸ General
+  ▸ Startup ▸ Close the launcher when Minecraft starts*, off by default. With
+  it on, the window goes as soon as Minecraft is running instead of waiting
+  around behind it — no second entry in the taskbar, nothing to alt-tab past.
+  Only the window closes: the process behind it stays, invisibly, until the
+  game exits, because what it does afterwards is not optional. It arms a GPU
+  safety marker before starting the game and clears it by watching the wrapper
+  return — a marker nobody watches back blocks the next launch until a reboot
+  — and it repairs and patches Minecraft's settings file once the game has
+  stopped writing to it. When that is done it exits on its own, with nothing
+  left behind. Leaving the switch off keeps what the window is worth during a
+  session: KILL, the activity log, and the launcher reporting how the game
+  ended. In Steam Game Mode the window still steps aside on its own, switch or
+  no switch, and comes back when the game closes.
+
+- **The AppImage updates itself in place, one changed block at a time**
+  ([#191](https://github.com/Wyze3306/BedrockOnLinux/issues/191)). It now
+  carries standard AppImage update information, and every release publishes the
+  matching `BedrockOnLinux-*-x86_64.AppImage.zsync` beside it, so
+  AppImageUpdate, AppImageLauncher, AM/AppMan and anything else that reads the
+  standard can upgrade an existing file by fetching only the blocks that
+  actually differ instead of the whole bundle. A stable AppImage follows the
+  newest release, a nightly one the rolling `nightly` prerelease it came from,
+  and the repository is read from the same place the launcher's own updater
+  reads it, so a fork updates from its own releases. The sidecar describes one
+  exact AppImage, so it is cleared, built, checksummed, attested and uploaded
+  with it — and the build now fails outright if the update information is
+  embedded without it, which `appimagetool` otherwise reduces to a warning.
+
+- **`bedrock-on-linux doctor` now reports what the graphics stack granted the
+  game** ([#153](https://github.com/Wyze3306/BedrockOnLinux/issues/153)).
+  "Minecraft does not detect my ray tracing hardware" had no answer anywhere:
+  the tier is decided inside the game process by vkd3d-proton, from the Vulkan
+  features the driver exposes, and that decision was thrown away. Every launch
+  now runs the graphics payload at its info level — a couple of dozen lines at
+  device creation, nothing per frame — and doctor reads the outcome back out
+  of the launch log: the DXR tier Minecraft's *Ray Traced* mode is gated on,
+  whether the device also reached DirectX 12 Ultimate, and which half of the
+  universal device-generated-commands payload the driver took. Nothing opens a
+  GPU device to answer it, which keeps the check on the right side of the same
+  rule the rest of the GPU reporting follows. It separates the cases that look
+  identical from a screenshot and are not: a driver that exposed no ray
+  tracing at all, a device that only reached tier 1.0 — which *Ray Traced*
+  does not accept — the *Ray tracing* switch being off, and vkd3d-proton's own
+  quirk dropping the tier on a Steam Deck. A launch that died before it ever
+  created a device is reported as no answer rather than as a missing feature.
+  For the complete feature set the same stack hands Minecraft, including the
+  adapter it picked and whether an acceleration structure can actually be
+  sized, `tools/dxr-probe.c` prints it from inside the prefix with the game
+  not involved.
+
+- **The version picker asks for the edition first**
+  ([#190](https://github.com/Wyze3306/BedrockOnLinux/pull/190)). Minecraft and
+  Minecraft Preview are two buttons above the list rather than a choice buried
+  in it, the builds below follow whichever is selected, and the list is filled
+  through the same beta setting the rest of the launcher honours, so a picker
+  opened on Preview cannot offer a build it would refuse to install.
+  Contributed by [@Hultwl](https://github.com/Hultwl).
+
+### Fixed
+
+- **The Microsoft sign-in window no longer dies on Wayland**
+  ([#186](https://github.com/Wyze3306/BedrockOnLinux/issues/186)). Signing in to
+  download Minecraft failed the moment the window should have appeared, with
+  nothing to go on but `Gdk-Message: Error 71 (Protocol error) dispatching to
+  Wayland display` — reported on Bazzite, Fedora and KDE Plasma, and fatal in
+  the plainest sense: the download comes from your own Microsoft account, so a
+  sign-in that cannot open is a game that cannot be installed. The window is
+  WebKitGTK's, and by default WebKitGTK composites the page into a DMABUF
+  buffer and hands that to the compositor. Where the handoff is refused, the
+  connection is not degraded but torn down, taking the window with it. The
+  launcher now runs the downloader with WebKitGTK's DMABUF renderer switched
+  off, so the page is drawn through shared memory instead — the same
+  `WEBKIT_DISABLE_DMABUF_RENDERER=1` that people were setting by hand, applied
+  to every `xodus-cli` call rather than the sign-in alone, since the download
+  and an encrypted game's launch load the same library. For one login page the
+  accelerated path is worth nothing measurable, so this is not conditional on
+  guessing at a compositor or a driver; a value you set yourself still wins,
+  and the game is never started with it.
+
+- **An encrypted game launch prepares the environment it runs in again**.
+  `xodus-cli run` — the outermost process of a Store-installed Minecraft, since
+  its executable stays encrypted on disk — was no longer being shown the
+  environment the launch had assembled: the call that hands it over lost its
+  `env=` to an unrelated indentation fix. The game itself was started with it
+  regardless, so nothing changed on an ordinary desktop, but on a host with no
+  WebKitGTK of its own the bundled runtime never reached the process that
+  cannot start without it — SteamOS above all — and, until now, neither did the
+  renderer setting above.
+
+- **What the Achievements support covers, said plainly**
+  ([#152](https://github.com/Wyze3306/BedrockOnLinux/issues/152)). The
+  Achievements section promised a catalog and added that the launcher "does not
+  unlock, emulate or force anything" — which reads as a policy rather than as a
+  limit, and left a Flatpak player looking for what was broken on their side.
+  Nothing was: new achievements never unlock, in any layout, and the Flatpak
+  behaves exactly like the AppImage here. Minecraft does not write its own
+  achievements. It reports what you did to Xbox as in-game events and the
+  achievement engine awards them from those — asked directly instead, the
+  achievements service refuses every id with *"None of the submitted
+  achievements may be updated in this fashion"*, whichever token it is
+  presented with, and the event path that would feed it is not implemented in
+  the engine. The catalog is unaffected and still loads through its dedicated
+  user-only token. `tools/achievements-probe.py` now shows the whole picture
+  for your own account in one run, without launching the game: the full list
+  through the Achievements token, the same list empty through the profile token
+  every other Xbox Live call uses, and the refusal — reading the tokens the
+  launcher already holds, printing none of them, and attempting its unlock on
+  an achievement id that does not exist, so it cannot change anything.
+
+- **A first run no longer fails with "wineboot timed out"**
+  ([#144](https://github.com/Wyze3306/BedrockOnLinux/issues/144)). "Could not
+  initialise the Wine prefix ... wineboot timed out after 300 seconds" was
+  reported from CachyOS, Artix and Kubuntu alike, on the Flatpak, the AppImage
+  and the packages, and it sent everyone hunting for missing Wine packages that
+  were never the cause. The first launch has to fetch the Steam Linux Runtime,
+  close to 900 MB unpacked and verified, and it does that inside the very call
+  the launcher was timing: the budget meant for booting a prefix was being spent
+  downloading a runtime, so only the first run failed and pressing Install again
+  looked like a fix. That bootstrap now gets its own allowance, decided in
+  advance from whether the runtime is already unpacked rather than measured
+  afterwards, and the timeout message names the budget that actually ran out.
+
+- **A failed Minecraft download can be retried**. Three attempts at the same
+  build could all fail with `cache ended before cached_len`, or install nothing
+  at all, alternating between the two forever: the downloader caches the
+  encrypted package beside the game and re-opens it next time, and once that
+  file was left short it stayed short, every later run either reading past its
+  end or concluding there was nothing left to fetch. Deleting the version
+  directory by hand was the only way out. A failed download now drops that
+  cache, so the next attempt starts from a clean state, while a cache belonging
+  to a playable install is kept, because an encrypted game reads from it at
+  every launch.
+
+- **The launcher scrolls under the mouse wheel everywhere**
+  ([#187](https://github.com/Wyze3306/BedrockOnLinux/pull/187)). Wheel and
+  touchpad events are normalised in one place and bound on the widgets that
+  scroll, so the version list, the settings pages and the activity log all
+  answer the wheel the same way instead of only some of them doing it.
+  Contributed by [@Hultwl](https://github.com/Hultwl).
+
+- **A Store-downloaded Minecraft starts on the Flatpak**
+  ([#193](https://github.com/Wyze3306/BedrockOnLinux/issues/193)). PLAY went to
+  a black screen and came straight back with `ShellExecuteEx failed: File not
+  found`, on a Steam Deck where the game was installed, the account signed in
+  and the executable sitting right there on disk. The Microsoft Store keeps
+  that executable encrypted at rest, so the launcher decrypts it at launch and
+  stages the plaintext on `/dev/shm` for Wine to map — but pressure-vessel
+  builds the Steam Linux Runtime container as a *new* Flatpak app instance, and
+  says so in the log itself: *"/dev/shm not shared between app instances"*.
+  Wine was looking into a different `/dev/shm`, found nothing there, fell back
+  to the ciphertext on disk and reported the game as missing. The decrypted
+  image is now staged in the application's `$XDG_RUNTIME_DIR`, the tmpfs
+  Flatpak binds into every instance of the same application: still RAM, still
+  created 0600, still unlinked by the loader the instant it is opened — and now
+  reachable from inside the container. Nothing changes outside the Flatpak, and
+  images left behind by a launch that died are swept from both locations.
+
+- **Imported worlds and templates land where a signed-in game reads them**
+  ([#188](https://github.com/Wyze3306/BedrockOnLinux/issues/188)). A
+  `.mctemplate` imported without a single error, and then the world creation
+  screen went on offering nothing but Marketplace purchases. The import was
+  real and the folder was right there — in the wrong `com.mojang`. A prefix
+  holds one per account the player has signed in with, plus `Users/Shared`
+  for playing signed out, and Minecraft splits its content between them:
+  packs are shared across accounts, but worlds, world templates and skins
+  belong to whoever is signed in and are only ever read from that account's
+  own folder. Everything was being unpacked into `Users/Shared`, so packs
+  arrived and worlds and templates quietly went nowhere. They now go to the
+  folder of the account that played last — the one whose settings the game
+  wrote most recently — while packs stay shared, and before the first launch,
+  with no account folder to prefer, they still go to `Users/Shared`. Each
+  import names the folder it wrote to, an import that finds earlier copies
+  stranded in the shared folder says where they are instead of moving save
+  data around, and *Open Minecraft folder* now opens the player's own content
+  rather than the shared one.
+
+- **Xbox Live sign-in survives a SISU refusal**
+  ([#149](https://github.com/Wyze3306/BedrockOnLinux/issues/149)). The
+  Microsoft login completed, and then every `sisu.xboxlive.com` call came back
+  HTTP 403 — profile, PlayFab, multiplayer, Realms and licensing alike — on
+  several accounts that Xbox and Minecraft were perfectly happy with
+  everywhere else. Nothing was wrong with those accounts: the same audiences
+  were still being issued by `xsts.auth.xboxlive.com` in the same run, with
+  the same user token, which is why the Achievements token kept arriving while
+  the rest of the chain came back empty. Each audience now falls back to XSTS
+  when SISU refuses it, so the sign-in completes instead of stopping at a
+  partial payload; the fallback costs nothing when SISU works, and it is not
+  attempted when XSTS has already failed. The advice was misleading on top of
+  it — an Xbox Live account rejection always names an `XErr`, so a bare 403 no
+  longer reads as *"Xbox Live rejected this Microsoft account"* and no longer
+  sends people to xbox.com to repair a profile that was never broken.
+
+- **`BOL_INPUT=wayland` gets a Wayland driver that can load**
+  ([#180](https://github.com/Wyze3306/BedrockOnLinux/issues/180)). Asking for
+  a native Wayland window never started the game on any host: Wine loaded
+  `winewayland.drv`, its Unix half failed on `undefined symbol:
+  win32u_set_window_pixel_format`, and no window was created. The driver was
+  not ours. Debian 11 ships the xkbregistry development files in their own
+  package, the build container installed only `libxkbcommon-dev`, and Wine's
+  configure dropped `winewayland.drv` without failing the build — and because
+  the engine is a Proton base with our WineGDK build overlaid on top, that did
+  not leave a gap in the result: the base's own Wine 10 driver stayed, next to
+  our Wine 11 `win32u.so`, which no longer exports the entry points it
+  imports. The build now installs `libxkbregistry-dev` and refuses to finish
+  without a Wayland driver, and the packager refuses a candidate whose driver
+  belongs to a different Wine build than the engine around it. Until an engine
+  built that way is installed, asking for Wayland says so and plays on
+  XWayland instead of failing to start; Doctor reports the driver's state on
+  its own line.
+
+- **A launcher that steps aside for the game says so**. In a session that
+  shows one application window at a time — Steam Game Mode — the launcher
+  unmaps its window while the game runs, or the game stays audible and never
+  appears ([#130](https://github.com/Wyze3306/BedrockOnLinux/issues/130)); it
+  comes back the moment the game closes. On screen that is indistinguishable
+  from a launcher that crashed, and it gets reported as one. The activity log
+  now records the step-aside and the reason for it, which is what separates
+  that case from an actual failure in the next report. Starting the launcher
+  has opened the launcher in every session since 2.2.0
+  ([#179](https://github.com/Wyze3306/BedrockOnLinux/issues/179)); the version
+  that started the game without its own window was 2.1.4.
+
+- **The Minecraft download reports how far along it is**. Installing an
+  edition left a working bar labelled *Installing Minecraft…* sweeping for the
+  whole package — over two gigabytes with nothing to say whether any of it was
+  moving. Xodus draws the progress it streams with indicatif, which stays
+  silent unless `TERM` names a terminal it is willing to draw on, and a
+  launcher started from a desktop entry, from Steam or in Game Mode inherits
+  no `TERM` at all: the pty the launcher opens precisely to catch those bars
+  carried, measured here, exactly zero lines while 334 MB arrived. The
+  download now names a terminal for its own child when the session named
+  none — a `TERM` the session did set is left alone — so the real byte counts
+  come back, 25 updates in the first twelve seconds of a fresh install, and
+  the status line spends them: *Downloading Minecraft… 37% (0.9 GiB of 2.3
+  GiB)*. The size is there beside the percentage because on a download this
+  large it is what tells you whether to wait for it.
+
+- **SteamOS can install and start the game again**
+  ([#184](https://github.com/Wyze3306/BedrockOnLinux/issues/184)). On a Steam
+  Deck, linking the Microsoft account failed with `No such file or directory`.
+  Behind it: `xodus-cli: error while loading shared libraries:
+  libwebkit2gtk-4.1.so.0`. Xodus links its login webview into every subcommand,
+  so that library has to load before the program starts — which makes it a
+  requirement not only of the sign-in window, but of the download *and* of
+  every launch, since a Store-installed executable stays encrypted on disk and
+  `xodus-cli run` is what decrypts it. SteamOS ships no WebKitGTK, and its
+  rootfs is read-only, so installing one means disabling that and losing it
+  again at the next update: the AppImage was simply unusable there for anyone
+  who did not already have the game. The launcher now carries that stack
+  itself. When the host has WebKitGTK — every ordinary distribution, the
+  `.deb`, the `.rpm`, the Flatpak's runtime — nothing changes and nothing is
+  downloaded. When it does not, one ~80 MB archive is fetched, verified
+  against a pinned SHA-256, and used for xodus-cli alone; the game is handed
+  back its own environment one exec before it starts, so Wine and the Steam
+  Linux Runtime keep their own libraries. Where even that is unavailable, the
+  failure now names the missing library and the package that provides it on
+  *this* distribution, instead of the loader's `No such file or directory`.
+
+- **The main menu no longer runs the GPU at full load**
+  ([#150](https://github.com/Wyze3306/BedrockOnLinux/issues/150)). A still
+  image over a panorama was pinning cards at 87-90%, hot and loud, before the
+  player had even chosen a world. Nothing in the stack paces Minecraft's
+  render loop when the game itself does not: with vsync off and *Max
+  Framerate* on Unlimited it simply draws as fast as the machine can, and the
+  menu — the cheapest frame the game ever produces — is where that goes
+  furthest. Measured here in that exact configuration: **~1800 FPS and 58-77%
+  of an RTX 4060** to display a menu. The launcher now hands vkd3d-proton a
+  frame rate limit at the refresh rate of the fastest display attached
+  whenever the game has no limit of its own, which brought the same menu to
+  **144 FPS and 3-16% of the card**. Only that unpaced case is capped: vsync,
+  or any *Max Framerate* the player chose, is left exactly as it was, and
+  nobody loses a frame their display could have shown. *Settings ▸ Advanced ▸
+  Limit the frame rate to the display* turns it off, and `BOL_FRAME_RATE` in
+  the custom-environment field names a rate instead: `0` never caps, a number
+  always caps at it.
+
+- **Naming what actually holds the frame rate down**
+  ([#173](https://github.com/Wyze3306/BedrockOnLinux/issues/173)). Reports of
+  the game refusing to reach 60 FPS while barely touching the GPU kept
+  arriving with no log to explain them, on hardware from an RTX 3050 to a
+  5090. The measurement finds Minecraft's own *Max Framerate* limiter: it
+  waits for each frame's deadline by polling for window messages, and under
+  Wine every one of those polls on an empty queue costs two user-mode
+  callbacks and a `NtYieldExecution` — three system calls, roughly a hundred
+  and fifty times per frame. In the main menu, same scene and same 60 FPS, the
+  main thread costs **99% of a CPU core with 56 points of it in the kernel**
+  when Minecraft holds the limit, against **10%** when the launcher's limiter
+  holds it instead; whole-process CPU falls from 127% of a core to 50%. That
+  thread is what builds every frame in Bedrock, so the wait comes straight out
+  of the frame rate. The launcher cannot change the setting on the player's
+  behalf — that file is theirs, and rewriting it is how #175 happened — so it
+  now says so before each launch, with the exact replacement to use. With
+  vsync on the game waits inside its present call instead and the main thread
+  stays near 20%, so the notice is limited to the configuration that was
+  measured.
+
+- **Settings no longer reset themselves after a crash** (#175). Players lost
+  their keyboard mappings, the tutorial flags and the whole *Video ▸ Mode*
+  block at random, with nothing in any log to explain it. The settings that
+  went were never random: Minecraft saves `options.txt` by truncating it and
+  streaming the entire file back, so when the game dies part-way through that
+  write — and on Wine it does, with the unhandled page fault the same sessions
+  report — the file is left cut off, and every key past the cut reads as its
+  default next time. Those four are simply what lives in the tail. The
+  launcher now keeps a copy of the settings file before the game starts and
+  puts it back when the game leaves a torn one behind, so an interrupted save
+  costs that session's changes rather than a rebuilt control scheme. Only a
+  file that cannot be a finished save is ever replaced, and only from a copy
+  the launcher took itself: a settings file Minecraft wrote to the end is left
+  alone however much it changed.
+
+- **The launcher no longer rewrites Minecraft's settings file wholesale.**
+  Disabling the repeated online-multiplayer warning reparsed `options.txt` and
+  regenerated it from scratch — 14,728 of 15,458 bytes rewritten for a
+  one-character change, every CRLF terminator converted to LF, and any line
+  the launcher could not parse dropped on the floor. It also ran the instant
+  the umu wrapper returned, which is not the instant Minecraft exits: the
+  launcher could be rewriting the file while the game was still saving to it.
+  It now edits the single line it owns, writes through a rename so the file is
+  never observed half-written, and waits for the prefix to be idle first.
+
+## 2.2.0 — 2026-08-19
+
+### Added
+
+- **A ray tracing switch, in Settings ▸ Advanced.** It is on by default and
+  matches what already happened: the bundled vkd3d-proton reports the ray
+  tracing tier on its own wherever the driver exposes the Vulkan ray tracing
+  extensions, so Minecraft is offered DXR 1.1 and full DirectX 12 Ultimate
+  without anyone asking for it. The switch makes that explicit in two
+  directions — it drops a `VKD3D_CONFIG=nodxr` inherited from the session,
+  which would otherwise remove the game's *Ray Traced* graphics mode with no
+  trace anywhere, and it sets `nodxr` when you would rather keep the video
+  memory. Minecraft's own conditions are unchanged: *Ray Traced* stays
+  uneditable outside a ray-tracing-capable world, and *Vibrant Visuals*, being
+  deferred rendering, is unaffected either way.
+
+- **The launcher now names why the game is slow, before it starts.** "It lags"
+  has always arrived as an engine or GPU report, because the ordinary causes
+  leave nothing in any Wine, Proton or vkd3d log: a host with no memory left,
+  where the kernel pages the game out and every chunk the player walks into
+  comes back through a disk fault; a data directory too full for vkd3d to keep
+  its shader cache, so pipelines are recompiled every session instead of
+  reused; a render distance set past what Bedrock's main thread can feed, which
+  leaves even a fast GPU idle, since that ring is built on one thread and the
+  work grows with the square of the distance; and vsync left on while the game
+  runs in a window on a desktop that composites every window, which stacks a
+  second frame queue on the game's own. Each is now reported before launch and
+  summarised by `doctor`, together with what to change. They are advisories —
+  nothing is blocked and no setting of yours is touched — and
+  `BOL_SKIP_PERF_CHECK=1` silences them. Detection costs two `/proc/meminfo`
+  fields, one `statvfs` and a read of Minecraft's own options.txt: no Wine
+  process is started and no GPU is opened, so it can run on every launch.
+
+### Changed
+
+- **A GPU safety block can be acknowledged from the dialog that reports it.**
+  PLAY refuses the launch, and the failure dialog then told you to open
+  Settings ▸ Tools and find the acknowledgement there. That is a long way
+  round for the most common case by far: rebooting the machine while
+  Minecraft is still open leaves an interrupted-launch marker behind, because
+  the launcher is killed before it can clear its own marker, and nothing can
+  tell that apart from a graphics driver that locked the machine up. The
+  confirmation is now offered where the block is met. Nothing about the
+  safety decision changes — the same eligibility is still re-evaluated under
+  the launch lock before anything is written, a marker from the running boot
+  is still refused, and every current graphics check still runs on the next
+  PLAY.
+
+- **Minecraft is now downloaded from the Microsoft Store with your own
+  account.** Until now the launcher fetched a repackaged, DRM-stripped copy of
+  the game from a third-party GitHub repository. That redistributed Minecraft,
+  and it let anyone install it without owning it. The launcher now uses
+  [Xodus](https://github.com/xodus-gaming/xodus), which signs in to your
+  Microsoft account, asks Microsoft's licensing service for the title licence
+  and streams the package straight from the Xbox CDN, decrypting it as it goes
+  — the same path Windows takes.
+
+  What this changes for you:
+
+  - **You must own Minecraft on the account you link.** This is now true for
+    installing, not only for playing online.
+  - **There is a second sign-in.** The Store account authorises the download;
+    the existing in-game account is unchanged. They can be the same account,
+    but they are separate links, because the Store needs a device-bound
+    session that the in-game sign-in cannot provide.
+  - **The picker gained an edition, and kept its builds.** You choose
+    *Minecraft* or *Minecraft Preview*, then a build. Microsoft's own service
+    only ever offers the current build, so the list of older ones comes from
+    [GdkLinks](https://github.com/MinecraftBedrockArchiver/GdkLinks), an index
+    of where each build sits on Microsoft's CDN — it holds no game data, and
+    the licence still comes from Microsoft for your account. Each build lives
+    in its own folder, so going back to one you already have costs nothing.
+  - **WebKitGTK is a new dependency** (`libwebkit2gtk-4.1-0`), for the Store
+    sign-in window. The `.deb` and `.rpm` pull it in and `doctor` reports it.
+    The Flatpak moved to the GNOME runtime to get it: `org.freedesktop.Platform`
+    ships no WebKitGTK and no Flathub extension provides one, so the sign-in —
+    and with it installing the game at all — could not run in the sandbox. Both
+    runtimes share the same freedesktop base and the same GL extension point,
+    and this manifest already built its own Tcl, Tk and Python, so nothing else
+    about the Flatpak changes.
+
+  A copy of the game you already have keeps working: point the launcher at it
+  as before.
+
+- Load the game executable from memory when the Store package keeps it
+  encrypted. Store packages leave the segments they flag
+  `KEEP_ENCRYPTED_ON_DISK` — the game executable on GDK titles — encrypted at
+  rest, exactly as on Windows, so there is no executable on disk for Wine to
+  open. The engine gained a loader that can map the main image from a
+  descriptor or a path, and the launcher decrypts it into `/dev/shm`, which is
+  RAM: the copy is private, the loader unlinks it the instant it opens it, and
+  nothing reaches durable storage. It goes through a file rather than anonymous
+  memory for one reason — the game runs inside the Steam Linux Runtime
+  container, where a descriptor number from outside means nothing. The
+  settings/pause stack-reserve fix now lands on that copy instead of the file
+  on disk. Packages that ship a plaintext executable are detected and take the
+  previous path unchanged.
+
+  One consequence worth knowing: an encrypted package needs the licence at
+  every launch, so starting the game requires the network and a valid Store
+  session even for single-player. Nothing else about offline play changes.
+
+### Fixed
+
 - Stop the crash that hit the main menu as soon as an account was signed in.
   Offline play was fine, but signing in brought the game to the menu, let it
   start loading the account and then killed it with a page fault

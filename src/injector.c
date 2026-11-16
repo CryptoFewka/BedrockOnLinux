@@ -2,15 +2,60 @@
  * CreateRemoteThread + LoadLibraryW technique, so BedrockOnLinux can inject
  * directly without any third-party injector .exe. Built for Wine (x86_64) and
  * run inside the game's own Wine prefix so it shares the wineserver and can see
- * Minecraft.Windows.exe. Returns 0 on success.
+ * Minecraft.Windows.exe -- by snapshot name, or by PEB image path when Wine
+ * reports no name for it. Returns 0 on success.
  *
  * Build: x86_64-w64-mingw32-gcc -O2 -municode -s injector.c -o ../bol/injector.exe
  * Usage: injector.exe <dll-path> [process.exe]   (default Minecraft.Windows.exe)
  */
 #include <windows.h>
+#include <winternl.h>
 #include <tlhelp32.h>
 #include <stdio.h>
 #include <wchar.h>
+
+typedef NTSTATUS (WINAPI *NtQueryInformationProcess_t)(HANDLE, PROCESSINFOCLASS,
+                                                       PVOID, ULONG, PULONG);
+
+/* Read a process's image path out of its own PEB. Wine reports an empty
+ * szExeFile for the game started by the GDK loader, so the snapshot name alone
+ * never matches Minecraft.Windows.exe; the PEB still holds the real path. */
+static BOOL peb_image_name(HANDLE proc, wchar_t *out, size_t cap)
+{
+    static NtQueryInformationProcess_t query;
+    PROCESS_BASIC_INFORMATION pbi;
+    RTL_USER_PROCESS_PARAMETERS params;
+    PEB peb;
+    ULONG got = 0;
+    size_t n;
+
+    if (!query) {
+        query = (NtQueryInformationProcess_t)(void *)GetProcAddress(
+            GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess");
+        if (!query) return FALSE;
+    }
+    if (query(proc, ProcessBasicInformation, &pbi, sizeof(pbi), &got)) return FALSE;
+    if (!ReadProcessMemory(proc, pbi.PebBaseAddress, &peb, sizeof(peb), NULL))
+        return FALSE;
+    if (!ReadProcessMemory(proc, peb.ProcessParameters, &params, sizeof(params), NULL))
+        return FALSE;
+
+    n = params.ImagePathName.Length / sizeof(wchar_t);
+    if (n >= cap) n = cap - 1;
+    if (!ReadProcessMemory(proc, params.ImagePathName.Buffer, out,
+                           n * sizeof(wchar_t), NULL))
+        return FALSE;
+    out[n] = 0;
+    return TRUE;
+}
+
+static const wchar_t *base_name(const wchar_t *path)
+{
+    const wchar_t *base = path, *p;
+    for (p = path; *p; ++p)
+        if (*p == L'\\' || *p == L'/') base = p + 1;
+    return base;
+}
 
 static DWORD find_pid(const wchar_t *name)
 {
@@ -22,6 +67,17 @@ static DWORD find_pid(const wchar_t *name)
     if (Process32FirstW(snap, &pe))
         do {
             if (!_wcsicmp(pe.szExeFile, name)) { pid = pe.th32ProcessID; break; }
+            if (pe.szExeFile[0]) continue;   /* named, just not the one we want */
+
+            HANDLE proc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+                                      FALSE, pe.th32ProcessID);
+            if (!proc) continue;
+            wchar_t image[MAX_PATH];
+            if (peb_image_name(proc, image, MAX_PATH) &&
+                !_wcsicmp(base_name(image), name))
+                pid = pe.th32ProcessID;
+            CloseHandle(proc);
+            if (pid) break;
         } while (Process32NextW(snap, &pe));
     CloseHandle(snap);
     return pid;

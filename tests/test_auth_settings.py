@@ -4,6 +4,7 @@
 import json
 import stat
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -57,11 +58,18 @@ class WineGdkPrerequisiteTests(unittest.TestCase):
                 r"\\Microsoft.Windows.Storage.Pickers.FileOpenPicker]",
                 system,
             )
+            # The save picker every export asks for (#167) is registered the
+            # same way.
+            self.assertIn(
+                r"[Software\\Microsoft\\WindowsRuntime\\ActivatableClassId"
+                r"\\Windows.Storage.Pickers.FileSavePicker]",
+                system,
+            )
             self.assertIn(
                 r'"DllPath"="C:\\windows\\system32\\windows.storage.dll"',
                 system,
             )
-            self.assertEqual(system.count('"DllPath"='), 1)
+            self.assertEqual(system.count('"DllPath"='), 2)
             self.assertEqual((prefix / "system.reg").read_bytes(), system_once)
             self.assertEqual((prefix / "user.reg").read_bytes(), user_once)
 
@@ -584,6 +592,63 @@ class OnlinePreauthPayloadTests(unittest.TestCase):
                     mock.patch.object(auth, "info"):
                 self.assertFalse(auth.xbl_preauth("fresh-access-token"))
 
+    def test_fresh_cache_skips_the_network_chain(self):
+        """PLAY should not redo what _warm_xbox_preauth just finished."""
+        epoch = "b" * 32
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cache = root / "winegdk-preauth"
+            cache.mkdir()
+            (cache / ".account-epoch").write_text(epoch + "\n")
+            payload = self.payload()
+            payload["_account_epoch"] = epoch
+            auth._store_online_preauth(cache / "device.json", payload,
+                                       expected_epoch=epoch)
+
+            with mock.patch.object(auth, "DATA", root), \
+                    mock.patch("urllib.request.urlopen") as urlopen, \
+                    mock.patch.object(auth, "warn"), \
+                    mock.patch.object(auth, "info"), \
+                    mock.patch.object(auth, "ok"):
+                self.assertTrue(
+                    auth.xbl_preauth("fresh-access-token", epoch))
+
+            urlopen.assert_not_called()
+
+    def test_cache_inside_reuse_margin_still_refreshes(self):
+        """A cache that clears the 60s floor but not the reuse margin still
+        drives a real refresh, so a session doesn't sign off mid-play."""
+        from datetime import datetime, timezone
+
+        epoch = "c" * 32
+        soon = datetime.fromtimestamp(
+            time.time() + auth._PREAUTH_REUSE_MARGIN / 2, tz=timezone.utc
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cache = root / "winegdk-preauth"
+            cache.mkdir()
+            (cache / ".account-epoch").write_text(epoch + "\n")
+            payload = self.payload(soon)
+            payload["_account_epoch"] = epoch
+            auth._store_online_preauth(cache / "device.json", payload,
+                                       expected_epoch=epoch)
+
+            with mock.patch.object(auth, "DATA", root), \
+                    mock.patch("urllib.request.urlopen",
+                               side_effect=OSError("simulated timeout")) \
+                    as urlopen, \
+                    mock.patch.object(auth, "warn"), \
+                    mock.patch.object(auth, "info"):
+                # The network attempt is made (not skipped) even though it
+                # then fails; the still-valid cache is what recovers True
+                # here, via the offline-resilience fallback, not the reuse
+                # fast path this test is guarding.
+                auth.xbl_preauth("fresh-access-token", epoch)
+
+            urlopen.assert_called()
+
+    @mock.patch.dict("os.environ", {"BOL_PREAUTH_SERIAL": "1"})
     def test_achievements_use_user_only_xsts_and_services_keep_sisu(self):
         expiry = "2999-01-01T00:00:00.1234567Z"
         epoch = "e" * 32
@@ -693,6 +758,7 @@ class OnlinePreauthPayloadTests(unittest.TestCase):
             self.assertEqual(stored["realms_token"], "realms")
             self.assertRegex(stored["realms_expiry_epoch"], r"^[0-9]+$")
 
+    @mock.patch.dict("os.environ", {"BOL_PREAUTH_SERIAL": "1"})
     def test_achievements_xsts_failure_does_not_block_core_preauth(self):
         expiry = "2999-01-01T00:00:00Z"
         epoch = "f" * 32
@@ -759,6 +825,220 @@ class OnlinePreauthPayloadTests(unittest.TestCase):
             self.assertEqual(stored["mp_token"], "multiplayer")
             self.assertEqual(stored["realms_token"], "realms")
             self.assertIsNone(auth.xbl_preauth_diagnostic())
+
+
+class SisuRefusalFallbackTests(unittest.TestCase):
+    """#149: SISU answered HTTP 403 for every relying party while XSTS kept
+    issuing tokens for the same audiences and the same account.  The chain has
+    to be completed through XSTS instead of failing the whole sign-in."""
+
+    expiry = "2999-01-01T00:00:00Z"
+
+    def setUp(self):
+        auth._clear_xbl_preauth_diagnostic()
+        self.addCleanup(auth._clear_xbl_preauth_diagnostic)
+
+    class _Response:
+        def __init__(self, status, payload):
+            self.status = status
+            self.payload = json.dumps(payload).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return self.payload
+
+    def _xsts_token(self, relying_party):
+        xui = {"uhs": "84"}
+        if relying_party == "http://xboxlive.com":
+            xui.update({"xid": "1234", "gtg": "Player", "agg": "Adult",
+                        "prv": "190 191"})
+        return {"Token": "xsts-" + relying_party, "NotAfter": self.expiry,
+                "DisplayClaims": {"xui": [xui]}}
+
+    def test_the_six_tokens_are_asked_for_together(self):
+        import threading
+
+        gate = threading.Barrier(6, timeout=10)
+        together = []
+
+        def urlopen(request, timeout=None):
+            body = json.loads(request.data)
+            if request.full_url.startswith("https://device.auth"):
+                return self._Response(
+                    200, {"Token": "device", "NotAfter": self.expiry})
+            if request.full_url.startswith("https://user.auth"):
+                return self._Response(
+                    200, {"Token": "user", "NotAfter": self.expiry})
+            # Answered only once all six are waiting on Xbox Live at once.
+            together.append(gate.wait())
+            if request.full_url.startswith("https://sisu"):
+                return self._Response(200, {
+                    "AuthorizationToken":
+                        self._xsts_token(body["RelyingParty"])})
+            return self._Response(
+                200, self._xsts_token(body["RelyingParty"]))
+
+        epoch = "b" * 32
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cache = root / "winegdk-preauth"
+            cache.mkdir()
+            (cache / ".account-epoch").write_text(epoch + "\n")
+            with mock.patch.object(auth, "DATA", root), \
+                    mock.patch.dict("os.environ"), \
+                    mock.patch("urllib.request.urlopen",
+                               side_effect=urlopen), \
+                    mock.patch.object(auth, "warn"), \
+                    mock.patch.object(auth, "info"), \
+                    mock.patch.object(auth, "ok"):
+                import os
+                os.environ.pop("BOL_PREAUTH_SERIAL", None)
+                self.assertTrue(auth.xbl_preauth("fresh-access-token", epoch))
+            stored = json.loads((cache / "device.json").read_text())
+        self.assertEqual(len(together), 6)
+        self.assertEqual(stored["realms_token"],
+                         "xsts-https://pocket.realms.minecraft.net/")
+        self.assertEqual(stored["xbl_xuid"], "1234")
+
+    def _run(self, xsts_status):
+        """Drive a full pre-auth where every SISU call is refused.
+
+        ``xsts_status`` maps a device-bound XSTS request to its HTTP status so
+        a test can also refuse that variant and check the user-only retry.
+        """
+        requests = []
+
+        def urlopen(request, timeout=None):
+            body = json.loads(request.data)
+            requests.append((request.full_url, body))
+            if request.full_url.startswith("https://device.auth"):
+                return self._Response(
+                    200, {"Token": "device", "NotAfter": self.expiry})
+            if request.full_url.startswith("https://user.auth"):
+                return self._Response(
+                    200, {"Token": "user", "NotAfter": self.expiry})
+            if request.full_url.startswith("https://sisu"):
+                # Exactly what the report shows: a bare 403 with no XErr.
+                return self._Response(403, {"Message": "Forbidden"})
+            device_bound = "DeviceToken" in body["Properties"]
+            status = xsts_status if device_bound else 200
+            if status != 200:
+                return self._Response(status, {"Message": "Forbidden"})
+            return self._Response(
+                200, self._xsts_token(body["RelyingParty"]))
+
+        epoch = "a" * 32
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cache = root / "winegdk-preauth"
+            cache.mkdir()
+            (cache / ".account-epoch").write_text(epoch + "\n")
+            with mock.patch.object(auth, "DATA", root), \
+                    mock.patch.dict("os.environ",
+                                    {"BOL_PREAUTH_SERIAL": "1"}), \
+                    mock.patch("urllib.request.urlopen",
+                               side_effect=urlopen), \
+                    mock.patch.object(auth, "warn"), \
+                    mock.patch.object(auth, "info"), \
+                    mock.patch.object(auth, "ok"):
+                completed = auth.xbl_preauth("fresh-access-token", epoch)
+            payload = cache / "device.json"
+            # A refused chain writes nothing; let the caller assert on that
+            # rather than fail here with a missing file.
+            stored = json.loads(payload.read_text()) if payload.exists() else {}
+        return completed, stored, requests
+
+    def test_every_audience_is_minted_through_xsts(self):
+        completed, stored, requests = self._run(xsts_status=200)
+
+        self.assertTrue(completed)
+        self.assertEqual(stored["xbl_token"], "xsts-http://xboxlive.com")
+        self.assertEqual(stored["sisu_token"],
+                         "xsts-https://b980a380.minecraft.playfabapi.com/")
+        self.assertEqual(stored["mp_token"],
+                         "xsts-https://multiplayer.minecraft.net/")
+        self.assertEqual(stored["realms_token"],
+                         "xsts-https://pocket.realms.minecraft.net/")
+        self.assertEqual(stored["lic_token"],
+                         "xsts-http://licensing.xboxlive.com")
+        self.assertEqual(stored["xbl_xuid"], "1234")
+        self.assertEqual(stored["realms_rp"],
+                         "https://pocket.realms.minecraft.net/")
+        # Every SISU refusal was answered by an XSTS request for the same
+        # audience, and the replacement carries the device identity.
+        fallbacks = [body for url, body in requests
+                     if url.startswith("https://xsts")
+                     and "DeviceToken" in body["Properties"]]
+        self.assertEqual(
+            [body["RelyingParty"] for body in fallbacks],
+            ["http://xboxlive.com",
+             "https://b980a380.minecraft.playfabapi.com/",
+             "https://multiplayer.minecraft.net/",
+             "https://pocket.realms.minecraft.net/",
+             "http://licensing.xboxlive.com"],
+        )
+        for body in fallbacks:
+            self.assertEqual(body["Properties"]["DeviceToken"], "device")
+            self.assertIn("ProofKey", body["Properties"])
+
+    def test_a_recovered_sign_in_leaves_no_failure_diagnostic(self):
+        """The refusals must not survive as 'Xbox Live rejected this account'
+        advice once the tokens were obtained anyway."""
+
+        self._run(xsts_status=200)
+
+        self.assertIsNone(auth.xbl_preauth_diagnostic())
+
+    def test_device_bound_refusal_retries_with_the_user_token_alone(self):
+        completed, stored, requests = self._run(xsts_status=403)
+
+        self.assertTrue(completed)
+        self.assertEqual(stored["mp_token"],
+                         "xsts-https://multiplayer.minecraft.net/")
+        user_only = [body for url, body in requests
+                     if url.startswith("https://xsts")
+                     and "DeviceToken" not in body["Properties"]]
+        # The achievements token plus one retry for each of the five audiences.
+        self.assertEqual(len(user_only), 6)
+
+
+class BareForbiddenClassificationTests(unittest.TestCase):
+    """Xbox Live names an XErr whenever it truly rejects an account, so a bare
+    403 must not send people to xbox.com to repair a healthy profile (#149)."""
+
+    class _Response:
+        def __init__(self, status, payload):
+            self.status_code = status
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def test_forbidden_without_an_xerr_is_not_an_account_verdict(self):
+        category, status, error_code = auth._xbl_response_error(
+            self._Response(403, {"Message": "Forbidden"}))
+
+        self.assertEqual(category, "service")
+        self.assertEqual(status, 403)
+        self.assertIsNone(error_code)
+
+    def test_forbidden_with_an_xerr_still_blames_the_account(self):
+        category, _status, error_code = auth._xbl_response_error(
+            self._Response(403, {"XErr": 2148916233}))
+
+        self.assertEqual(category, "account")
+        self.assertEqual(error_code, 2148916233)
+
+    def test_unauthorized_without_an_xerr_still_blames_the_account(self):
+        category, _status, _error_code = auth._xbl_response_error(
+            self._Response(401, {"Message": "Unauthorized"}))
+
+        self.assertEqual(category, "account")
 
 
 class NativeAuthCancellationTests(unittest.TestCase):

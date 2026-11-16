@@ -11,6 +11,8 @@
 #                       between releases, so building it would ship a Flatpak
 #                       that does not match the .deb/AppImage/.pyz next to it
 #                       and would fail that same audit.
+#   prerelease        — this working tree too: a versioned pre-release is
+#                       built from a branch the Flathub manifest does not pin.
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,9 +26,9 @@ mkdir -p "$OUT"
 CHANNEL="${BOL_RELEASE_CHANNEL:-release}"
 case "$CHANNEL" in
   release) FLATPAK_NOTE="" ;;
-  nightly) FLATPAK_NOTE=" (working tree, not the pinned tag)" ;;
+  nightly|prerelease) FLATPAK_NOTE=" (working tree, not the pinned tag)" ;;
   *)
-    echo "!! BOL_RELEASE_CHANNEL must be 'release' or 'nightly', got '$CHANNEL'" >&2
+    echo "!! BOL_RELEASE_CHANNEL must be 'release', 'nightly' or 'prerelease', got '$CHANNEL'" >&2
     exit 1
     ;;
 esac
@@ -60,6 +62,7 @@ old_application_artifacts=(
   "$OUT"/bedrock-on-linux-*.pyz
   "$OUT"/BedrockOnLinux-x86_64.AppImage
   "$OUT"/BedrockOnLinux-*-x86_64.AppImage
+  "$OUT"/BedrockOnLinux-*-x86_64.AppImage.zsync
   "$OUT"/BedrockOnLinux-*-x86_64.flatpak
   "$OUT"/BedrockOnLinux-*-SHA256SUMS
   "$OUT"/*portable.tar.gz
@@ -154,8 +157,8 @@ else
   required_failures+=(".rpm")
 fi
 
-# The zipapp needs host Python 3 and tkinter; login dependencies can be
-# installed on first use by bol/deps.py.
+# The zipapp needs host Python 3; GUI and login dependencies (PySide6-Essentials,
+# cryptography, …) can be installed on first use by bol/deps.py.
 STAGE="$OUT/pyz-stage"
 PYZ="$OUT/bedrock-on-linux-${VER}.pyz"
 rm -rf "$STAGE"
@@ -166,13 +169,8 @@ install -m644 "$SRC/LICENSE" "$STAGE/LICENSE"
 install -Dm644 "$SRC/data/icon.png" "$STAGE/data/icon.png"
 find "$STAGE/bol" -name __pycache__ -type d -exec rm -rf {} +
 cat > "$STAGE/__main__.py" <<'PYEOF'
-import sys
-from bol.cli import main
-try:
-    main()
-except KeyboardInterrupt:
-    print()
-    sys.exit(130)
+from bol.__main__ import main
+main()
 PYEOF
 # zipapp uses the freshly copied/generated mtimes, so two otherwise identical
 # builds receive different central-directory timestamps. Write the same
@@ -212,18 +210,26 @@ built_artifacts+=("$PYZ")
 verified_artifacts+=("$PYZ")
 
 APPIMAGE="$OUT/BedrockOnLinux-${VER}-x86_64.AppImage"
+# The .zsync sidecar carries the block checksums AppImageUpdate and friends use
+# to transfer only what changed (issue #191); it describes exactly these bytes,
+# so it is built, published and checksummed with the AppImage, never separately.
+APPIMAGE_ZSYNC="$APPIMAGE.zsync"
 # build-appimage.sh removes its output only at the packaging stage.  Remove it
 # before starting too, otherwise an early dependency/network failure could make
 # an old file look like the successful result of this invocation.
-rm -f -- "$APPIMAGE"
+rm -f -- "$APPIMAGE" "$APPIMAGE_ZSYNC"
 APPIMAGE_LOG="$OUT/appimage-build.log"
 if bash "$SRC/scripts/build-appimage.sh" >"$APPIMAGE_LOG" 2>&1 \
     && [[ -s "$APPIMAGE" ]]; then
   echo "  ✓ dist/$(basename "$APPIMAGE")"
   built_artifacts+=("$APPIMAGE")
   verified_artifacts+=("$APPIMAGE")
+  if [[ -s "$APPIMAGE_ZSYNC" ]]; then
+    echo "  ✓ dist/$(basename "$APPIMAGE_ZSYNC") (AppImage delta updates)"
+    built_artifacts+=("$APPIMAGE_ZSYNC")
+  fi
 else
-  rm -f -- "$APPIMAGE"
+  rm -f -- "$APPIMAGE" "$APPIMAGE_ZSYNC"
   echo "  !! AppImage build failed — last 40 lines of scripts/build-appimage.sh:"
   tail -n 40 "$APPIMAGE_LOG" | sed 's/^/     /'
   required_failures+=("AppImage")

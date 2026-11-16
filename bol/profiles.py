@@ -15,7 +15,14 @@ from .log import BolError
 
 
 _PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}")
-_SHARED_DIRS = ("games", "proton", "umu", "cache", "xodus-xcurl")
+# Big, account-independent payloads: the game builds, the engine, the runtimes
+# and the downloader binary. Deliberately not here: "xodus-home", which holds
+# the Microsoft Store session. A keyring can hold one user, so sharing it would
+# have every profile sign the previous one out -- and profiles exist to keep
+# accounts apart, which is why "msa" is per-profile too. Each profile
+# therefore takes one Store device of its own (issue #198).
+_SHARED_DIRS = ("games", "proton", "umu", "cache", "xodus", "xodus-xcurl",
+                "xodus-webview")
 
 
 def profile_slug(name):
@@ -76,10 +83,70 @@ def _ensure_shared_link(profile_dir, base_data, name):
     link.symlink_to(target, target_is_directory=True)
 
 
+def _environ_uses_profile_home(environ, profile_dir):
+    """Match an exact NUL-delimited BOL_HOME entry."""
+    target = b"BOL_HOME=" + os.fsencode(str(Path(profile_dir).resolve()))
+    return target in environ.split(b"\0")
+
+
+def profile_processes(profile_dir):
+    """Return live PIDs running BedrockOnLinux with this exact BOL_HOME."""
+    found = []
+    for pdir in Path("/proc").glob("[0-9]*"):
+        try:
+            if _environ_uses_profile_home(
+                    pdir.joinpath("environ").read_bytes(), profile_dir):
+                pid = int(pdir.name)
+                if pid != os.getpid():
+                    found.append(pid)
+        except Exception:
+            continue
+    return sorted(set(found))
+
+
+def require_profile_idle(profile_dir, action="modify profile"):
+    """Fail before a profile mutation while game or launcher processes are live."""
+    p_dir = Path(profile_dir)
+    pfx = p_dir / "compatdata" / "pfx"
+    if pfx.is_dir():
+        from .prefix import prefix_processes
+        live_wine = prefix_processes(pfx)
+        if live_wine:
+            raise BolError(
+                f"Cannot {action}: {len(live_wine)} Wine/Proton process(es) still "
+                "use this profile. Close Minecraft or use 'Force stop Minecraft' first."
+            )
+
+    lock_path = p_dir / ".launch.lock"
+    if lock_path.exists():
+        try:
+            lock_fd = os.open(lock_path, os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise BolError(
+                    f"Cannot {action}: a game session or preparation task is "
+                    "currently active in this profile. Close Minecraft first."
+                ) from exc
+            finally:
+                os.close(lock_fd)
+        except OSError:
+            pass
+
+    live_gui = profile_processes(p_dir)
+    if live_gui:
+        raise BolError(
+            f"Cannot {action}: {len(live_gui)} launcher window(s) are currently "
+            "open for this profile. Close those windows first."
+        )
+
+
 def create_profile(name, base_data=None):
     """Create an account/prefix-isolated profile while sharing large assets."""
     display = str(name).strip()
     slug = profile_slug(display)
+    if slug == "default":
+        raise BolError("The name 'Default' is reserved for the main installation root.")
     base = _profile_base(base_data)
     root = profiles_root(base)
     profile_dir = root / slug
@@ -98,6 +165,9 @@ def create_profile(name, base_data=None):
         except OSError:
             pass
 
+        # Re-creating an existing profile repairs it: an interrupted creation
+        # leaves a directory with no metadata, and a profile made before a
+        # release that shares one more directory still misses that link.
         metadata_path = _metadata_path(profile_dir)
         if metadata_path.exists():
             try:
@@ -141,7 +211,7 @@ def list_profiles(base_data=None):
     if not root.is_dir():
         return []
     found = []
-    for metadata in sorted(root.glob("*/profile.json")):
+    for metadata in root.glob("*/profile.json"):
         try:
             item = json.loads(metadata.read_text(encoding="utf-8"))
             item["path"] = str(metadata.parent)
@@ -149,7 +219,128 @@ def list_profiles(base_data=None):
                 found.append(item)
         except Exception:
             continue
+    found.sort(key=lambda p: str(p.get("name", "")).lower())
     return found
+
+
+def delete_profile(name, base_data=None, applications_dir=None):
+    """Delete an isolated profile directory and its shortcuts."""
+    display = str(name).strip()
+    slug = profile_slug(display)
+    if slug == "default":
+        raise BolError("The main 'Default' profile cannot be deleted.")
+    base = _profile_base(base_data)
+    root = profiles_root(base)
+    profile_dir = root / slug
+    if not profile_dir.is_dir():
+        raise BolError(f"Profile '{display}' does not exist.")
+
+    require_profile_idle(profile_dir, f"delete profile '{display}'")
+
+    for item in profile_dir.iterdir():
+        if item.is_symlink():
+            try:
+                item.unlink()
+            except OSError:
+                pass
+
+    shutil.rmtree(profile_dir)
+
+    apps = Path(applications_dir or (XDG_DATA_HOME / "applications"))
+    for pattern in (f"{APP}-profile-{slug}.desktop", f"{APP}-play-{slug}.desktop"):
+        (apps / pattern).unlink(missing_ok=True)
+    return True
+
+
+def rename_profile(old_name, new_name, base_data=None, applications_dir=None):
+    """Rename the display name and directory of an existing profile."""
+    old_display = str(old_name).strip()
+    old_slug = profile_slug(old_display)
+    if old_slug == "default":
+        raise BolError("The main 'Default' profile cannot be renamed.")
+
+    new_display = str(new_name).strip()
+    new_slug = profile_slug(new_display)
+    if new_slug == "default":
+        raise BolError("The name 'Default' is reserved for the main installation root.")
+
+    base = _profile_base(base_data)
+    root = profiles_root(base)
+    old_dir = root / old_slug
+    new_dir = root / new_slug
+
+    if not old_dir.is_dir():
+        raise BolError(f"Profile '{old_display}' does not exist.")
+
+    if new_slug != old_slug and new_dir.exists():
+        raise BolError(f"A profile named '{new_display}' already exists.")
+
+    require_profile_idle(old_dir, f"rename profile '{old_display}'")
+
+    if new_slug != old_slug:
+        old_dir.rename(new_dir)
+        target_dir = new_dir
+    else:
+        target_dir = old_dir
+
+    fd, staged_name = tempfile.mkstemp(
+        prefix=".profile-", suffix=".json", dir=target_dir
+    )
+    staged = Path(staged_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump({"name": new_display, "slug": new_slug}, stream, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(staged, 0o600)
+        os.replace(staged, _metadata_path(target_dir))
+    finally:
+        staged.unlink(missing_ok=True)
+
+    apps = Path(applications_dir or (XDG_DATA_HOME / "applications"))
+    old_prof_desktop = apps / f"{APP}-profile-{old_slug}.desktop"
+    old_play_desktop = apps / f"{APP}-play-{old_slug}.desktop"
+
+    if new_slug != old_slug:
+        had_prof_desktop = old_prof_desktop.exists()
+        had_play_desktop = old_play_desktop.exists()
+        old_prof_desktop.unlink(missing_ok=True)
+        old_play_desktop.unlink(missing_ok=True)
+        if had_prof_desktop and profile_shortcuts_supported():
+            try:
+                write_profile_shortcut(
+                    new_display, profile_dir=target_dir, applications_dir=apps
+                )
+            except Exception:
+                pass
+        if had_play_desktop and profile_shortcuts_supported():
+            try:
+                write_play_shortcut(
+                    profile_name=new_display, profile_dir=target_dir,
+                    applications_dir=apps
+                )
+            except Exception:
+                pass
+    else:
+        if old_prof_desktop.exists() and profile_shortcuts_supported():
+            try:
+                write_profile_shortcut(
+                    new_display, profile_dir=target_dir, applications_dir=apps
+                )
+            except Exception:
+                pass
+        if old_play_desktop.exists() and profile_shortcuts_supported():
+            try:
+                write_play_shortcut(
+                    profile_name=new_display, profile_dir=target_dir,
+                    applications_dir=apps
+                )
+            except Exception:
+                pass
+
+    return target_dir
+
 
 
 def _desktop_quote(value):
@@ -206,6 +397,30 @@ def launcher_executable(explicit=None):
     if installed:
         return installed
     return str(Path(sys.argv[0]).expanduser().resolve())
+
+
+def _launcher_argv(exe, *arguments):
+    """Run the launcher at `exe` with `arguments`, under this interpreter if
+    it is a Python script. The Nix flake's makeWrapper and Guix's
+    wrap-program put a shell script by that name on PATH, and Python cannot
+    read one."""
+    if exe.endswith(".py") or (Path(exe).name == APP
+                               and _is_python_script(exe)):
+        return [sys.executable, exe, *arguments]
+    return [exe, *arguments]
+
+
+def _gui_command(exe):
+    return _launcher_argv(exe, "gui")
+
+
+def _is_python_script(path):
+    try:
+        with open(path, "rb") as script:
+            first = script.readline(256)
+    except OSError:
+        return True
+    return not first.startswith(b"#!") or b"python" in first
 
 
 def _desktop_command(argument, profile_dir=None, executable=None):
@@ -305,3 +520,170 @@ def profile_launch_command(profile_dir, executable=None):
 def play_launch_command(profile_dir=None, executable=None):
     """Shell-display form of the launcher-free launch, for Steam."""
     return _shell_command("play", profile_dir, executable)
+
+
+def current_profile_info(base_data=None):
+    """Return metadata for the active profile, or 'Default' for the main root."""
+    base = Path(DATA if base_data is None else base_data).expanduser().resolve()
+    if base.parent.name == "profiles":
+        try:
+            metadata = json.loads(_metadata_path(base).read_text(encoding="utf-8"))
+            if metadata.get("name") and metadata.get("slug") == base.name:
+                return {
+                    "name": metadata["name"],
+                    "slug": metadata["slug"],
+                    "path": str(base),
+                }
+        except (OSError, ValueError, TypeError):
+            pass
+    return {
+        "name": "Default",
+        "slug": "default",
+        "path": None,
+    }
+
+
+def current_profile_name(base_data=None):
+    """Return the display name of the currently active profile."""
+    return current_profile_info(base_data)["name"]
+
+
+def relaunch_with_profile(profile_path=None, base_data=None, executable=None):
+    """Relaunch the launcher GUI in the target profile's environment."""
+    from .config import DEFAULT_DATA
+    base_root = _profile_base(base_data)
+    env = dict(os.environ)
+    if profile_path:
+        env["BOL_HOME"] = str(Path(profile_path).expanduser().resolve())
+    else:
+        if base_root.resolve() != DEFAULT_DATA.resolve():
+            env["BOL_HOME"] = str(base_root.resolve())
+        else:
+            env.pop("BOL_HOME", None)
+
+    args = _gui_command(launcher_executable(explicit=executable))
+
+    os.environ.clear()
+    os.environ.update(env)
+
+    try:
+        os.execv(args[0], args)
+    except OSError:
+        import subprocess
+        subprocess.Popen(args, env=env)
+        sys.exit(0)
+
+
+def open_profile_window(profile_path=None, base_data=None, executable=None):
+    """Spawn a new launcher GUI window for the target profile."""
+    import subprocess
+    from .config import DEFAULT_DATA
+    base_root = _profile_base(base_data)
+    env = dict(os.environ)
+    if profile_path:
+        env["BOL_HOME"] = str(Path(profile_path).expanduser().resolve())
+    else:
+        if base_root.resolve() != DEFAULT_DATA.resolve():
+            env["BOL_HOME"] = str(base_root.resolve())
+        else:
+            env.pop("BOL_HOME", None)
+
+    args = _gui_command(launcher_executable(explicit=executable))
+
+    return subprocess.Popen(
+        args,
+        env=env,
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _profile_environment(profile_path=None, base_data=None):
+    """This process's environment, pointed at a profile (None: Default)."""
+    from .config import DEFAULT_DATA
+    base_root = _profile_base(base_data)
+    env = dict(os.environ)
+    if profile_path:
+        env["BOL_HOME"] = str(Path(profile_path).expanduser().resolve())
+    elif base_root.resolve() != DEFAULT_DATA.resolve():
+        env["BOL_HOME"] = str(base_root.resolve())
+    else:
+        env.pop("BOL_HOME", None)
+    return env
+
+
+def profile_home(profile_path=None, base_data=None):
+    """Where a profile keeps its data: its folder, or the main root."""
+    if profile_path:
+        return Path(profile_path).expanduser().resolve()
+    return _profile_base(base_data)
+
+
+def start_profile_game(profile_path=None, hidden=False, base_data=None,
+                       executable=None):
+    """Start Minecraft for a profile in a launcher process of its own.
+
+    Every profile plays in its own process: its prefix, its account and its
+    locks are that process's ``BOL_HOME``. The game it starts shows up in
+    the list of running instances (bol.instances), from where it can be
+    hidden, shown and closed. A launch that fails says so in a desktop
+    notification, like a launcher-free shortcut.
+    """
+    import subprocess
+    arguments = ["play"] + (["--hidden"] if hidden else [])
+    return subprocess.Popen(
+        _launcher_argv(launcher_executable(explicit=executable), *arguments),
+        env=_profile_environment(profile_path, base_data),
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def profile_account(profile_path=None, base_data=None):
+    """The Xbox account a profile is signed in with, read from its files.
+
+    ``{"signed_in": bool, "gamertag": str or None}``. The gamertag is only
+    known once a launch has signed that account in to Xbox Live.
+    """
+    home = profile_home(profile_path, base_data)
+    signed_in = False
+    try:
+        token = json.loads(
+            (home / "msa" / "token.json").read_text(encoding="utf-8"))
+        signed_in = bool(isinstance(token, dict)
+                         and token.get("refresh_token"))
+    except (OSError, ValueError):
+        pass
+    gamertag = None
+    if signed_in:
+        try:
+            device = json.loads((home / "winegdk-preauth" / "device.json")
+                                .read_text(encoding="utf-8"))
+            value = device.get("xbl_gamertag") \
+                if isinstance(device, dict) else None
+            gamertag = str(value) if value else None
+        except (OSError, ValueError):
+            pass
+    return {"signed_in": signed_in, "gamertag": gamertag}
+
+
+def profile_build(profile_path=None, base_data=None):
+    """The build a profile would start next, as "<edition> <version>"; or
+    None when it has none selected."""
+    home = profile_home(profile_path, base_data)
+    try:
+        settings = json.loads(
+            (home / "settings.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    game_dir = settings.get("game_dir") if isinstance(settings, dict) else None
+    if not game_dir:
+        return None
+    folder = Path(str(game_dir))
+    if not folder.is_dir():
+        return None
+    return f"{folder.parent.name.capitalize()} {folder.name}"

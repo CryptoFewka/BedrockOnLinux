@@ -63,6 +63,44 @@ class GameCrashDiagnosisTests(unittest.TestCase):
         self.assertTrue(
             any("memory access violation" in hit for hit in hits), hits)
 
+    _PAGE_FAULT = ("wine: Unhandled page fault on read access to "
+                   "0000000000000008 at address 0000000140427AB5 (thread "
+                   "0118), starting debugger...\n")
+
+    def _diagnose_on(self, log, drm):
+        with mock.patch.object(gamesetup, "DRM_SYSFS", drm):
+            return self._diagnose(log)
+
+    def test_a_crash_on_a_virtual_gpu_suggests_the_legacy_renderer(self):
+        # A Chromebook's Venus driver: exit 84 until the legacy renderer (#302).
+        with tempfile.TemporaryDirectory() as td:
+            hits = self._diagnose_on(
+                "info:vkd3d-proton: Virtio-GPU Venus (Intel(R) UHD Graphics "
+                "(JSL))\n" + self._PAGE_FAULT, Path(td))
+        self.assertTrue(any("Legacy compatibility renderer" in hit
+                            and "virtual GPU" in hit for hit in hits), hits)
+
+    def test_sysfs_names_a_virtual_gpu_the_log_does_not(self):
+        with tempfile.TemporaryDirectory() as td:
+            card = Path(td) / "card0" / "device"
+            card.mkdir(parents=True)
+            (card / "vendor").write_text("0x1af4\n")
+            hits = self._diagnose_on(self._PAGE_FAULT, Path(td))
+        self.assertTrue(any("virtual GPU" in hit for hit in hits), hits)
+
+    def test_a_crash_on_a_real_gpu_does_not_blame_virtualisation(self):
+        with tempfile.TemporaryDirectory() as td:
+            card = Path(td) / "card0" / "device"
+            card.mkdir(parents=True)
+            (card / "vendor").write_text("0x10de\n")
+            hits = self._diagnose_on(self._PAGE_FAULT, Path(td))
+        self.assertFalse(any("virtual GPU" in hit for hit in hits), hits)
+
+    def test_a_virtual_gpu_that_did_not_crash_is_not_mentioned(self):
+        with tempfile.TemporaryDirectory() as td:
+            hits = self._diagnose_on("Virtio-GPU Venus\n", Path(td))
+        self.assertFalse(any("virtual GPU" in hit for hit in hits), hits)
+
     def test_ordinary_log_traffic_is_not_a_crash(self):
         hits = self._diagnose(
             "fixme:seh:page fault handling discussed in a fixme\n"
@@ -70,6 +108,124 @@ class GameCrashDiagnosisTests(unittest.TestCase):
         )
         self.assertFalse(
             any("memory access violation" in hit for hit in hits), hits)
+
+    def test_a_refused_licence_is_the_exact_cause_the_launch_reports(self):
+        # launch._launch_once raises on this very string (#280), so the rule
+        # has to hand it back unchanged.
+        hits = self._diagnose(
+            "not entitled to this content: Device group is full, please "
+            "remove a device and try again\n")
+        self.assertIn(gamesetup.LICENCE_REFUSED, hits)
+
+    def test_a_licence_the_service_refused_is_named_with_its_reason(self):
+        # #345: the game never started and the launcher said nothing. The
+        # -p5 downloader could only say it failed to decode the answer.
+        hits = self._diagnose(
+            "appxmanifest.xml: 73994240 4913\n"
+            "request error: error decoding response body for url "
+            "(https://licensing.mp.microsoft.com/v7.0/licenses/content)\n")
+        refused = [h for h in hits
+                   if h.startswith(gamesetup.LICENCE_SERVICE_REFUSED)]
+        self.assertEqual(len(refused), 1, hits)
+        self.assertIn("Store account", refused[0])
+        # -p7 names the status and Microsoft's reason, and so does the hit.
+        hits = self._diagnose(
+            "request error: the licensing service refused the request "
+            "(HTTP 401): InvalidMsaTicketFormat: There was a problem parsing "
+            "the request\n")
+        refused = [h for h in hits
+                   if h.startswith(gamesetup.LICENCE_SERVICE_REFUSED)]
+        self.assertEqual(len(refused), 1, hits)
+        self.assertIn("(HTTP 401: InvalidMsaTicketFormat:", refused[0])
+
+    def test_a_full_device_group_keeps_its_own_advice(self):
+        hits = self._diagnose(
+            "request error: the licensing service refused the request "
+            "(HTTP 403): not entitled to this content: Device group is full\n")
+        self.assertIn(gamesetup.LICENCE_REFUSED, hits)
+        self.assertFalse(any(h.startswith(gamesetup.LICENCE_SERVICE_REFUSED)
+                             for h in hits), hits)
+
+    def test_a_licence_fetched_without_a_network_is_named(self):
+        # What xodus-cli printed with the network down (#308): a Store build
+        # cannot be decrypted without the key Microsoft hands out per launch.
+        hits = self._diagnose(
+            "appxmanifest.xml: 73994240 4913\n\n"
+            "thread 'main' (277526) panicked at "
+            "crates/xodus-cli/src/license.rs:51:6:\n"
+            "called `Result::unwrap()` on an `Err` value: Request(reqwest::"
+            "Error { kind: Request, url: \"https://login.live.com/RST2.srf\", "
+            "source: hyper_util::client::legacy::Error(Connect, ConnectError("
+            "\"dns error\", Custom { kind: Uncategorized, error: \"failed to "
+            "lookup address information: Temporary failure in name "
+            "resolution\" })) })\n"
+            "note: run with `RUST_BACKTRACE=1` environment variable to "
+            "display a backtrace\n")
+        self.assertIn(gamesetup.LICENCE_UNREACHABLE, hits)
+        self.assertIn("internet connection", gamesetup.LICENCE_UNREACHABLE)
+        # login.live.com and "failed" in the same panic are not a sign-in
+        # the player can do anything about.
+        self.assertFalse(any(hit.startswith("Microsoft sign-in failed")
+                             for hit in hits), hits)
+
+    def test_an_unreachable_licence_is_named_without_a_panic(self):
+        # xodus-cli from -p9 on reports the exchange it could not make instead
+        # of panicking; this is what it printed with no network namespace.
+        hits = self._diagnose(
+            "could not exchange this device's Microsoft session: Error making "
+            "a request reqwest::Error { kind: Request, url: \"https://login."
+            "live.com/RST2.srf\", source: hyper_util::client::legacy::Error("
+            "Connect, ConnectError(\"dns error\", Custom { kind: "
+            "Uncategorized, error: \"failed to lookup address information: "
+            "Temporary failure in name resolution\" })) }\n")
+        self.assertIn(gamesetup.LICENCE_UNREACHABLE, hits)
+        self.assertNotIn(gamesetup.STORE_SESSION_REFUSED, hits)
+
+    def test_a_device_session_microsoft_refused_is_named(self):
+        # minecraft.log of every PLAY about sixty days after the Store sign-in,
+        # with xodus-cli up to -p8 (#367). It read "No known cause".
+        hits = self._diagnose(
+            "resources.pri: 73756672 1192\n\n"
+            "thread 'main' (4736) panicked at "
+            "crates/xodus/src/api/live/mod.rs:79:14:\n"
+            "not implemented: Exchange token supports only singular token "
+            "right now Fault(Fault)\n"
+            "note: run with `RUST_BACKTRACE=1` environment variable to "
+            "display a backtrace\n")
+        self.assertIn(gamesetup.STORE_SESSION_REFUSED, hits)
+        self.assertIn("sign out", gamesetup.STORE_SESSION_REFUSED)
+        self.assertNotIn(gamesetup.LICENCE_UNREACHABLE, hits)
+
+    def test_a_session_refused_even_signed_in_afresh_is_named(self):
+        hits = self._diagnose(
+            "this device's Microsoft session was refused again after signing "
+            "it in afresh: login.live.com refused the token request with a "
+            "SOAP Fault (reqstatus: 0x80048821)\n")
+        self.assertIn(gamesetup.STORE_SESSION_REFUSED, hits)
+        self.assertFalse(any(hit.startswith("Microsoft sign-in failed")
+                             for hit in hits), hits)
+
+    def test_an_account_session_that_ran_out_is_named(self):
+        hits = self._diagnose(
+            "not logged in: the Microsoft account's session token in the "
+            "keyring has expired (entry expired at 2026-11-24T03:09:36Z); "
+            "sign in again\n")
+        self.assertIn(gamesetup.STORE_SESSION_REFUSED, hits)
+
+    def test_a_refused_licence_request_is_not_a_refused_session(self):
+        # #322: the licensing service refused the ticket, not Live the
+        # session. Signing out again changes nothing there.
+        hits = self._diagnose(
+            "the licensing service refused the request (HTTP 401): "
+            "InvalidMsaTicketFormat\n")
+        self.assertNotIn(gamesetup.STORE_SESSION_REFUSED, hits)
+
+    def test_other_xodus_panics_are_not_called_offline(self):
+        hits = self._diagnose(
+            "thread 'main' panicked at crates/xodus-cli/src/run.rs:133:58:\n"
+            "called `Result::unwrap()` on an `Err` value: Os { code: 2, "
+            "kind: NotFound, message: \"No such file or directory\" }\n")
+        self.assertNotIn(gamesetup.LICENCE_UNREACHABLE, hits)
 
 
 class OnlineDiagnosisTests(unittest.TestCase):

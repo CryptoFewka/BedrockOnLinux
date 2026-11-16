@@ -30,13 +30,17 @@ cffi==2.0.0 \
 pycparser==3.0 \
     --hash=sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992
 
-# GUI toolkit + X11 primary-monitor lookup (pure Python).
-customtkinter==5.2.2 \
-    --hash=sha256:14ad3e7cd3cb3b9eb642b9d4e8711ae80d3f79fb82545ad11258eeffb2e6b37c
-darkdetect==0.8.0 \
-    --hash=sha256:a7509ccf517eaad92b31c214f593dbcf138ea8a43b2935406bbd565e15527a85
-packaging==26.2 \
-    --hash=sha256:5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e
+# GUI toolkit (PySide6-Essentials only — not the PySide6 meta-package, which
+# also pulls PySide6-Addons: ~167 MB of Qt modules — Multimedia, WebEngine,
+# Charts, … — this app never uses. Essentials alone provides QtCore/QtGui/
+# QtWidgets under the `PySide6.*` namespace. Pinned to 6.9.3: the newest
+# PySide6 line still built on manylinux_2_28 (glibc 2.28); 6.10+ wheels
+# require glibc 2.34 and would break the same Bullseye/Ubuntu 22.04/Steam
+# Runtime baseline the cryptography==43.0.3 pin above protects.
+shiboken6==6.9.3 \
+    --hash=sha256:f3f5337a3a8fc660ba1462265bd9a2bdda9588f8d90fbc3d5ac4ce3134c11e59
+pyside6-essentials==6.9.3 \
+    --hash=sha256:c70d5544e892b201a677b615156fab6a0fef865e7fc287f55a0eae00a682e83f
 python-xlib==0.33 \
     --hash=sha256:c3534038d42e0df2f1392a1b30a15a4ff5fdc2b86cfa94f072bf11b10a164398
 six==1.17.0 \

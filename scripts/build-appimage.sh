@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
-# Portable AppImage with bundled CPython, Tk, login dependencies and CA store.
-# Xft/fontconfig/X11 remain host GUI dependencies, as with standard AppImages.
+# Portable AppImage with bundled CPython, PySide6-Essentials (Qt), login
+# dependencies and CA store.
+#
+# An AppImage cannot declare dependencies, and the Qt platform-plugin runtime
+# libraries stay host GUI dependencies as with standard AppImages -- but unlike
+# the Tk GUI this replaced, a missing one is fatal and silent: Qt aborts the
+# process natively with "could not load the Qt platform plugin xcb" before
+# control returns to Python, so bol.gui's own error reporting never runs.
+# The full list is pinned in tests/test_application_packaging.py
+# (QT_HOST_LIBRARIES) and declared by the .deb and .rpm; the short version is
+# libX11/libX11-xcb, libxkbcommon(-x11), libGL/libEGL, fontconfig, freetype
+# and libxcb with its extensions.
+#
+# Everything else Qt links that is *not* a GUI or driver library is bundled
+# here instead -- libzstd (issue #205) and the xcb-util family (cursor,
+# icccm, image, keysyms, render-util, util), which stock Ubuntu and Mint
+# desktops do not install -- and the host dependency audit below fails the
+# build if that list ever grows behind our back.
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -11,17 +27,41 @@ mkdir -p "$CACHE" "$OUT"
 GLIBC_CEILING="${BOL_APPIMAGE_GLIBC_CEILING:-2.31}"
 SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-1782250551}"
 export SOURCE_DATE_EPOCH
+
+# Update information (issue #191). AppImageUpdate, AppImageLauncher, AM/AppMan
+# and friends read this string out of the runtime's .upd_info section; it names
+# the release to look at and the .zsync sidecar appimagetool writes next to the
+# AppImage, so an update transfers only the blocks that actually changed
+# instead of the whole ~200 MB bundle. The repository comes from bol/config.py,
+# the same one the launcher's own updater asks, so a fork updates from its own
+# releases. The channel picks the tag: a nightly must follow the rolling
+# "nightly" prerelease rather than replace itself with the stable release,
+# and a versioned pre-release follows its own tag: "latest" is the previous
+# stable release, which AppImageUpdate would install over it.
+# Setting BOL_APPIMAGE_UPDATE_INFO to the empty string builds an AppImage with
+# no update information at all.
+SELF_REPO="$(grep -m1 '^WINEGDK_PREBUILT_REPO = ' "$SRC/bol/config.py" | cut -d'"' -f2)"
+[[ "$SELF_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || {
+  echo "!! could not read the release repository from bol/config.py" >&2
+  exit 1
+}
+case "${BOL_RELEASE_CHANNEL:-release}" in
+  nightly)    UPDATE_TAG="nightly" ;;
+  prerelease) UPDATE_TAG="v$(grep -m1 '^VERSION = ' "$SRC/bol/config.py" | cut -d'"' -f2)" ;;
+  *)          UPDATE_TAG="latest" ;;
+esac
+UPDATE_INFO="${BOL_APPIMAGE_UPDATE_INFO-gh-releases-zsync|${SELF_REPO%/*}|${SELF_REPO#*/}|${UPDATE_TAG}|BedrockOnLinux-*-x86_64.AppImage.zsync}"
+
 APPDIR="$OUT/BedrockOnLinux.AppDir"; rm -rf "$APPDIR"
 mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" \
          "$APPDIR/usr/share/icons/hicolor/256x256/apps" \
          "$APPDIR/usr/share/licenses/bedrock-on-linux"
 
-PBS_TAG="${PBS_TAG:-20260610}"; PBS_PY="${PBS_PY:-3.12.13}"; PYABI=cpython-312-x86_64-linux-gnu
+PBS_TAG="${PBS_TAG:-20260610}"; PBS_PY="${PBS_PY:-3.12.13}"
 PBS_ASSET="cpython-${PBS_PY}+${PBS_TAG}-x86_64-unknown-linux-gnu-install_only.tar.gz"
 PBS_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/${PBS_ASSET}"
 PBS_TARBALL="$CACHE/$PBS_ASSET"
 PBS_SHA256="c218f50baeb2c06a30c2f03db5986b2bad6ab7c8a52faad2d5a59bda0677b93a"
-TKVER="${TKVER:-8.6.14}"
 
 download_verified() {
   local url="$1" output="$2" expected="$3" label="$4" actual
@@ -43,13 +83,6 @@ download_verified() {
   mv -f -- "$output.part" "$output"
 }
 
-PATCHELF="${PATCHELF:-$(command -v patchelf || true)}"
-if [[ -z "$PATCHELF" ]]; then
-  python3 -m pip install --quiet --user patchelf 2>/dev/null || true
-  PATCHELF="$(command -v patchelf || echo "$HOME/.local/bin/patchelf")"
-fi
-[[ -x "$PATCHELF" ]] || { echo "!! need patchelf (pip install patchelf)" >&2; exit 1; }
-
 download_verified "$PBS_URL" "$PBS_TARBALL" "$PBS_SHA256" \
   "python-build-standalone archive"
 echo "== unpacking Python into the AppDir"
@@ -58,88 +91,156 @@ PYHOME="$APPDIR/usr/python"; PYBIN="$PYHOME/bin/python3.12"
 PYLIB="$PYHOME/lib"; DYN="$PYLIB/python3.12/lib-dynload"
 [[ -x "$PYBIN" ]] || { echo "!! bundled python missing" >&2; exit 1; }
 
-TKX="$CACHE/tkxft-${PBS_PY}-${TKVER}-relocatable-v3-no-xss"
-if [[ ! -f "$TKX/lib/libtk8.6.so" || ! -f "$TKX/_tkinter.${PYABI}.so" ]]; then
-  echo "== building Tcl/Tk ${TKVER} with Xft (one-time, cached)"
-  rm -rf "$TKX"; mkdir -p "$TKX"
-  bdir="$CACHE/tk-build"; rm -rf "$bdir"; mkdir -p "$bdir"
-  for kit in tcl tk; do
-    if [[ "$kit" == tcl ]]; then
-      kit_sha="5880225babf7954c58d4fb0f5cf6279104ce1cd6aa9b71e9a6322540e1c4de66"
-    else
-      kit_sha="8ffdb720f47a6ca6107eac2dd877e30b0ef7fac14f3a84ebbd0b3612cee41a94"
-    fi
-    download_verified \
-      "https://prdownloads.sourceforge.net/tcl/${kit}${TKVER}-src.tar.gz" \
-      "$CACHE/${kit}${TKVER}-src.tar.gz" "$kit_sha" "$kit source archive"
-    tar -C "$bdir" -xzf "$CACHE/${kit}${TKVER}-src.tar.gz"
-  done
-  tks="$CACHE/tksrc-${PBS_PY}"; mkdir -p "$tks/clinic"
-  base="https://raw.githubusercontent.com/python/cpython/v${PBS_PY}/Modules"
-  for f in _tkinter.c tkappinit.c tkinter.h clinic/_tkinter.c.h; do
-    case "$f" in
-      _tkinter.c) source_sha="c484afe880de65c628f5376adf0be413eae2f0d339d5ef5f33365c14ba59eca3" ;;
-      tkappinit.c) source_sha="312be438c11b08dd334c9a64149e94aef9ac31d24b7ae9b428c37f93f67821d6" ;;
-      tkinter.h) source_sha="229776646f467c4ed9ec1460a14b756bc2de5e5bd70ead431a495d21305f7675" ;;
-      clinic/_tkinter.c.h) source_sha="2a6f1f61b004e88fbb8769650699747119004076c45eb7d430beb0be93325658" ;;
-    esac
-    download_verified "$base/$f" "$tks/$f" "$source_sha" \
-      "CPython $f"
-  done
-  TK_HELPER="$SRC/scripts/build-appimage-tk-cache.sh"
-  if [[ -n "${BOL_TK_BUILD_ROOTFS:-}" ]]; then
-    ROOTFS="$(readlink -f -- "$BOL_TK_BUILD_ROOTFS")"
-    [[ -x "$ROOTFS/bin/bash" && -x "$ROOTFS/usr/bin/gcc" ]] \
-      || { echo "!! BOL_TK_BUILD_ROOTFS is not a prepared build rootfs: $ROOTFS" >&2; exit 1; }
-    echo "   compiling native Tk inside: $ROOTFS"
-    env ROOTFS="$ROOTFS" SRC="$SRC" CACHE="$CACHE" TK_HELPER="$TK_HELPER" \
-      BDIR="$bdir" TKX="$TKX" PYHOME="$PYHOME" TKS="$tks" \
-      TKVER="$TKVER" PYABI="$PYABI" \
-      unshare --user --map-root-user --mount --propagation private --fork \
-      /bin/bash -c '
-        set -euo pipefail
-        mkdir -p "$ROOTFS$SRC" "$ROOTFS$CACHE" "$ROOTFS/dev" "$ROOTFS/proc"
-        mount --bind "$SRC" "$ROOTFS$SRC"
-        mount --bind "$CACHE" "$ROOTFS$CACHE"
-        mount --rbind /dev "$ROOTFS/dev"
-        mount --make-rslave "$ROOTFS/dev"
-        mount --rbind /proc "$ROOTFS/proc"
-        mount --make-rslave "$ROOTFS/proc"
-        exec chroot "$ROOTFS" /usr/bin/env -i \
-          HOME=/tmp PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-          LC_ALL=C.UTF-8 LANG=C.UTF-8 TZ=UTC \
-          /bin/bash "$TK_HELPER" "$BDIR" "$TKX" "$PYHOME" "$TKS" "$TKVER" "$PYABI"
-      '
-  else
-    bash "$TK_HELPER" "$bdir" "$TKX" "$PYHOME" "$tks" "$TKVER" "$PYABI"
-  fi
-fi
-
-echo "== grafting Xft Tk into the bundle"
-install -m644 "$TKX/lib/libtcl8.6.so" "$TKX/lib/libtk8.6.so" "$PYLIB/"
-cp -r "$TKX/lib/tcl8.6" "$TKX/lib/tk8.6" "$PYLIB/"
-install -m755 "$TKX/_tkinter.${PYABI}.so" "$DYN/_tkinter.${PYABI}.so"
-# drop python-build-standalone's no-Xft Tcl/Tk 9 so it can never be picked up
+# python-build-standalone bundles its own Tcl/Tk 9 + _tkinter for `tkinter`,
+# which nothing here imports anymore (PySide6/Qt replaced it). Drop the
+# extension module and the Tcl/Tk libraries behind it so they can never be
+# picked up, and so the audit below has that much less to walk.
+rm -f "$DYN"/_tkinter.*.so
 rm -f "$PYLIB"/libtcl9*.so "$PYLIB"/libtcl9tk9*.so
 rm -rf "$PYLIB"/tcl9* "$PYLIB"/tk9* 2>/dev/null || true
-# rpath so the grafted libs find each other relative to the AppImage mount
-"$PATCHELF" --set-rpath '$ORIGIN'        "$PYLIB/libtcl8.6.so"
-"$PATCHELF" --set-rpath '$ORIGIN'        "$PYLIB/libtk8.6.so"
-"$PATCHELF" --set-rpath '$ORIGIN/../..'  "$DYN/_tkinter.${PYABI}.so"
-for library in "$PYLIB/libtcl8.6.so" "$PYLIB/libtk8.6.so"; do
-  [[ "$("$PATCHELF" --print-rpath "$library")" == '$ORIGIN' ]] || {
-    echo "!! non-relocatable RUNPATH remained in $library" >&2
-    exit 1
-  }
-done
 
-echo "== installing portable cryptography + certifi + customtkinter + python-xlib into the bundle"
+echo "== installing portable cryptography + certifi + PySide6-Essentials + python-xlib into the bundle"
 # Hash-pinned, wheels only, no sdist builds: the closure + SHA-256s live in
 # third_party/requirements-appimage.txt (--require-hashes rejects any mismatch).
 "$PYBIN" -m pip install --no-cache-dir --no-compile \
     --no-deps --require-hashes --only-binary=:all: \
     -r "$SRC/third_party/requirements-appimage.txt" \
     >/dev/null
+
+# PySide6 dev tools embed the build host's absolute Python path in their
+# shebangs. They are not needed at runtime (the imports live in
+# site-packages), so drop them before the relocatability audit below.
+rm -f "$PYHOME"/bin/pyside6-* 2>/dev/null || true
+
+QT_LIB="$PYLIB/python3.12/site-packages/PySide6/Qt/lib"
+[[ -d "$QT_LIB" ]] || {
+  echo "!! the PySide6 wheel no longer keeps its Qt libraries in Qt/lib" >&2
+  exit 1
+}
+# Libraries Qt links that the AppImage carries itself, taken from the pinned
+# Debian 11 snapshot the containerised builds already use: identical bytes on
+# every build host, and an old enough glibc for the baseline audited below.
+# They go beside the wheel's own libicu, in Qt/lib, where the $ORIGIN RUNPATH
+# of libQt6Core and libQt6XcbQpa finds them before any host copy.
+DEBIAN_SNAPSHOT="https://snapshot.debian.org/archive/debian/20260701T000000Z"
+bundle_deb_library() {
+  local pool="$1" sha256="$2" member="$3" soname="$4" package deb
+  package="$(basename "$pool")"
+  deb="$CACHE/$package"
+  download_verified "$DEBIAN_SNAPSHOT/${pool//+/%2B}" "$deb" "$sha256" \
+    "Debian 11 ${package%%_*}"
+  python3 - "$deb" "$member" "$QT_LIB/$soname" \
+      "$APPDIR/usr/share/licenses/bedrock-on-linux/${package%%_*}.copyright" \
+      <<'PY'
+import io
+import lzma
+import sys
+import tarfile
+from pathlib import Path
+
+package, member, library, licence = sys.argv[1:5]
+package, library, licence = Path(package), Path(library), Path(licence)
+raw = package.read_bytes()
+if raw[:8] != b"!<arch>\n":
+    raise SystemExit(f"{package} is not a Debian package")
+# A .deb is an ar archive: 60-byte member headers, member data padded to an
+# even length. Read it here rather than shelling out, so the build needs
+# neither dpkg nor xz-utils on the host that runs it.
+members, offset = {}, 8
+while offset + 60 <= len(raw):
+    header = raw[offset:offset + 60]
+    name = header[:16].decode("ascii", "replace").strip().rstrip("/")
+    start = offset + 60
+    size = int(header[48:58])
+    members[name] = raw[start:start + size]
+    offset = start + size + size % 2
+if "data.tar.xz" not in members:
+    raise SystemExit(f"{package} carries no data.tar.xz")
+binary = package.name.split("_", 1)[0]
+wanted = {
+    "./usr/lib/x86_64-linux-gnu/" + member: library,
+    f"./usr/share/doc/{binary}/copyright": licence,
+}
+with tarfile.open(fileobj=io.BytesIO(lzma.decompress(members["data.tar.xz"])),
+                  mode="r:") as payload:
+    for name, destination in wanted.items():
+        try:
+            entry = payload.getmember(name)
+        except KeyError:
+            raise SystemExit(f"{package.name} no longer contains {name}")
+        source = payload.extractfile(entry)
+        if source is None:
+            raise SystemExit(f"{name} is not a regular file in {package.name}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(source.read())
+        destination.chmod(0o755 if destination == library else 0o644)
+print(f"  bundled {library.name} + its licence from {package.name}")
+PY
+}
+
+# libQt6Core.so.6 links libzstd.so.1, and unlike the X11/GL stack above that
+# is no host GUI library: a system with no zstd runtime at all -- NixOS via
+# appimage-run, a minimal container -- fails the launcher's very first
+# `import PySide6.QtCore` with "libzstd.so.1: cannot open shared object file"
+# and never draws a window (issue #205). It is not on the AppImage excludelist
+# either. GLIBC_2.14 at most -- well under the baseline below.
+echo "== bundling libzstd.so.1, the one non-GUI library Qt asked the host for"
+bundle_deb_library \
+  "pool/main/libz/libzstd/libzstd1_1.4.8+dfsg-2.1_amd64.deb" \
+  "5dcadfbb743bfa1c1c773bff91c018f835e8e8c821d423d3836f3ab84773507b" \
+  "libzstd.so.1.4.8" "libzstd.so.1"
+
+# Qt's xcb platform plugin also links the xcb-util family, and those are not
+# libxcb: they come from six small source packages that a desktop only has
+# when something else pulled them in. Stock Ubuntu 22.04 and 24.04 -- and so
+# Mint -- install no libxcb-cursor0, and Debian, Fedora and Arch desktops
+# vary. Without it Qt 6.5+ refuses the plugin ("xcb-cursor0 or
+# libxcb-cursor0 is needed to load the Qt xcb platform plugin") and aborts
+# the process, on every X11 session. linuxdeploy's Qt plugin bundles them for
+# the same reason; libxcb itself and its extensions stay host libraries.
+echo "== bundling the xcb-util libraries Qt's xcb plugin links"
+bundle_deb_library \
+  "pool/main/x/xcb-util/libxcb-util1_0.4.0-1+b1_amd64.deb" \
+  "4c48af51fb2ac1be0490067e7450aeda27bf6c6c395165de02199eee4835336f" \
+  "libxcb-util.so.1.0.0" "libxcb-util.so.1"
+bundle_deb_library \
+  "pool/main/x/xcb-util-cursor/libxcb-cursor0_0.1.1-4_amd64.deb" \
+  "bab731cd0143303f77461dd0a03ad20807bd3d767d5d6af6a11ff99c3b7aeac3" \
+  "libxcb-cursor.so.0.0.0" "libxcb-cursor.so.0"
+bundle_deb_library \
+  "pool/main/x/xcb-util-image/libxcb-image0_0.4.0-1+b3_amd64.deb" \
+  "36a381bb18c9f349a53457c66b3d1825631f3e50c4f6c12326cf05257302172d" \
+  "libxcb-image.so.0.0.0" "libxcb-image.so.0"
+bundle_deb_library \
+  "pool/main/x/xcb-util-keysyms/libxcb-keysyms1_0.4.0-1+b2_amd64.deb" \
+  "aed1436db9a3e63b10d00c4ed16248b5c82b5dd2963a83a761f406af65eb4b49" \
+  "libxcb-keysyms.so.1.0.0" "libxcb-keysyms.so.1"
+bundle_deb_library \
+  "pool/main/x/xcb-util-renderutil/libxcb-render-util0_0.3.9-1+b1_amd64.deb" \
+  "be4b38a63e65c84e2f1322f044d05a9baa677e0f3dc68b742a0a109a3ff40ae9" \
+  "libxcb-render-util.so.0.0.0" "libxcb-render-util.so.0"
+bundle_deb_library \
+  "pool/main/x/xcb-util-wm/libxcb-icccm4_0.4.1-1.1_amd64.deb" \
+  "f323194cb04cd4e5ae064fafec39db6dcf8a431cbd65a0bc53fa6c359862d8ff" \
+  "libxcb-icccm.so.4.0.0" "libxcb-icccm.so.4"
+
+# Two more that a stock desktop can lack, both seen on openSUSE Tumbleweed.
+# libQt6Core links libgthread-2.0, and openSUSE splits it out of GLib into
+# libgthread-2_0-0, which no desktop pattern installs (only ten packages in
+# the whole distribution require it, none of them Qt or GTK): `import
+# PySide6.QtCore` fails there before the launcher can draw anything. Since
+# GLib 2.32 it is an empty compatibility shim over libglib, so a copy cannot
+# shadow anything of the host's. The xcb plugin also links libxcb-shape,
+# which comes with neither libxcb nor the X server there.
+echo "== bundling libgthread-2.0 and libxcb-shape"
+bundle_deb_library \
+  "pool/main/libx/libxcb/libxcb-shape0_1.14-3_amd64.deb" \
+  "d0f942240fc5c1b11514c726a1cba1bad80506a15c837ce2a9f11c9b313c4851" \
+  "libxcb-shape.so.0.0.0" "libxcb-shape.so.0"
+bundle_deb_library \
+  "pool/main/g/glib2.0/libglib2.0-0_2.66.8-1+deb11u4_amd64.deb" \
+  "7aff8c1338b58a6fa2b3a914724040a2b7f6e8dc2333f30c98834f7948f1884f" \
+  "libgthread-2.0.so.0.6600.8" "libgthread-2.0.so.0"
 
 PY3="$PYLIB/python3.12"
 rm -rf "$PY3/test" "$PY3/idlelib" "$PY3/turtledemo" "$PY3/tkinter/test" \
@@ -170,6 +271,8 @@ worst = ((0, 0), None)
 violations = []
 rpath_violations = []
 forbidden_dependencies = []
+sonames = {}
+dependencies = {}
 count = 0
 for path in root.rglob("*"):
     if not path.is_file():
@@ -208,7 +311,12 @@ for path in root.rglob("*"):
                     if entry and os.path.isabs(entry)]
         if absolute:
             rpath_violations.append((path.relative_to(root), absolute))
-    for dependency in re.findall(r"\(NEEDED\).*?\[([^]]+)\]", dynamic.stdout):
+    dependencies[path] = re.findall(
+        r"\(NEEDED\).*?\[([^]]+)\]", dynamic.stdout)
+    soname = re.search(r"\(SONAME\).*?\[([^]]+)\]", dynamic.stdout)
+    if soname:
+        sonames.setdefault(soname.group(1), path)
+    for dependency in dependencies[path]:
         if dependency in {"libcrypt.so.1", "libXss.so.1"}:
             forbidden_dependencies.append((path.relative_to(root), dependency))
 if not count:
@@ -220,7 +328,8 @@ if violations:
     )
     raise SystemExit(
         "AppImage contains host-built ELF files newer than GLIBC_%d.%d:\n%s\n"
-        "Rebuild the Tcl/Tk cache on Debian 11 (Bullseye) and retry."
+        "Check the pinned wheel versions in "
+        "third_party/requirements-appimage.txt against this ceiling."
         % (*ceiling, details)
     )
 if rpath_violations:
@@ -242,6 +351,73 @@ if forbidden_dependencies:
     )
 print("  AppImage ABI OK: %d ELF files, maximum GLIBC_%d.%d (%s)" %
       (count, worst[0][0], worst[0][1], worst[1]))
+
+# Libraries the host is expected to own. Nearly all are on the AppImage
+# excludelist -- the C/C++ runtime, the X11/GL stack, zlib, fontconfig and
+# freetype -- and glib and D-Bus stay host libraries too, because a bundled
+# copy would shadow the desktop's own GTK/D-Bus stack for the whole process.
+# Anything Qt needs that is not in here has to be bundled instead.
+# Keep in step with QT_HOST_LIBRARIES in tests/test_application_packaging.py
+# and with the .deb/.rpm dependency lists.
+host_libraries = {
+    "ld-linux-x86-64.so.2", "libc.so.6", "libdl.so.2", "libm.so.6",
+    "libpthread.so.0", "librt.so.1", "libgcc_s.so.1", "libstdc++.so.6",
+    "libz.so.1", "libglib-2.0.so.0", "libdbus-1.so.3",
+    "libfontconfig.so.1", "libfreetype.so.6", "libGL.so.1", "libEGL.so.1",
+    "libX11.so.6", "libX11-xcb.so.1", "libxkbcommon.so.0",
+    "libxkbcommon-x11.so.0", "libxcb.so.1", "libxcb-randr.so.0",
+    "libxcb-render.so.0", "libxcb-shm.so.0",
+    "libxcb-sync.so.1", "libxcb-xfixes.so.0", "libxcb-xkb.so.1",
+}
+# What bol.gui imports, and what Qt loads behind it to put a window on the
+# screen. Plugins Qt only tries opportunistically -- image formats, SQL
+# drivers, the GTK platform theme -- are deliberately not roots: Qt carries on
+# without them, and several link libraries (libpq, libgtk-3) this app never
+# wants to require.
+site_packages = root / "usr/python/lib/python3.12/site-packages"
+import_path = [site_packages / "PySide6/QtCore.abi3.so",
+               site_packages / "PySide6/QtGui.abi3.so",
+               site_packages / "PySide6/QtWidgets.abi3.so",
+               site_packages / "PySide6/Qt/plugins/platforms/libqxcb.so"]
+absent = [str(path.relative_to(root)) for path in import_path
+          if not path.is_file()]
+if absent:
+    raise SystemExit(
+        "the pinned PySide6 wheel no longer provides the files the launcher "
+        "imports:\n  " + "\n  ".join(absent))
+from_host = {}
+reached = set()
+queue = list(import_path)
+while queue:
+    path = queue.pop()
+    if path in reached:
+        continue
+    reached.add(path)
+    for dependency in dependencies.get(path, ()):
+        if dependency in sonames:
+            queue.append(sonames[dependency])
+        elif dependency in host_libraries:
+            from_host.setdefault(dependency, [])
+        else:
+            from_host.setdefault(dependency, []).append(
+                str(path.relative_to(root)))
+undeclared = {name: users for name, users in from_host.items() if users}
+if undeclared:
+    details = "\n".join(
+        f"  {name}  (needed by {', '.join(sorted(set(users)))})"
+        for name, users in sorted(undeclared.items()))
+    raise SystemExit(
+        "the launcher's Qt import path needs libraries that are neither "
+        "bundled here nor declared host dependencies:\n" + details + "\n"
+        "An AppImage cannot ask for these, so a host without one gets an "
+        "ImportError instead of a window (issue #205). Bundle it from a "
+        "pinned Debian 11 package, the way libzstd.so.1 is bundled above -- "
+        "or, if the host really must own it, add it to host_libraries here, "
+        "to QT_HOST_LIBRARIES in tests/test_application_packaging.py and to "
+        "the .deb/.rpm dependency lists.")
+print("  AppImage host dependencies OK: the import path resolves %d bundled "
+      "objects and asks the host for %d libraries"
+      % (len(reached), len(from_host)))
 PY
 
 [[ -f "$SRC/data/icon.png" ]] || { echo "data/icon.png missing" >&2; exit 1; }
@@ -265,8 +441,6 @@ cat > "$APPDIR/AppRun" <<'EOF'
 #!/bin/sh
 HERE="$(dirname "$(readlink -f "$0")")"
 PY="$HERE/usr/python/bin/python3.12"
-export TCL_LIBRARY="$HERE/usr/python/lib/tcl8.6"
-export TK_LIBRARY="$HERE/usr/python/lib/tk8.6"
 CERT="$HERE/usr/python/lib/python3.12/site-packages/certifi/cacert.pem"
 if [ -f "$CERT" ]; then
   export SSL_CERT_FILE="$CERT"
@@ -279,9 +453,8 @@ chmod 755 "$APPDIR/AppRun"
 /bin/sh -n "$APPDIR/AppRun" \
   || { echo "!! AppRun is not compatible with /bin/sh" >&2; exit 1; }
 
-echo "== verifying the bundle: Xft Tk + cryptography + HTTPS, all self-contained"
-env -i TCL_LIBRARY="$PYHOME/lib/tcl8.6" TK_LIBRARY="$PYHOME/lib/tk8.6" \
-   SSL_CERT_FILE="$PYLIB/python3.12/site-packages/certifi/cacert.pem" \
+echo "== verifying the bundle: PySide6/Qt + cryptography + HTTPS, all self-contained"
+env -i SSL_CERT_FILE="$PYLIB/python3.12/site-packages/certifi/cacert.pem" \
    SSL_CERT_DIR=/nonexistent \
    ${DISPLAY:+DISPLAY="$DISPLAY"} ${XAUTHORITY:+XAUTHORITY="$XAUTHORITY"} \
    "$PYBIN" - <<'PY'
@@ -291,25 +464,31 @@ import time
 import urllib.error
 import urllib.request
 
-import _tkinter
 import cryptography
-import customtkinter
+import shiboken6
 import Xlib
 from importlib.metadata import version
-assert _tkinter.TK_VERSION == "8.6", _tkinter.TK_VERSION   # Xft build, not PBS Tk9
+from PySide6 import __version__ as pyside6_version
+from PySide6.QtCore import QLibraryInfo
 expected = {
     "cryptography": "43.0.3",
     "certifi": "2026.6.17",
     "cffi": "2.0.0",
     "pycparser": "3.0",
-    "customtkinter": "5.2.2",
-    "darkdetect": "0.8.0",
-    "packaging": "26.2",
+    "shiboken6": "6.9.3",
+    "pyside6_essentials": "6.9.3",
     "python-xlib": "0.33",
     "six": "1.17.0",
 }
 actual = {package: version(package) for package in expected}
 assert actual == expected, (actual, expected)
+assert pyside6_version == "6.9.3", pyside6_version
+# The bundled Qt plugins (platforms/libqxcb.so, etc.) ship inside the
+# PySide6 wheel itself; PySide6 points Qt's plugin search path at its own
+# package directory on import, so this is what the app will actually find
+# at runtime rather than anything on the host.
+plugins_path = QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath)
+assert os.path.isdir(plugins_path), f"Qt plugins path missing: {plugins_path}"
 def verify_https():
     # The point of this check is that the bundled OpenSSL + certifi CA can
     # complete a real TLS handshake. A certificate/TLS failure is a genuine
@@ -340,17 +519,17 @@ def verify_https():
     return "HTTPS online check skipped (network unavailable)"
 
 https_status = verify_https()
-msg = (f"  bundle OK: Tk {_tkinter.TK_VERSION} | cryptography {cryptography.__version__}"
-       f" | customtkinter {customtkinter.__version__} | {https_status}")
+msg = (f"  bundle OK: PySide6 {pyside6_version} | cryptography {cryptography.__version__}"
+       f" | {https_status}")
 if os.environ.get("DISPLAY"):
-    import tkinter
-    from tkinter import font
-    r = tkinter.Tk()
-    r.withdraw()
-    n = len(set(font.families()))
-    r.destroy()
-    assert n > 100, f"Xft not active — only {n} fonts"
-    msg += f" | {n} font families (Xft, antialiased)"
+    # A real QApplication construction proves the bundled xcb platform
+    # plugin actually loads against the host's X11/xcb libraries — the one
+    # part of this bundle a headless build box cannot exercise, so it only
+    # runs when DISPLAY is present (same convention the old Tk check used).
+    from PySide6.QtWidgets import QApplication
+    app = QApplication(["bedrock-on-linux-appimage-verify"])
+    app.quit()
+    msg += " | QApplication constructed (xcb platform plugin OK)"
 print(msg)
 PY
 
@@ -390,29 +569,140 @@ print("  AppImage staging paths are relocatable")
 PY
 
 TOOL="$CACHE/appimagetool"
+# The 1.9.1 release, not "continuous": upstream rebuilds that tag on every push
+# to its main branch, which swapped the bytes behind the URL on 2026-10-04 and
+# took the release build down the next day, as the runtime's did below. 1.9.1
+# is commit 8c8c91f, the same source as the continuous build 295 pinned before
+# it, bundling the same mksquashfs 4.6.1, zsyncmake 0.6.2 and
+# desktop-file-validate 0.28. Upstream publishes no checksums or attestations;
+# this is the digest GitHub recorded when the 1.9.1 tag's own build (run
+# 19938734639) uploaded the asset.
 download_verified \
-  "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage" \
+  "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage" \
   "$TOOL" \
-  "a6d71e2b6cd66f8e8d16c37ad164658985e0cf5fcaa950c90a482890cb9d13e0" \
-  "appimagetool build 295"
+  "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0" \
+  "appimagetool 1.9.1"
 chmod 755 "$TOOL"
 RUNTIME="$CACHE/runtime-x86_64"
+# A dated release, not "continuous": upstream republishes that tag whenever
+# it rebuilds, which swaps the bytes behind the URL and fails the hash check
+# below -- it took the release build down on 2026-09-29.
 download_verified \
-  "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64" \
+  "https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64" \
   "$RUNTIME" \
-  "1cc49bcf1e2ccd593c379adb17c9f85a36d619088296504de95b1d06215aebbf" \
-  "AppImage type-2 x86_64 runtime"
-runtime_header="$(readelf -h "$RUNTIME")"
+  "2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d" \
+  "AppImage type-2 x86_64 runtime 20251108"
+# readelf translates its field labels, so read the header in the C locale:
+# on a French or German build host "Class:" is "Classe:" and this check would
+# reject a perfectly good runtime.
+runtime_header="$(LC_ALL=C readelf -h "$RUNTIME")"
 [[ "$runtime_header" == *"Class:"*"ELF64"* \
    && "$runtime_header" == *"Machine:"*"X86-64"* ]] \
   || { echo "!! AppImage runtime is not ELF64 x86-64" >&2; exit 1; }
-runtime_dynamic="$(readelf -d "$RUNTIME")"
+runtime_dynamic="$(LC_ALL=C readelf -d "$RUNTIME")"
 [[ "$runtime_dynamic" != *"(NEEDED)"* ]] \
   || { echo "!! AppImage runtime is not statically linked" >&2; exit 1; }
 APPIMG="$OUT/BedrockOnLinux-${VER}-x86_64.AppImage"
-rm -f "$APPIMG"
-ARCH=x86_64 "$TOOL" --appimage-extract-and-run \
-  --runtime-file "$RUNTIME" "$APPDIR" "$APPIMG"
+ZSYNC="$APPIMG.zsync"
+rm -f "$APPIMG" "$ZSYNC"
+declare -a UPDATE_ARGS=()
+if [[ -n "$UPDATE_INFO" ]]; then
+  UPDATE_ARGS=(-u "$UPDATE_INFO")
+fi
+# appimagetool writes the .zsync sidecar into the *working directory*, named
+# after the destination's basename -- not beside the destination itself. Build
+# from dist/ so the sidecar lands next to the AppImage instead of wherever the
+# maintainer (or build-release.sh) happened to be standing.
+(
+  cd "$OUT"
+  ARCH=x86_64 "$TOOL" --appimage-extract-and-run "${UPDATE_ARGS[@]}" \
+    --runtime-file "$RUNTIME" "$APPDIR" "${APPIMG##*/}"
+)
 chmod 755 "$APPIMG"
+
+if [[ -n "$UPDATE_INFO" ]]; then
+  # appimagetool only *warns* when zsyncmake is missing, so without this the
+  # build would happily ship an AppImage advertising a delta file that was
+  # never written, and every updater would fail on it.
+  [[ -s "$ZSYNC" ]] || {
+    echo "!! update information was embedded but no $ZSYNC was written" >&2
+    echo "   (appimagetool found no zsyncmake — install the zsync package)" >&2
+    exit 1
+  }
+  chmod 644 "$ZSYNC"
+  python3 - "$APPIMG" "$ZSYNC" "$UPDATE_INFO" "$SOURCE_DATE_EPOCH" <<'PY'
+import email.utils
+import fnmatch
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+image, sidecar = Path(sys.argv[1]), Path(sys.argv[2])
+expected, epoch = sys.argv[3], int(sys.argv[4])
+
+# The updaters read the string back out of the runtime's .upd_info section, so
+# check it there rather than trusting the command line we passed.
+headers = subprocess.run(
+    ["readelf", "--section-headers", "--wide", str(image)],
+    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+if headers.returncode:
+    raise SystemExit(f"readelf failed for {image}: {headers.stderr.strip()}")
+section = re.search(
+    r"\.upd_info\s+\S+\s+[0-9a-f]+\s+([0-9a-f]+)\s+([0-9a-f]+)", headers.stdout)
+if not section:
+    raise SystemExit("the AppImage runtime carries no .upd_info section")
+offset, size = (int(value, 16) for value in section.groups())
+with image.open("rb") as stream:
+    stream.seek(offset)
+    embedded = stream.read(size).split(b"\0", 1)[0].decode("utf-8", "replace")
+if embedded != expected:
+    raise SystemExit(f"embedded update information is {embedded!r}, "
+                     f"expected {expected!r}")
+
+fields = expected.split("|")
+if fields[0] == "gh-releases-zsync" and len(fields) == 5:
+    # The release asset has to be the file the embedded pattern looks for,
+    # otherwise every updater reports "no matching asset" on a release that
+    # does carry the update.
+    if not fnmatch.fnmatch(sidecar.name, fields[4]):
+        raise SystemExit(f"{sidecar.name} does not match the pattern the "
+                         f"AppImage advertises ({fields[4]})")
+
+raw = sidecar.read_bytes()
+end = raw.find(b"\n\n")          # text headers, blank line, binary checksums
+if end < 0:
+    raise SystemExit(f"{sidecar.name} has no zsync header block")
+zsync = {}
+for line in raw[:end].decode("utf-8", "replace").splitlines():
+    key, _, value = line.partition(": ")
+    zsync[key] = value
+for key in ("Filename", "URL"):
+    # URL is relative, so it resolves next to the .zsync -- i.e. the AppImage
+    # asset of the same release.
+    if zsync.get(key) != image.name:
+        raise SystemExit(f"{sidecar.name} {key} is {zsync.get(key)!r}, "
+                         f"expected {image.name!r}")
+if zsync.get("Length") != str(image.stat().st_size):
+    raise SystemExit(f"{sidecar.name} describes {zsync.get('Length')} bytes, "
+                     f"but the AppImage is {image.stat().st_size}")
+
+# zsyncmake stamps the input file's mtime, which is the one value here that is
+# not derived from the bytes. Pin it to SOURCE_DATE_EPOCH like every other
+# timestamp in this build, so rebuilding the same source reproduces the sidecar
+# too. RFC-822 dates are fixed width, so the header block keeps its length.
+stamp = email.utils.formatdate(epoch).replace("-0000", "+0000")
+sidecar.write_bytes(
+    re.sub(rb"(?m)^MTime: .*$", ("MTime: " + stamp).encode(), raw[:end],
+           count=1) + raw[end:])
+print(f"  update information: {embedded}")
+print(f"  delta updates: {sidecar.name} "
+      f"({zsync['Blocksize']}-byte blocks, MTime {stamp})")
+PY
+fi
+
 rm -rf "$APPDIR"
 echo "OK -> $APPIMG ($(du -h "$APPIMG" | cut -f1))"
+if [[ -s "$ZSYNC" ]]; then
+  echo "OK -> $ZSYNC ($(du -h "$ZSYNC" | cut -f1))"
+fi

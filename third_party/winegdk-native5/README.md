@@ -70,7 +70,208 @@ not own may still belong to the native GDK threading sidecar, where
 driven and closed through the implementation that owns them instead of being
 silently replaced by a thread-pool queue of our own.
 
+The `0007` patch lets the loader map the main image straight from a file
+descriptor. Minecraft is no longer installed from a repackaged copy of the
+game: it is downloaded from the Microsoft Store with the user's own account,
+and the package keeps the segments it flags `KEEP_ENCRYPTED_ON_DISK` — the game
+executable on GDK titles — encrypted at rest, exactly as on Windows. What sits
+on disk is not a loadable PE, so there is nothing for `open_dll_file` to open.
+The launcher decrypts the executable into anonymous memory at launch and passes
+the descriptor through `WINE_DLL_FILE_MAP`, whose `<fd>:<nt-name>` entries
+`open_main_image` now consults before touching the filesystem; the plaintext
+never reaches a file. Without a match, or without the variable, the loader takes
+its usual path unchanged. This is a port of `xodus-gaming/wine` commit
+`183d5d90b62a`, using `RtlUnicodeToUTF8N` in place of the `locale_private.h`
+helpers this Wine base predates, and carrying only the loader change: the
+upstream commit's standalone C launcher is replaced by the launcher's own
+Python implementation in `bol/launch.py`.
+
+The `0008` patch lets a `WINE_DLL_FILE_MAP` entry name a file instead of a
+descriptor, chosen by a leading `/`. `0007` alone is enough on a bare Wine, but
+not through a container: Minecraft runs inside the Steam Linux Runtime, where a
+descriptor number means nothing, and Wine died on `sendmsg: Bad file
+descriptor` before drawing a frame. The loader now opens such an entry, unlinks
+it immediately, and maps the descriptor it is left holding — so the decrypted
+image has no name from the first instant and is reachable only through that
+process, exactly as an anonymous mapping would be. The launcher stages it on
+`/dev/shm`, which is RAM, so nothing reaches durable storage either. Descriptor
+entries are unchanged, and a map with no matching entry still falls through to
+the ordinary on-disk path.
+
+The `0009` patch lets `XSystem` answer every interface revision the GDK
+libraries Minecraft ships ask it for. The GDK serves one XSystem object behind
+several interface IDs, and each library queries the one its headers were built
+with: `libHttpClient.GDK.dll` asks for `1861cf2e-e18b-4834-a9f5-b4a4e6efb4cf`,
+`PlayFabMultiplayerGDK.dll` for `6fd71f09-7513-49f0-89bc-bfaf5df6f852`, and
+`Microsoft.Xbox.Services.GDK.C.Thunks.dll`, new with Minecraft 1.26.50, for
+`67ce4bfc-b1d1-4ac7-bc3a-cb9219a97a85`. `QueryInterface` accepted only the
+`dadc2895-34b0-4ef5-a83e-45114d629b80` revision `provider.idl` declares, so all
+three were refused with `E_NOINTERFACE`. The first two carry on without it; the
+Xbox Live services thunks do not, and on 1.26.50 a signed-in player got a game
+that was half offline (issue #266). Measured on 1.26.51.1: Social showed no
+friends, the Realms tab spun forever with its buttons disabled, and featured
+servers kept a disabled Play button; with this patch Social counts the friends
+online, Realms offers its invitations and featured servers can be joined. Each of
+the three libraries calls one method through the interface it obtains, vtable
+slot 4 — `XSystemGetXboxLiveSandboxId` with the size, buffer and used-size
+arguments the flattened vtable already implements — so the one vtable answers
+them all. The patch also makes `XSystemHandleTrack`, which registers a
+handle-lifetime debugging callback, report success instead of `E_NOTIMPL`; no
+callback is ever delivered.
+
+The `0010` patch implements `Windows.Storage.Pickers.FileSavePicker`, the
+system save picker every export Minecraft offers goes through: a structure
+block's, a world's, the album's PDF and ZIP, a model's GLB. The game activates
+the class, gives it its window through `IInitializeWithWindow`, fills
+`SuggestedFileName`, `SuggestedStartLocation` and `FileTypeChoices`, and reads
+the chosen path back from the `StorageFile` `PickSaveFileAsync` completes
+with. Nothing registered or implemented the class, so activation failed with
+`REGDB_E_CLASSNOTREG` and every export stayed on its loading screen (issue
+#167). The picker lives in `windows.storage.dll` beside the WinAppSDK open
+picker and follows the single-file open picker's shape: a modal
+`GetSaveFileNameW` owned by the caller's window, filtered by the file-type
+choices in the order they were inserted, which asks before replacing a file
+and appends the default extension to a name typed without one; an operation
+that is already complete when `PickSaveFileAsync` returns; a picked file that
+exists afterwards, empty unless it was already there, and no file for a
+dismissed dialog. The file is the `Windows.Storage.StorageFile` that
+`windows.storage.applicationdata.dll` serves. `windows.storage.pickers.idl`
+declares the `Windows.Storage.Pickers` types; its `PickerLocationId` shares its
+C enumerator names with the WinAppSDK one, so `savepicker.c` is the only file
+that includes it. Wine registers a class only when it updates a prefix, which
+the engine's reproducible `wine.inf` timestamp never triggers, so the launcher
+registers this one in the prefix before every launch.
+
+The `0011` patch binds `wl_seat` no newer than the pointer listener can
+handle. Version 8 of the seat makes the compositor send
+`wl_pointer.axis_value120` for every turn of the mouse wheel, and
+`wayland_pointer.c` adds a handler for that event only when
+`WL_POINTER_AXIS_VALUE120_SINCE_VERSION` exists, which wayland-client defines
+from 1.21. The engine is built against Bullseye's 1.18, so its listener ends
+at `axis_discrete` (72 bytes in the native18 `winewayland.so`) while the seat
+was still bound at version 8: under the Wayland driver, the first wheel event
+found a NULL handler and libwayland aborted the game with "listener function
+for opcode 9 of wl_pointer is NULL" (issue #296). Built against those headers,
+the seat is now bound at version 7, where the wheel arrives as
+`axis_discrete`, which the driver already turns into the same `WHEEL_DELTA`
+steps; with newer headers nothing changes.
+
+The `0012` patch lets a title built against a newer Gaming Services run.
+`GDKC_InitAPI` refused every title asking for more than the 6247 this runtime
+reports, and Minecraft Preview 1.26.70 asks for 7849: it quit with exit code 0
+before its window opened, with nothing on screen to say why (issue #274). On
+Windows the answer is a Gaming Services update; here there is none to install,
+so the difference is now a warning and the title continues, its calls this
+runtime lacks failing one by one like any other unimplemented call. The
+`HKLM\Software\Microsoft\GamingServices` `IgnoreVersionMismatch` switch was
+read with an uninitialised buffer size and value and tested with `FAILED()`,
+which never sees the positive Win32 error `RegGetValueW` returns, so whether
+the title was refused depended on the stack: the same build started with Wine
+tracing on and quit with it off. Both are initialised and the result is
+compared with `ERROR_SUCCESS`; the switch now only silences the warning.
+
+The `0013` patch makes `GetProcessMemoryInfo` report `PrivateUsage`. Given a
+`PROCESS_MEMORY_COUNTERS_EX`, kernelbase filled the short structure, set `cb`
+to the short size and returned `TRUE`, so the caller read whatever its stack
+held in the last field. Minecraft uses that field to estimate how much memory
+it has left, and when the leftover looked like a huge figure it stored a
+default skin for every player added to the world instead of their own, at
+random and for the rest of the session (issue #292, found and fixed by
+ItsClairton). ntdll already answers `ProcessVmCounters` with `VM_COUNTERS_EX`;
+kernelbase now asks for it, fills `PrivateUsage` when the caller's buffer has
+room for it and reports the `_EX` size in `cb`, as Windows does. `psapi.h`
+gains the structure.
+
+The `0014` patch brings back a fast synchronization path for kernels without
+ntsync. Upstream Wine 11 dropped esync and fsync, so its only in-process
+backend is the ntsync driver, which mainline Linux ships from 6.14: on Debian
+13's stock 6.12, Debian 12's 6.1 and the 6.8 of Ubuntu 22.04 HWE and Linux Mint
+21 and 22, every wait, `SetEvent`, mutex and semaphore operation was a
+wineserver round-trip, and the wineserver serialised Minecraft's worker
+threads behind one another. The patch is Valve's futex-based backend for
+Wine's inproc sync framework from the `proton_11.0` branch of
+ValveSoftware/wine (`b62913d8cab`, with the `054473d56e3` alignment fix),
+developed by Elizabeth Figura with later work by Paul Gofman and others. The
+wineserver still opens `/dev/ntsync` first and only falls back to fsync when
+that fails and `WINEFSYNC` is set, which Proton does unless `PROTON_NO_FSYNC`
+is given, so a kernel with ntsync behaves exactly as before; fsync itself needs
+`futex_waitv`, Linux 5.16 or later. Adapted to this tree: the system
+`<linux/ntsync.h>` stays in place of Valve's bundled copy, the per-game
+workarounds Proton's loader enables are environment switches read by
+`fsync_init()` and off by default, `<linux/futex.h>` is included on Linux
+rather than behind a new configure check, and the server protocol files that
+`tools/make_requests` generates are regenerated (protocol version 931). Both
+builders also refuse a wineserver that lacks the fallback.
+
 `SOURCE-SHA256SUMS` pins every source file changed by the cumulative r12 to
-native5 delta and its follow-ups. The Bullseye builder applies the reviewed r12
-and native patches when the target commit is unavailable, always applies `0002`
-through `0005`, then verifies the complete resulting source tree.
+native5 delta and its follow-ups through `0020`. The Bullseye builder applies
+the reviewed r12 and native patches when the target commit is unavailable,
+always applies `0002` through `0020`, then verifies the complete resulting
+source tree; the container builder does the same on the target commit. Each
+patch is also pinned by its own SHA-256 in both builders and in the
+packager. `0014` to `0017` were first applied around the manifest, so that the
+`WINEGDK_SOURCE_MANIFEST_SHA256` the launcher checks against the installed
+engine stayed valid for native22; native23 adds the files they change to the
+manifest and moves that pin with it. Because the prefix release is named
+after the manifest hash, the native23 prefix is published under a new name
+and the native22 one stays as it was.
+
+The `0015` and `0016` patches take two Wine calls Minecraft makes on every
+frame off its main thread, the one that builds each frame and caps the frame
+rate. `GetProcessMemoryInfo` opened `/proc/self/status`, read it through stdio
+and ran up to six `sscanf()` per line before closing it; ntdll now keeps the
+file open for its own process, rereads it with one `pread()` from offset 0 and
+picks the six fields out with `strncmp()` and `strtoull()`, for the same
+values. `get_timezone_info()`, behind `GetTimeZoneInformation`, ran
+`gmtime()`, `mktime()` and `localtime()` on each of the game's four calls per
+frame, and glibc stats the zone file in two of them; it now compares
+`time(NULL)` with the second it last checked, as `SystemTimeOfDayInformation`
+already does, and only then asks libc. Measured on the game's main thread at
+about 600 FPS, the two calls went from 2.8% and 1.9% of its time to almost
+nothing.
+
+The `0017` patch serves the `XGameEvent` runtime class,
+`{bbfbdcc7-bfe7-409b-a5ca-edf054960b4d}`, which `QueryApiImpl` refused with
+`E_NOTIMPL`, so XSAPI dropped every in-game event Minecraft wrote, and with
+them every achievement (issue #152): Xbox Live grades Minecraft's achievements
+from these events and refuses a client-side unlock. Each event is appended as
+one JSON line to the file named by `BOL_GAME_EVENT_LOG`; `bol/gameevents.py`
+sets that variable and uploads the events to the Xbox Live event collector
+with the player's own tickets while the game runs. Without the variable the
+write is accepted and dropped. Measured on 2026-11-12 with Minecraft 1.26.60.5
+in a survival world without cheats, the game writes its events in batches,
+every few minutes and when it is paused; the launcher sent all 56 of the
+session's events, the collector refused none, the account's
+`BlockBrokenTotal` and `DistanceTravelled` stats grew by what they carried,
+and crafting a wooden hoe unlocked "Time to Farm!" and "MOAR Tools". The
+packager refuses an `xgameruntime.dll` built without the class.
+
+The `0018` patch adds the ECMA-402 `Intl` object to jscript, at the level
+Internet Explorer 11 shipped it (`NumberFormat`, `DateTimeFormat`, `Collator`),
+and implements `String.prototype.localeCompare`. Minecraft Education signs in
+through the IE WebBrowser control, which is Wine's mshtml with jscript; the
+Microsoft account page it opens is a React app that reads `Intl` while it
+renders, and with none the sign-in window stayed an empty card (issue #351).
+native25 is the first engine built with it; the packager refuses a jscript.dll
+without `Intl` in either architecture.
+
+`0019` makes jscript call, not read, a property when `IDispatchEx::InvokeEx`
+gets `DISPATCH_METHOD|DISPATCH_PROPERTYGET` with positional arguments. Since
+upstream treats that pair as a getter in ES5+ modes, while jscript's own
+`disp_call()` still sends it for a call with arguments when it cannot see a
+script object yet, the first `document.createElement("div")` of a page came
+back as the `createElement` function: the document's script object is only
+created by that call. Knockout's Internet Explorer detection throws on it,
+and the Office sign-in page Minecraft Education opens first
+(`odc.officeapps.live.com/odc/v2.1/hrd`) then drew its background and no form
+(issue #351). A getter takes no arguments, so the change leaves every
+argument-less case upstream tests as it was. native26 is the first engine
+built with it.
+
+`0020` lets the WebBrowser control answer
+`QueryService(SID_SShellBrowser, ...)` itself, through the shell browser its
+document already gets, and makes `IShellBrowser::GetWindow` return the
+browser's window instead of `E_NOTIMPL`. OneAuth, which signs Minecraft
+Education in, asks for that window right after the e-mail address, to hook
+the browser's thread. Both calls failed, and sign-in ended on "Something went
+wrong [9zj22]" (issue #351). native27 is the first engine built with it.

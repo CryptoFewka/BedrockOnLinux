@@ -11,20 +11,20 @@
         system = "x86_64-linux";
         config.allowUnfree = true;
       };
-      bolPython = pkgs.python313.withPackages (ps: with ps; [
-        tkinter
+      bolPython = pkgs.python3.withPackages (ps: with ps; [
+        pyside6
         cryptography
-        customtkinter
-        darkdetect
-        packaging
         python-xlib
         certifi
       ]);
+      steam-run = pkgs.steam-run.override (prev: {
+        targetPkgs = pkgs: prev.targetPkgs pkgs ++ [ pkgs.libxcomposite ];
+      });
     in
     {
       packages.x86_64-linux.default = pkgs.stdenv.mkDerivation {
         pname = "bedrock-on-linux";
-        version = "2.1.3";
+        version = "3.0.0";
 
         src = ./.;
 
@@ -39,10 +39,14 @@
           cp data/bedrock-on-linux.desktop $out/share/applications/
           cp data/icon.png $out/share/icons/hicolor/256x256/apps/bedrock-on-linux.png
 
-          makeWrapper ${pkgs.steam-run}/bin/steam-run $out/bin/bedrock-on-linux \
+          # Qt shows GTK's file chooser on GTK desktops, and GTK aborts when
+          # its org.gtk.Settings.FileChooser schema is nowhere on
+          # XDG_DATA_DIRS -- which NixOS does not put there for us (#263).
+          makeWrapper ${steam-run}/bin/steam-run $out/bin/bedrock-on-linux \
             --add-flags "${bolPython}/bin/python3" \
             --add-flags "$out/lib/bedrock-on-linux/bedrock-on-linux" \
-            --prefix PYTHONPATH : "$out/lib/bedrock-on-linux"
+            --prefix PYTHONPATH : "$out/lib/bedrock-on-linux" \
+            --suffix XDG_DATA_DIRS : "${pkgs.gtk3}/share/gsettings-schemas/${pkgs.gtk3.name}"
         '';
 
         meta = {

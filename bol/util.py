@@ -25,6 +25,7 @@ from .config import (
     FLATPAK_APP_ID,
     GAMES,
     LOGS,
+    PRETTY,
     PROTON_DIR,
     SETTINGS,
     UMU_DIR,
@@ -126,11 +127,13 @@ LAUNCHER_OWNED_ENV = (
     "PROTON_USE_WINED3D",
     "PROTON_LOG",
     "PROTON_LOG_DIR",
-    # Wine 11 has no esync/fsync, so ntsync is the only fast synchronization
-    # path left. A stale global export of this must not silently serialise
-    # every Minecraft worker thread behind the wineserver; the Advanced
-    # custom-environment field remains the supported way to turn it off.
+    # ntsync is Wine 11's fast synchronization path and fsync (engine patch
+    # 0014) the only fallback when the kernel lacks it. A stale global export
+    # of either must not silently serialise every Minecraft worker thread
+    # behind the wineserver; the Advanced custom-environment field remains
+    # the supported way to turn them off.
     "PROTON_NO_NTSYNC",
+    "PROTON_NO_FSYNC",
 )
 
 # The Settings control which configures a launcher-owned variable properly,
@@ -197,6 +200,23 @@ def apply_custom_env(env, custom_env):
     """Merge KEY=VALUE tokens from a space-separated string into env."""
     for key, value in _custom_env_pairs(custom_env):
         env[key] = value
+
+
+def steam_app_id(environ=None):
+    """The numeric Steam application ID this launch inherited, or None.
+
+    Steam exports one for its own games and one it generates for every
+    non-Steam shortcut a user adds, and everything downstream keys off that
+    32-bit number: gamescope's focus list, the overlay, the screenshot
+    manager. ``SteamGameId`` is deliberately not consulted as a fallback —
+    a non-Steam shortcut carries a 64-bit composite there, which is a
+    different identifier and would be wrong everywhere the app ID is wanted.
+    """
+    source = os.environ if environ is None else environ
+    value = str(source.get("SteamAppId", "")).strip()
+    if not (value.isascii() and value.isdigit()):
+        return None
+    return value if int(value) else None
 
 
 def launcher_command(*arguments, environ=None, argv=None,
@@ -465,6 +485,17 @@ def mc_releases(fetch_all=True, ignore_cache=False):
         for m in matches:
             parts = [int(x) if x else 0 for x in m]
             if parts[0] > 10:
+                # Article titles often carry a "YYYY.MM.DD"-style release
+                # date alongside the real version (e.g. "1.19.0, released
+                # 2023.05.01"). Without a ceiling, a 4+ digit year gets
+                # misread as an old-style "<major>.<minor>" version and
+                # reinterpreted as e.g. (1, 2023, 5, 1) -- which is high
+                # enough to pass the "recent version" filter below and lets
+                # a stale article slip back into the list. Minecraft's own
+                # version components never reach 1000, so anything at or
+                # above that is a date, not a version, and is dropped.
+                if parts[0] > 999:
+                    continue
                 parts = [1, parts[0], parts[1], parts[2]]
             res.append(tuple(parts))
         return res
@@ -518,6 +549,13 @@ def _screen_wh(runner=None):
     return primary_output_size(runner)
 
 
+def _screen_refresh_hz(runner=None):
+    """Fastest refresh rate an active output drives, or None. See
+    bol.x11.primary_output_refresh_hz for why it is the fastest one."""
+    from .x11 import primary_output_refresh_hz
+    return primary_output_refresh_hz(runner)
+
+
 def sha256_file(path):
     """SHA-256 of a file, read in blocks so a multi-gigabyte engine fits."""
     digest = hashlib.sha256()
@@ -548,3 +586,37 @@ def remove_path(path):
 def env_flag(value):
     """Whether an environment or settings string opts in."""
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def sudo_invoker(environ=None, euid=None):
+    """The account that started this as root through sudo or doas, or None.
+
+    Root alone is not the question: a container that runs everything as
+    root has no one else to be. Elevated from an account, the launcher
+    reads root's data instead of that account's -- `sudo ... doctor` found
+    no GPU incident to acknowledge because the marker was in the user's
+    data, not root's (#299) -- or, where sudo keeps HOME, leaves files only
+    root can change in the user's own.
+    """
+    source = os.environ if environ is None else environ
+    if (os.geteuid() if euid is None else euid) != 0:
+        return None
+    for key in ("SUDO_USER", "DOAS_USER"):
+        name = str(source.get(key) or "").strip()
+        if name and name != "root":
+            return name
+    return None
+
+
+def refuse_sudo(environ=None, euid=None):
+    """Stop before anything is read or written as root for someone else."""
+    source = os.environ if environ is None else environ
+    invoker = sudo_invoker(source, euid)
+    if invoker is None or env_flag(source.get("BOL_ALLOW_ROOT")):
+        return
+    die(f"Run {PRETTY} as {invoker}, without sudo. As root it uses root's "
+        "copy of the game, the sign-ins and the safety records instead of "
+        "yours, or leaves files only root can change among yours, and it "
+        "would start the game as root. Nothing in it needs root: the one "
+        "system password prompt, at the first Store sign-in, asks for "
+        "itself. BOL_ALLOW_ROOT=1 overrides this.")

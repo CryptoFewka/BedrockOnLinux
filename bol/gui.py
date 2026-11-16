@@ -1,3174 +1,5726 @@
-"""bol.gui — the desktop GUI (customtkinter: modern, rounded, self-contained)."""
+"""bol.gui — the desktop GUI (PySide6)."""
 # SPDX-License-Identifier: MIT
 
-import base64
+from __future__ import annotations
+
+import html
+import inspect
 import os
+import re
 import shutil
+import signal
 import socket
 import stat
 import subprocess
-import re
 import sys
 import threading
-import urllib.parse
-import zipfile
+import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Optional
 
-from .auth import (
-    NativeAuth,
-    msa_logout,
-    msa_signed_in,
-    msa_gamertag,
+from PySide6.QtCore import (
+    QObject, QPoint, QPointF, QRect, QSize, QSocketNotifier, Qt, QThread, QTimer, Signal,
+    Slot,
 )
+from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPainter, QPainterPath, QPixmap
+from PySide6.QtWidgets import (
+    QAbstractButton, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame,
+    QGridLayout, QHBoxLayout, QInputDialog, QLabel,
+    QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
+    QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QStackedWidget, QStyledItemDelegate, QTabWidget, QTextBrowser, QTextEdit,
+    QVBoxLayout, QWidget,
+)
+
+from .auth import NativeAuth, msa_logout, msa_signed_in, msa_gamertag
 from .config import (
-    LOGS,
-    PRETTY,
-    VERSION,
-    get_install_location,
-    clear_install_location,
-    default_install_location,
-    is_relocation_allowed,
+    GAMES, LOGS, PRETTY, VERSION, get_install_location, clear_install_location,
+    default_install_location, is_relocation_allowed,
 )
-from .relocation import (
-    migrate_data,
-    paths_overlap,
-    RelocationError,
-    DIRS_TO_MOVE,
-    FILES_TO_MOVE,
-)
-from .content import _mojang_dir, import_content
+from .relocation import migrate_data, paths_overlap, DIRS_TO_MOVE, FILES_TO_MOVE
+from .content import game_content_dir, import_content
 from .doctor import acknowledge_gpu_crash, gpu_crash_acknowledgement_status
-from .games import list_mc_versions
-from .gamesetup import do_setup
+from .games import (installed_builds, installed_versions, list_editions,
+                    list_versions, remove_build)
+from .gamesetup import setup_or_join
+from . import betterrtx, gpus
 from .inject import run_injector
+from . import icons
+from .gui_profiles import ProfilesPage
 from .launch import direct_launch_readiness, launch, single_window_session
-from . import log
+from . import saves
+from .navigation import ControllerNav
+from . import log, supervision
 from .log import BolError, _LEVELS, desktop_notify, warn
-from .prefix import (
-    _mc_running,
-    kill_wine,
-    prefix_operation_lock,
-    reset_prefix,
-)
+from .prefix import _mc_running, kill_wine, prefix_operation_lock, reset_prefix
 from .profiles import (
-    create_profile,
-    play_launch_command,
-    profile_launch_command,
-    require_profile_shortcuts_supported,
-    require_shortcuts_supported,
-    write_play_shortcut,
-    write_profile_shortcut,
+    create_profile, current_profile_info, current_profile_name, delete_profile,
+    list_profiles, play_launch_command, profile_launch_command,
+    profile_shortcuts_supported, relaunch_with_profile, open_profile_window,
+    rename_profile, require_profile_shortcuts_supported,
+    require_shortcuts_supported, write_play_shortcut, write_profile_shortcut,
 )
-from .update import check_for_update, self_update
-from .util import load_settings, save_settings
-from .x11 import monitor_geometries
+from . import feed, netpolicy, rollback
+from .update import check_for_update, describe_install, self_update
+from .util import load_settings, save_settings, format_display_version, mc_releases, gh_releases
 
-RE_MD_TOKENS = re.compile(r"(\*\*|`|__|\[[^\]]+\]\([^)]+\))")
-RE_MD_LINK = re.compile(r"^\[([^\]]+)\]\(([^)]+)\)$")
-_DIALOG_SCREEN_MARGIN = (40, 80)
-_DIALOG_MAX_PHYSICAL_SIZE = (760, 640)
+try:
+    import shiboken6
+except ImportError:  # pragma: no cover - shiboken6 ships alongside PySide6
+    shiboken6 = None
+
+# QProgressBar counts in C++ ints, so a download measured in bytes gets a
+# scale of its own and the byte counts stay in Python, where they fit. Fine
+# enough for a bar: one step is a tenth of a percent.
+BAR_STEPS = 1000
 
 
-def _desktop_error(message):
+# The only link schemes a changelog may open. The text comes off the network
+# (feedback.minecraft.net articles, GitHub release notes), and a QTextBrowser
+# left to open its own links hands any scheme to the desktop -- file:, smb:,
+# ssh:, steam: and whatever else has a handler (#379).
+_LINK_SCHEMES = ("http", "https")
+
+
+def _web_link(url) -> bool:
+    """True if ``url`` (a str or QUrl) is an http(s) link with a host."""
+    text = url.toString() if hasattr(url, "toString") else str(url or "")
+    m = re.match(r"\s*([A-Za-z][A-Za-z0-9+.-]*)://([^/?#\s]+)", text)
+    return bool(m) and m.group(1).lower() in _LINK_SCHEMES
+
+
+def _href(url) -> str:
+    """``url`` quoted for an href attribute, or "" if it is not a web link."""
+    return html.escape(str(url), quote=True) if url and _web_link(url) else ""
+
+
+def _open_web_link(url) -> bool:
+    """Open an http(s) ``url`` in the browser; refuse every other scheme."""
+    if not _web_link(url):
+        warn(f"Not opening a non-web link from the changelog: "
+             f"{url.toString() if hasattr(url, 'toString') else url}")
+        return False
+    return bool(QDesktopServices.openUrl(url))
+
+
+def _guard_links(view):
+    """Route a QTextBrowser's link clicks through _open_web_link().
+
+    setOpenLinks(False) is the half that is easy to miss: without it the
+    browser follows the link itself with setSource(), which would show a
+    file: URL's contents in the changelog.
+    """
+    view.setOpenExternalLinks(False)
+    view.setOpenLinks(False)
+    view.anchorClicked.connect(_open_web_link)
+    return view
+
+
+def _alive(widget) -> bool:
+    """True if `widget`'s underlying C++ object hasn't been destroyed.
+
+    Worker threads and QTimer.singleShot callbacks are asynchronous: they
+    can still be pending when the window that owns them goes away (the
+    window closed, or torn down between tests, while a background job is
+    in flight). Without this guard the callback runs anyway and touches a
+    widget whose C++ side is already gone, raising "libshiboken: Internal
+    C++ object already deleted" from inside the Qt event loop.
+    """
+    if widget is None:
+        return False
+    if shiboken6 is None:
+        return True
+    return shiboken6.isValid(widget)
+
+
+def _desktop_error(message: str) -> None:
     warn(message)
     desktop_notify(message)
 
 
-def _open_web_url(url):
-    """Hand a link that came from downloaded content to the browser.
-
-    Changelog bodies and the Microsoft device-code response are fetched over
-    the network, so their links are externally controlled. xdg-open dispatches
-    whatever scheme a desktop handler claims, so only the two schemes that mean
-    "a web page" are passed on.
-    """
-    try:
-        scheme = urllib.parse.urlsplit(str(url)).scheme.lower()
-    except ValueError:
-        scheme = ""
-    if scheme not in ("http", "https"):
-        warn(f"Refusing to open a link that is not http(s): {url!r}")
-        return False
-    subprocess.Popen(["xdg-open", str(url)],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return True
+# ======================================================================
+# Stale-display (XWayland) recovery
+#
+# Under Wayland, $DISPLAY commonly points at an XWayland X11 socket that can
+# go stale (e.g. XWayland restarts between login and launch). The old Tk GUI
+# recovered by constructing CTk() and catching the resulting TclError, then
+# retrying against another of the user's own X11 sockets.
+#
+# Qt's xcb platform plugin cannot be recovered the same way: on a failed
+# server connection it logs "could not connect to display" and aborts the
+# process natively, before control ever returns to Python -- there is no
+# catchable exception to retry on. So this probes and repoints $DISPLAY
+# *before* QApplication is ever constructed, by connecting directly to the
+# candidate X11 sockets, rather than construct-and-catch.
+# ======================================================================
 
 
-_X11_SOCKET_NAME = re.compile(r"^X([0-9]+)$")
-_X11_DISPLAY_NUMBER = re.compile(r"^(?:[^:]*)?:([0-9]+)(?:\.[0-9]+)?$")
-
-
-def _display_connection_error(error):
-    """Return whether Tcl failed specifically while opening an X display."""
-    message = str(error).casefold()
-    return (
-        "couldn't connect to display" in message
-        or "no display name and no $display environment variable" in message
-    )
-
-
-def _owned_x11_socket_displays(
-        socket_dir=Path("/tmp/.X11-unix"), uid=None):
-    """List local X displays whose filesystem socket belongs to this user."""
-    socket_dir = Path(socket_dir)
+def _owned_x11_socket_displays(socket_dir=None, uid=None):
+    """Numeric-sorted (":N", ...) tuple of X11 sockets under socket_dir that
+    are actually AF_UNIX sockets owned by uid (defaults to the current user
+    and /tmp/.X11-unix)."""
+    if socket_dir is None:
+        socket_dir = Path("/tmp/.X11-unix")
+    else:
+        socket_dir = Path(socket_dir)
     if uid is None:
         uid = os.getuid()
     try:
         entries = list(socket_dir.iterdir())
     except OSError:
         return ()
-
     displays = []
     for entry in entries:
-        match = _X11_SOCKET_NAME.fullmatch(entry.name)
-        if not match:
+        name = entry.name
+        if not name.startswith("X") or not name[1:].isdigit():
             continue
         try:
-            metadata = entry.lstat()
+            st = entry.stat()
         except OSError:
             continue
-        if metadata.st_uid != uid or not stat.S_ISSOCK(metadata.st_mode):
+        if not stat.S_ISSOCK(st.st_mode) or st.st_uid != uid:
             continue
-        displays.append((int(match.group(1)), f":{match.group(1)}"))
-    return tuple(display for _, display in sorted(displays))
+        displays.append(int(name[1:]))
+    return tuple(f":{n}" for n in sorted(displays))
 
 
-def _display_number(display):
-    if not isinstance(display, str):
-        return None
-    match = _X11_DISPLAY_NUMBER.fullmatch(display.strip())
-    return int(match.group(1)) if match else None
-
-
-def _x11_socket_is_listening(socket_dir, display, timeout=0.1):
-    """Return whether the display's filesystem socket accepts a connection."""
-    number = _display_number(display)
-    if number is None:
+def _x11_socket_is_live(socket_dir, display, timeout=0.5):
+    """True if `display` (e.g. ':2') has a socket under socket_dir that
+    actually accepts a connection -- a bound-but-unlistened or orphaned
+    socket file is not enough."""
+    if not display or not display.startswith(":"):
         return False
-    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    num = display[1:].split(".", 1)[0]
+    if not num.isdigit():
+        return False
+    path = Path(socket_dir) / f"X{num}"
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        client.settimeout(timeout)
-        client.connect(str(Path(socket_dir) / f"X{number}"))
+        probe.settimeout(timeout)
+        probe.connect(str(path))
         return True
     except OSError:
         return False
     finally:
-        client.close()
+        probe.close()
 
 
-def _create_gui_root(
-        ctk, tk, *, environ=None, socket_dir=Path("/tmp/.X11-unix"),
-        attempted=None):
-    """Create the Tk root, recovering from a stale Wayland-session DISPLAY.
-
-    Hyprland can select a new XWayland display number while a desktop launcher
-    or terminal retains an older DISPLAY value.  Retry only after Tcl reports a
-    display connection failure, and only against filesystem sockets owned by
-    this uid.  XAUTHORITY is deliberately left untouched.
-    """
-    environ = os.environ if environ is None else environ
-    attempted = [] if attempted is None else attempted
-    original_present = "DISPLAY" in environ
-    original_display = environ.get("DISPLAY")
-    attempted.append(original_display or "<unset>")
-
-    def restore_display():
-        if original_present:
-            environ["DISPLAY"] = original_display
-        else:
-            environ.pop("DISPLAY", None)
-
-    try:
-        return ctk.CTk(className=PRETTY)
-    except tk.TclError as first_error:
-        if (not environ.get("WAYLAND_DISPLAY")
-                or not _display_connection_error(first_error)):
-            raise
-
-        candidates = _owned_x11_socket_displays(socket_dir)
-        original_number = _display_number(original_display)
-        # Preserve Xauthority failures on a live display; only bypass orphaned
-        # sockets.
-        if (original_number is not None
-                and f":{original_number}" in candidates
-                and _x11_socket_is_listening(
-                    socket_dir, f":{original_number}")):
-            raise
-
-        for candidate in candidates:
-            if _display_number(candidate) == original_number:
-                continue
-            environ["DISPLAY"] = candidate
+def _resolve_gui_display(environ=None, socket_dir=None, uid=None,
+                          attempted=None):
+    """Repoint environ['DISPLAY'] at a live, user-owned X11 socket before Qt
+    ever tries to connect. Only probes when WAYLAND_DISPLAY is set (a pure
+    X11 session has nothing more useful to recover to), and only moves off
+    the current DISPLAY if it is not actually live. Returns the display
+    string that should be used (also written back into environ when it
+    changes); never raises."""
+    if environ is None:
+        environ = os.environ
+    if socket_dir is None:
+        socket_dir = Path("/tmp/.X11-unix")
+    if uid is None:
+        uid = os.getuid()
+    current = environ.get("DISPLAY")
+    if not environ.get("WAYLAND_DISPLAY"):
+        return current
+    if attempted is not None:
+        attempted.append(current or "<unset>")
+    if current and _x11_socket_is_live(socket_dir, current):
+        return current
+    for candidate in _owned_x11_socket_displays(socket_dir, uid=uid):
+        if candidate == current:
+            continue
+        if attempted is not None:
             attempted.append(candidate)
-            try:
-                return ctk.CTk(className=PRETTY)
-            except tk.TclError as retry_error:
-                if not _display_connection_error(retry_error):
-                    restore_display()
-                    raise
-            except Exception:
-                restore_display()
-                raise
-
-        restore_display()
-        raise first_error
+        if _x11_socket_is_live(socket_dir, candidate):
+            environ["DISPLAY"] = candidate
+            return candidate
+    return current
 
 
-class Theme:
-    BG          = ("#f2f4f7", "#0f1115")
-    FG          = ("#0f1115", "#f2f4f7")
-    SUB         = ("#5d6577", "#8b93a7")
-    MUTED       = ("#8b93a7", "#5d6577")
+def icon_candidates(module_file=None):
+    """Where data/icon.png can be, in the order to try.
 
-    CARD        = ("#ffffff", "#181b22")
-    CARD_2      = ("#e8ebf0", "#20242e")
-    CARD_3      = ("#d8dce4", "#2a2f3b")
-    
-    BORDER      = ("#d0d4dc", "#2a2e38")
-
-    RED         = ("#d35446", "#e2685a")
-    RED_HOV     = ("#bc4a3d", "#ea7c70")
-
-    GREEN       = ("#43a047", "#43a047")
-    GREEN_HOV   = ("#3b8e3f", "#4fc153")
-    GREEN_DIM   = ("#e6f4e6", "#1c2c1c")
-
-    BLUE        = ("#3b7bc4", "#5b9bd9")
-    BLUE_DIM    = ("#e6f0fa", "#16202c")
-    BLUE_LIGHT  = ("#1f3342", "#c2d6e8")
-    BLUE_MUTED  = ("#69829e", "#9ab3c9")
-    BLUE_DARK   = ("#c2d6e8", "#1f3342")
-
-    GOLD        = ("#d8a230", "#e3b34a")
-    GOLD_HOV    = ("#c2912a", "#f3c35a")
-    GOLD_DIM    = ("#fcf3e1", "#33291a")
-
-    BROWN       = ("#8c6446", "#a67958")
-
-    CONSOLE_BG  = ("#f8f9fa", "#0b0d11")
-    CONSOLE_FG  = ("#3b8e3f", "#7fd97f")
-
-    @staticmethod
-    def r(color):
-        import customtkinter as ctk
-        if isinstance(color, tuple):
-            return color[0] if ctk.get_appearance_mode() == "Light" else color[1]
-        return color
-
-
-def _messagebox_height(message):
-    lines = str(message).splitlines() or [""]
-    wrapped_lines = sum(max(1, (len(line) + 47) // 48) for line in lines)
-    return max(210, min(520, 170 + wrapped_lines * 19))
-
-
-def _fit_dialog_size(requested, viewport, window_scaling):
-    requested_width, requested_height = requested
-    viewport_width, viewport_height = viewport
-    scale = max(0.4, float(window_scaling))
-    margin_width, margin_height = _DIALOG_SCREEN_MARGIN
-    max_width, max_height = _DIALOG_MAX_PHYSICAL_SIZE
-    usable_width = min(max_width, max(1, viewport_width - margin_width))
-    usable_height = min(max_height, max(1, viewport_height - margin_height))
-    return (
-        min(requested_width, max(1, int(usable_width / scale))),
-        min(requested_height, max(1, int(usable_height / scale))),
-    )
-
-
-def _select_monitor_bounds(owner, monitors, fallback):
-    owner_x, owner_y, owner_width, owner_height = owner
-    valid_monitors = tuple(
-        monitor for monitor in monitors
-        if monitor[2] > 0 and monitor[3] > 0
-    )
-    if not valid_monitors:
-        return fallback
-    center_x = owner_x + owner_width // 2
-    center_y = owner_y + owner_height // 2
-
-    def score(monitor):
-        x, y, width, height = monitor
-        contains_center = (
-            x <= center_x < x + width
-            and y <= center_y < y + height
-        )
-        overlap_width = max(
-            0, min(owner_x + owner_width, x + width) - max(owner_x, x))
-        overlap_height = max(
-            0, min(owner_y + owner_height, y + height) - max(owner_y, y))
-        distance = (
-            abs(center_x * 2 - (x * 2 + width))
-            + abs(center_y * 2 - (y * 2 + height))
-        )
-        return contains_center, overlap_width * overlap_height, -distance
-
-    return max(valid_monitors, key=score)
-
-
-def _centered_window_position(owner, window, bounds):
-    owner_x, owner_y, owner_width, owner_height = owner
-    window_width, window_height = window
-    bound_x, bound_y, bound_width, bound_height = bounds
-    x = owner_x + (owner_width - window_width) // 2
-    y = owner_y + (owner_height - window_height) // 2
-    max_x = bound_x + max(0, bound_width - window_width)
-    max_y = bound_y + max(0, bound_height - window_height)
-    return (
-        max(bound_x, min(x, max_x)),
-        max(bound_y, min(y, max_y)),
-    )
-
-
-def _geometry_position(geometry):
-    match = re.search(r"([+-]{1,2}\d+)([+-]{1,2}\d+)$", geometry)
-    if match is None:
-        return None
-
-    def coordinate(value):
-        return int(value.replace("+-", "-").replace("++", "+"))
-
-    return coordinate(match.group(1)), coordinate(match.group(2))
-
-
-def _bind_x11_mousewheel_recursive(widget, target_canvas):
-    """Forward X11 wheel events from descendants to a scrollable canvas."""
-    def _on_wheel(event):
-        delta = -1 if event.num == 4 else 1
-        target_canvas.yview_scroll(delta, "units")
-        return "break"
-
-    def _bind(w):
-        w.bind("<Button-4>", _on_wheel, add="+")
-        w.bind("<Button-5>", _on_wheel, add="+")
-        for child in w.winfo_children():
-            _bind(child)
-
-    _bind(widget)
-
-
-def _enable_scrollable_frame_wheel(scrollable_frame, container=None):
-    """Give one CustomTkinter scrollable area a working X11 wheel.
-
-    CustomTkinter removes its own wheel bindings as soon as the pointer enters
-    a child widget, so any list built from controls — the Settings tabs, the
-    version picker — only scrolled by dragging its scrollbar. Forward the
-    events from every descendant of ``container`` to the frame's canvas.
+    Every packaging layout puts it somewhere different, and one of them has
+    no copy next to bol/ at all: the Flatpak installs only the themed icon
+    under /app, so dropping that path leaves the window, the title bar and
+    the hero screen with no icon at all on the Flathub build.
     """
-    canvas = getattr(scrollable_frame, "_parent_canvas", None)
-    if canvas is None:
-        return False
-    _bind_x11_mousewheel_recursive(
-        scrollable_frame if container is None else container, canvas)
-    return True
+    here = Path(module_file or __file__).resolve().parent
+    # A wheel puts bol/ in <prefix>/lib/pythonX.Y/site-packages and the icon
+    # in that prefix's share/: a venv, ~/.local, a /gnu/store item (#306).
+    wheel = ()
+    if len(here.parents) > 3 and here.parent.name in ("site-packages",
+                                                       "dist-packages"):
+        wheel = (here.parents[3] /
+                 "share/icons/hicolor/256x256/apps/bedrock-on-linux.png",)
+    return (
+        # source checkout, AppImage (usr/bin/data), .deb and .rpm
+        # (/usr/lib/bedrock-on-linux/data)
+        here.parent / "data/icon.png",
+        here / "data/icon.png",
+        *wheel,
+        # Flatpak: the manifest installs the icon under the app-id name only
+        Path("/app/share/icons/hicolor/256x256/apps/"
+             "io.github.wyze3306.BedrockOnLinux.png"),
+        # system icon theme, for a distribution package that ships only that
+        Path("/usr/share/icons/hicolor/256x256/apps/bedrock-on-linux.png"),
+    )
 
 
-class _ThemedMessageBox:
-    def __init__(
-            self, ctk, tk, root, theme, font, mkbtn, dialog,
-            window_scaling=1.0, monitor_provider=None):
-        self.ctk = ctk
-        self.tk = tk
-        self.root = root
-        self.theme = theme
-        self.font = font
-        self.mkbtn = mkbtn
-        self.dialog = dialog
-        self.window_scaling = window_scaling
-        self.monitor_provider = monitor_provider or (lambda: ())
+# ======================================================================
+# Theme
+# ======================================================================
 
-    def _show(self, title, message, kind, buttons, parent=None):
-        title = "" if title is None else str(title)
-        message = "" if message is None else str(message)
-        owner = self.root if parent is None else parent.winfo_toplevel()
-        try:
-            previous_focus = self.root.focus_get()
-        except self.tk.TclError:
-            previous_focus = None
-        theme = self.theme
-        accent, accent_hover, glyph = {
-            "info": (theme.THEME_ACCENT, theme.THEME_HOV, "ℹ"),
-            "question": (theme.THEME_ACCENT, theme.THEME_HOV, "?"),
-            "warning": (theme.GOLD, theme.GOLD_HOV, "⚠"),
-            "error": (theme.RED, theme.RED_HOV, "✕"),
-        }.get(kind, (theme.THEME_ACCENT, theme.THEME_HOV, "ℹ"))
+def _chevron(color, up=False):
+    """A chevron for drop-downs, as a file Qt style sheets can point at.
 
-        owner.update_idletasks()
-        fallback_bounds = (
-            owner.winfo_vrootx(), owner.winfo_vrooty(),
-            owner.winfo_vrootwidth(), owner.winfo_vrootheight(),
-        )
-        monitor_bounds = _select_monitor_bounds(
-            (
-                owner.winfo_rootx(), owner.winfo_rooty(),
-                owner.winfo_width(), owner.winfo_height(),
-            ),
-            self.monitor_provider(),
-            fallback_bounds,
-        )
-        width, height = _fit_dialog_size(
-            (480, _messagebox_height(message)),
-            monitor_bounds[2:],
-            self.window_scaling,
-        )
-        window = self.dialog(
-            title, width, height, parent=owner, bounds=monitor_bounds)
-        try:
-            previous_grab = window.grab_current()
-        except self.tk.TclError:
-            previous_grab = None
-        result = {"value": buttons[0]}
-        closed = False
-
-        def choose(value):
-            nonlocal closed
-            if closed:
-                return "break"
-            closed = True
-            result["value"] = value
-            try:
-                if window.grab_current() == window:
-                    window.grab_release()
-            except self.tk.TclError:
-                pass
-            try:
-                window.destroy()
-            except self.tk.TclError:
-                pass
-            if previous_grab is not None:
-                try:
-                    if previous_grab.winfo_exists():
-                        previous_grab.grab_set()
-                except self.tk.TclError:
-                    pass
-            return "break"
-
-        cancel = buttons[0]
-        default = buttons[-1]
-        window.protocol("WM_DELETE_WINDOW", lambda: choose(cancel))
-        window.bind("<Escape>", lambda _event: choose(cancel))
-        window.bind("<Return>", lambda _event: choose(default))
-        window.bind("<KP_Enter>", lambda _event: choose(default))
-
-        header = self.ctk.CTkFrame(window, fg_color="transparent")
-        header.pack(fill="x", padx=22, pady=(20, 6))
-        self.ctk.CTkLabel(
-            header, text=glyph, font=self.font(22, "bold"),
-            text_color=accent, width=28,
-        ).pack(side="left", padx=(0, 8))
-        self.ctk.CTkLabel(
-            header, text=title, font=self.font(16, "bold"),
-            text_color=theme.FG, anchor="w", justify="left",
-        ).pack(side="left", fill="x", expand=True)
-
-        row = self.ctk.CTkFrame(window, fg_color="transparent")
-        row.pack(side="bottom", fill="x", padx=22, pady=(6, 20))
-        default_button = None
-        for index in range(len(buttons) - 1, -1, -1):
-            value = buttons[index]
-            is_default = value == default
-            button = self.mkbtn(
-                row, value, lambda value=value: choose(value),
-                kind="primary" if is_default else "ghost",
-                width=100, height=38, font=self.font(13, "bold"),
-                **({
-                    "fg_color": accent,
-                    "hover_color": accent_hover,
-                } if is_default else {}),
-            )
-            button.pack(side="right", padx=(8, 0) if index else 0)
-            if is_default:
-                default_button = button
-
-        body = self.ctk.CTkTextbox(
-            window, fg_color="transparent", border_width=0,
-            text_color=theme.SUB, font=self.font(14), wrap="word",
-            activate_scrollbars=True,
-        )
-        body.pack(fill="both", expand=True, padx=22, pady=(0, 6))
-        body.insert("1.0", message)
-        body.configure(state="disabled")
-
-        window.update_idletasks()
-        try:
-            window.wait_visibility()
-            window.grab_set()
-            default_button.focus_set()
-        except self.tk.TclError:
-            choose(cancel)
-        if not closed:
-            window.wait_window()
-        focus_target = previous_focus or owner
-        try:
-            if focus_target.winfo_exists():
-                focus_target.focus_set()
-        except self.tk.TclError:
-            pass
-        return result["value"]
-
-    def showinfo(
-            self, title=None, message=None, parent=None, icon=None, **_kwargs):
-        return self._show(
-            title, message, icon or "info", ("OK",), parent).casefold()
-
-    def showerror(
-            self, title=None, message=None, parent=None, icon=None, **_kwargs):
-        return self._show(
-            title, message, icon or "error", ("OK",), parent).casefold()
-
-    def showwarning(
-            self, title=None, message=None, parent=None, icon=None, **_kwargs):
-        return self._show(
-            title, message, icon or "warning", ("OK",), parent).casefold()
-
-    def askyesno(
-            self, title=None, message=None, parent=None, icon=None, **_kwargs):
-        return self._show(
-            title, message, icon or "question", ("No", "Yes"), parent
-        ) == "Yes"
-
-
-def _create_play_icon(size=16, fg_color="white", bg_color="black"):
-    import tkinter as tk
-    fg = Theme.r(fg_color)
-    bg = Theme.r(bg_color)
-    if not isinstance(fg, str): fg = fg[0] if isinstance(fg, tuple) else "#ffffff"
-    if not isinstance(bg, str): bg = bg[0] if isinstance(bg, tuple) else "#000000"
-    if fg == "white": fg = "#ffffff"
-    if fg == "black": fg = "#000000"
-    if bg == "white": bg = "#ffffff"
-    if bg == "black": bg = "#000000"
-    
-    data = []
-    for y in range(size):
-        row = []
-        for x in range(size):
-            if 5 <= x <= 15:
-                dy = abs(y - size/2.0)
-                max_dy = (15 - x) * 0.5
-                if dy <= max_dy + 0.5:
-                    row.append(fg)
-                else:
-                    row.append(bg)
-            else:
-                row.append(bg)
-        data.append(row)
-    img = tk.PhotoImage(width=size, height=size)
-    img.put(data)
-    return img
-
-def _create_kill_icon(size=16, fg_color="white", bg_color="black"):
-    import tkinter as tk
-    fg = Theme.r(fg_color)
-    bg = Theme.r(bg_color)
-    if not isinstance(fg, str): fg = fg[0] if isinstance(fg, tuple) else "#ffffff"
-    if not isinstance(bg, str): bg = bg[0] if isinstance(bg, tuple) else "#000000"
-    if fg == "white": fg = "#ffffff"
-    if fg == "black": fg = "#000000"
-    if bg == "white": bg = "#ffffff"
-    if bg == "black": bg = "#000000"
-    
-    data = []
-    pad = 3
-    thickness = 2
-    for y in range(size):
-        row = []
-        for x in range(size):
-            if pad <= x <= size - pad and pad <= y <= size - pad:
-                d1 = abs(x - y)
-                d2 = abs(x - (size - 1 - y))
-                if d1 <= thickness or d2 <= thickness:
-                    row.append(fg)
-                else:
-                    row.append(bg)
-            else:
-                row.append(bg)
-        data.append(row)
-    img = tk.PhotoImage(width=size, height=size)
-    img.put(data)
-    return img
-
-def gui():
-    if (os.environ.get("WAYLAND_DISPLAY")
-            and not os.environ.get("DISPLAY")
-            and not _owned_x11_socket_displays()):
-        _desktop_error(
-            "No XWayland display was published to this session. Install or "
-            "enable XWayland and make sure the app launcher inherited the "
-            "current DISPLAY/XAUTHORITY environment; command-line tools "
-            "remain available.")
-        return
-    from .deps import ensure_gui_deps
-    ensure_gui_deps()
+    Styling a combo box's drop-down takes its native arrow away, and a style
+    sheet only reads images from files. Written once per colour into the
+    cache; on any failure the arrow is simply missing, never the window.
+    """
+    from .config import CACHE  # noqa: PLC0415 - GUI-only helper
+    name = f"chevron-{'up' if up else 'down'}-{color.lstrip('#')}.svg"
+    path = CACHE / "ui" / name
+    points = "2,8 6,4 10,8" if up else "2,4 6,8 10,4"
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" '
+           'viewBox="0 0 12 12"><polyline points="' + points + '" fill="none" '
+           f'stroke="{color}" stroke-width="1.8" stroke-linecap="round" '
+           'stroke-linejoin="round"/></svg>')
     try:
-        import tkinter as tk
-        import customtkinter as ctk
-    except Exception as e:
-        _desktop_error(
-            f"GUI toolkit unavailable ({e}). Install python3-tk and "
-            "customtkinter, or use the command line.")
+        if not path.is_file() or path.read_text() != svg:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(svg)
+    except OSError:
+        return ""
+    return path.as_posix()
+
+
+@dataclass
+class Theme:
+    """Palette used to generate the app's QSS."""
+    dark: bool = True
+    beta: bool = False
+
+    def _pick(self, light, dark):
+        return dark if self.dark else light
+
+    @property
+    def bg(self):        return self._pick("#eef1f6", "#0d0f14")
+    @property
+    def fg(self):         return self._pick("#12141a", "#eef1f6")
+    @property
+    def sub(self):        return self._pick("#5a6273", "#9198ab")
+    @property
+    def muted(self):      return self._pick("#8890a1", "#5a6273")
+    @property
+    def card(self):       return self._pick("#ffffff", "#161922")
+    @property
+    def card2(self):      return self._pick("#e6e9f0", "#1d212c")
+    @property
+    def card3(self):      return self._pick("#d6dae4", "#272c39")
+    @property
+    def border(self):     return self._pick("#cdd2de", "#2a2f3d")
+    @property
+    def red(self):        return "#e0574a"
+    @property
+    def red_hov(self):    return "#c94b3f"
+    @property
+    def green(self):      return self._pick("#43a047", "#43a047")
+    @property
+    def green_hov(self):  return self._pick("#3b8e3f", "#4fc153")
+    @property
+    def green_dim(self):  return self._pick("#e6f4e6", "#1c2c1c")
+    @property
+    def gold(self):       return self._pick("#d8a230", "#e3b34a")
+    @property
+    def gold_hov(self):   return self._pick("#c2912a", "#f3c35a")
+    @property
+    def gold_dim(self):   return self._pick("#fcf3e1", "#33291a")
+    @property
+    def blue(self):       return "#4a90d9"
+    @property
+    def accent(self):     return self.gold if self.beta else self.green
+    @property
+    def accent_hov(self): return self.gold_hov if self.beta else self.green_hov
+    @property
+    def accent_dim(self): return self.gold_dim if self.beta else self.green_dim
+    @property
+    def console_bg(self): return self._pick("#f7f9fb", "#0a0c10")
+    @property
+    def console_fg(self): return self._pick("#2f9a5c", "#7fe0a0")
+
+    def qss(self) -> str:
+        return f"""
+        QWidget {{
+            background: transparent;
+            color: {self.fg};
+            font-family: -apple-system, "Segoe UI", "Inter", sans-serif;
+            font-size: 13px;
+        }}
+        QMainWindow, #Root {{ background: {self.bg}; }}
+        QDialog {{
+            background: {self.bg};
+            border: 1px solid {self.border};
+            border-radius: 14px;
+        }}
+        QDialog QFrame#Card {{
+            background: {self.card};
+            border: 1px solid {self.border};
+            border-radius: 16px;
+        }}
+        QFrame#Card {{
+            background: {self.card};
+            border: 1px solid {self.border};
+            border-radius: 18px;
+        }}
+        QFrame#CardFlat {{
+            background: {self.card};
+            border: 1px solid {self.border};
+            border-radius: 14px;
+        }}
+        QFrame#Pill {{
+            background: {self.card2};
+            border-radius: 14px;
+        }}
+        QFrame#PillOnCard {{
+            background: {self.card2};
+            border-radius: 12px;
+        }}
+        QLabel#Title {{ font-size: 16px; font-weight: 700; }}
+        QLabel#Sub {{ color: {self.sub}; }}
+        QLabel#Muted {{ color: {self.muted}; font-size: 11px; }}
+        QLabel#Hero {{ font-size: 26px; font-weight: 700; }}
+        QFrame#ProfileCard {{
+            background: {self.card};
+            border: 1px solid {self.border};
+            border-radius: 14px;
+        }}
+        QFrame#ProfileCard[active="true"] {{ border: 1px solid {self.accent}; }}
+        QFrame#InstanceRow {{
+            background: {self.card};
+            border: 1px solid {self.border};
+            border-left: 3px solid {self.green};
+            border-radius: 12px;
+        }}
+        QFrame#EmptyHint {{
+            background: transparent;
+            border: 1px dashed {self.card3};
+            border-radius: 14px;
+        }}
+        QLabel#HintTitle {{ font-weight: 700; }}
+        QLabel#ProfileName {{ font-size: 15px; font-weight: 700; }}
+        QLabel#SectionTitle {{
+            color: {self.sub}; font-size: 11px; font-weight: 700;
+        }}
+        QLabel#Warn {{ color: {self.red}; padding: 0px 4px 4px 4px; }}
+        QLabel#Badge {{
+            color: {self.sub};
+            background: {self.card2};
+            border-radius: 9px;
+            padding: 2px 9px;
+            font-size: 11px;
+            font-weight: 700;
+        }}
+        QLabel#Badge[tone="accent"] {{
+            color: {self.accent}; background: {self.accent_dim};
+        }}
+        QLabel#Badge[tone="live"] {{
+            color: {self.green}; background: {self.green_dim};
+        }}
+        QPushButton#MoreBtn {{ padding: 6px 9px; }}
+        QPushButton#DangerGhost {{
+            background: {self.card2}; color: {self.red}; font-weight: 600;
+        }}
+        QPushButton#DangerGhost:hover {{ background: {self.red}; color: white; }}
+        QPushButton#DangerGhost:disabled {{ color: {self.muted}; background: {self.card2}; }}
+        QLabel#Chip {{
+            color: {self.accent};
+            background: {self.accent_dim};
+            border-radius: 9px;
+            padding: 4px 12px;
+            font-weight: 700;
+        }}
+        QPushButton {{
+            border: none;
+            border-radius: 10px;
+            padding: 6px 14px;
+            background: {self.card2};
+            color: {self.fg};
+        }}
+        QPushButton:hover {{ background: {self.card3}; }}
+        QPushButton#Play {{
+            background: {self.accent};
+            color: white;
+            font-weight: 700;
+            font-size: 15px;
+            border-radius: 12px;
+        }}
+        QPushButton#Play:hover {{ background: {self.accent_hov}; }}
+        QPushButton#Kill {{
+            background: {self.red};
+            color: white;
+            font-weight: 700;
+            font-size: 15px;
+            border-radius: 12px;
+        }}
+        QPushButton#Kill:hover {{ background: {self.red_hov}; }}
+        QPushButton#Primary {{
+            background: {self.accent};
+            color: white;
+            font-weight: 700;
+        }}
+        QPushButton#Primary:hover {{ background: {self.accent_hov}; }}
+        QPushButton#Primary:disabled {{ background: {self.card3}; color: {self.muted}; }}
+        QPushButton#Ghost:disabled, QPushButton#GhostSmall:disabled,
+        QPushButton#DangerSmall:disabled {{ color: {self.muted}; }}
+        QPushButton#Danger {{ background: {self.red}; color: white; }}
+        QPushButton#Danger:hover {{ background: {self.red_hov}; }}
+        QPushButton#Ghost {{ background: {self.card2}; color: {self.fg}; font-weight: 600; }}
+        QPushButton#Ghost:hover {{ background: {self.card3}; }}
+        QPushButton#GhostSmall {{ background: {self.card2}; color: {self.fg}; font-size: 11px; font-weight: 600; padding: 4px 10px; border-radius: 8px; }}
+        QPushButton#GhostSmall:hover {{ background: {self.card3}; }}
+        QPushButton#EditionRow {{ background: transparent; border-radius: 10px; padding: 0px; }}
+        QPushButton#EditionRow:hover {{ background: {self.card2}; }}
+        QPushButton#EditionRow:checked {{ background: {self.accent_dim}; }}
+        QFrame#Page {{ background: transparent; border: none; }}
+        QPushButton#FoldBtn {{
+            background: transparent; color: {self.muted};
+            border-radius: 6px; padding: 0px; font-size: 16px; font-weight: 700;
+        }}
+        QPushButton#FoldBtn:hover {{ background: {self.card2}; color: {self.fg}; }}
+        QPushButton#FoldBtn:disabled {{ color: {self.card3}; }}
+        QPushButton#DangerSmall {{ background: {self.card2}; color: {self.red}; font-size: 11px; padding: 4px 8px; border-radius: 10px; }}
+        QPushButton#DangerSmall:hover {{ background: {self.red}; color: white; }}
+        QPushButton#IconBtn {{
+            background: {self.card2};
+            border-radius: 8px;
+            padding: 0px;
+            font-size: 15px;
+        }}
+        QPushButton#IconBtn:hover {{ background: {self.card3}; }}
+        QPushButton#ToolRow {{
+            background: {self.card2};
+            border-radius: 10px;
+            padding: 10px 14px;
+            text-align: left;
+            font-size: 13px;
+            font-weight: 600;
+        }}
+        QPushButton#ToolRow:hover {{ background: {self.card3}; }}
+        QPushButton#ToolRowDanger {{
+            background: {self.card2};
+            color: {self.red};
+            border-radius: 10px;
+            padding: 10px 14px;
+            text-align: left;
+            font-size: 13px;
+            font-weight: 600;
+        }}
+        QPushButton#ToolRowDanger:hover {{ background: {self.red}; color: white; }}
+        QFrame#Rail {{
+            background: {self.card};
+            border: 1px solid {self.border};
+            border-radius: 18px;
+        }}
+        QPushButton#NavItem {{
+            background: transparent;
+            color: {self.sub};
+            border-radius: 10px;
+            padding: 9px 12px;
+            text-align: left;
+            font-size: 13px;
+            font-weight: 600;
+        }}
+        QPushButton#NavItem:hover {{ background: {self.card2}; color: {self.fg}; }}
+        QPushButton#NavItem:checked {{
+            background: {self.accent_dim};
+            color: {self.accent};
+        }}
+        QLabel#PageTitle {{ font-size: 18px; font-weight: 700; }}
+        QLabel#Brand {{ font-size: 14px; font-weight: 800; }}
+        QFrame#Tile {{
+            background: {self.card2};
+            border-radius: 14px;
+        }}
+        QFrame#Tile:hover {{ background: {self.card3}; }}
+        QPushButton#Toggle {{
+            background: transparent;
+            color: {self.sub};
+            border-radius: 8px;
+            font-weight: 700;
+        }}
+        QPushButton#Toggle:checked {{
+            background: {self.accent_dim};
+            color: {self.accent};
+        }}
+        QLineEdit, QPlainTextEdit {{
+            background: {self.card2};
+            border: 1px solid transparent;
+            border-radius: 10px;
+            padding: 6px 10px;
+            selection-background-color: {self.accent};
+        }}
+        QLineEdit:focus {{ border: 1px solid {self.accent}; }}
+        QComboBox, QSpinBox {{
+            background: {self.card2};
+            color: {self.fg};
+            border: 1px solid {self.border};
+            border-radius: 10px;
+            padding: 5px 30px 5px 12px;
+            min-height: 20px;
+        }}
+        QSpinBox {{ padding-right: 22px; }}
+        QComboBox:hover, QSpinBox:hover {{
+            background: {self.card3};
+            border: 1px solid {self.sub};
+        }}
+        QComboBox:focus, QSpinBox:focus, QComboBox:on {{
+            border: 1px solid {self.accent};
+        }}
+        QComboBox:disabled, QSpinBox:disabled {{ color: {self.muted}; }}
+        QComboBox::drop-down {{
+            subcontrol-origin: padding;
+            subcontrol-position: center right;
+            width: 26px;
+            border: none;
+            background: transparent;
+        }}
+        QComboBox::down-arrow {{
+            image: url("{_chevron(self.sub)}");
+            width: 12px; height: 12px;
+        }}
+        QComboBox::down-arrow:on {{ image: url("{_chevron(self.accent, up=True)}"); }}
+        QSpinBox::up-button, QSpinBox::down-button {{
+            subcontrol-origin: border;
+            width: 20px;
+            border: none;
+            background: transparent;
+        }}
+        QSpinBox::up-button {{ subcontrol-position: top right; }}
+        QSpinBox::down-button {{ subcontrol-position: bottom right; }}
+        QSpinBox::up-arrow {{
+            image: url("{_chevron(self.sub, up=True)}"); width: 9px; height: 9px;
+        }}
+        QSpinBox::down-arrow {{
+            image: url("{_chevron(self.sub)}"); width: 9px; height: 9px;
+        }}
+        QComboBox QAbstractItemView {{
+            padding: 4px;
+            border-radius: 8px;
+        }}
+        QComboBox QAbstractItemView::item {{
+            min-height: 26px;
+            padding: 2px 10px;
+            border-radius: 6px;
+        }}
+        QComboBox QAbstractItemView::item:selected,
+        QComboBox QAbstractItemView::item:hover {{
+            background: {self.accent_dim};
+            color: {self.accent};
+        }}
+        QListWidget {{
+            background: {self.card2};
+            border: none;
+            border-radius: 8px;
+            outline: none;
+        }}
+        QListWidget::item {{
+            padding: 6px 10px;
+            border-radius: 6px;
+        }}
+        QListWidget::item:selected {{
+            background: {self.accent_dim};
+            color: {self.accent};
+        }}
+        QListWidget::item:hover {{ background: {self.card3}; }}
+        /* A combo box's list, a context menu and a tooltip are windows of
+           their own. Under the transparent QWidget rule they paint no
+           background, so the desktop's palette shows behind the theme's
+           text: dark under dark text once the light theme is on (#332). */
+        QComboBox QAbstractItemView, QMenu {{
+            background: {self.card};
+            color: {self.fg};
+            border: 1px solid {self.border};
+            outline: none;
+            selection-background-color: {self.accent_dim};
+            selection-color: {self.accent};
+        }}
+        QMenu::item {{ padding: 5px 18px; background: transparent; }}
+        QMenu::item:selected {{ background: {self.accent_dim}; color: {self.accent}; }}
+        QMenu::item:disabled {{ color: {self.muted}; }}
+        QToolTip {{
+            background: {self.card};
+            color: {self.fg};
+            border: 1px solid {self.border};
+            padding: 3px 5px;
+        }}
+        QProgressBar {{
+            background: {self.card2};
+            border-radius: 4px;
+            height: 8px;
+            text-align: center;
+            color: transparent;
+        }}
+        QProgressBar::chunk {{ background: {self.accent}; border-radius: 4px; }}
+        QTabWidget::pane {{
+            border: none;
+            background: transparent;
+            top: 4px;
+        }}
+        QTabBar {{ background: transparent; }}
+        QTabBar::tab {{
+            background: {self.card2};
+            color: {self.sub};
+            padding: 8px 18px;
+            border-radius: 8px;
+            margin: 4px 3px 4px 0px;
+            font-weight: 600;
+        }}
+        QTabBar::tab:hover {{ background: {self.card3}; color: {self.fg}; }}
+        QTabBar::tab:selected {{ background: {self.accent}; color: white; }}
+        QScrollArea, QScrollArea > QWidget > QWidget {{ border: none; background: transparent; }}
+        QScrollBar:vertical {{ width: 10px; background: transparent; }}
+        QScrollBar::handle:vertical {{
+            background: {self.card3}; border-radius: 5px; min-height: 24px;
+        }}
+        QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
+        QTextBrowser {{
+            background: {self.card2};
+            border-radius: 12px;
+            border: none;
+        }}
+        QMessageBox {{ background: {self.card}; }}
+        /* Qt draws a message box's checkbox with the platform style, which on
+           a dark palette comes out as an unlit square nobody can see they are
+           allowed to tick. */
+        QMessageBox QCheckBox {{ color: {self.sub}; }}
+        QMessageBox QCheckBox::indicator {{
+            width: 14px; height: 14px;
+            border: 1px solid {self.border};
+            border-radius: 4px;
+            background: {self.card2};
+        }}
+        QMessageBox QCheckBox::indicator:checked {{
+            background: {self.accent};
+            border-color: {self.accent};
+        }}
+        #ActivityLog QTextEdit {{
+            background: {self.console_bg};
+            color: {self.console_fg};
+            font-family: monospace;
+            border-radius: 12px;
+        }}
+        #Popup {{
+            background: {self.card2};
+            border: 1px solid {self.border};
+            border-radius: 12px;
+        }}
+        """
+
+
+# ======================================================================
+# Background workers
+# ======================================================================
+
+#: Workers whose window went away before they had finished. A QThread whose
+#: last reference is dropped while it is still running is destroyed by the
+#: C++ side mid-run, and Qt aborts the process on that -- so closing the
+#: launcher during the Settings > Versions disk scan, a changelog fetch or
+#: the update check took the exit down with it. The reference moves here
+#: instead of dying with the window. Waiting would be the other answer and
+#: is the wrong one: two of those three are network reads, and the close
+#: would freeze on them.
+_ORPHAN_WORKERS: list = []
+
+
+def _park_worker(worker) -> None:
+    """Keep `worker` alive past the window that started it."""
+    if worker in _ORPHAN_WORKERS:
         return
+    _ORPHAN_WORKERS.append(worker)
+    worker.finished.connect(lambda: _release_worker(worker))
+    # finished() may already have fired between the caller's isRunning()
+    # check and this connect, in which case nothing would drop it again.
+    if not worker.isRunning():
+        _release_worker(worker)
 
-    T = Theme
-    s = load_settings()
-    _init_beta = s.get("ui_is_beta", False)
-    T.THEME_ACCENT = T.GOLD if _init_beta else T.GREEN
-    T.THEME_HOV    = T.GOLD_HOV if _init_beta else T.GREEN_HOV
-    T.THEME_DIM    = T.GOLD_DIM if _init_beta else T.GREEN_DIM
 
-    ctk.set_appearance_mode("Light" if s.get("light_theme", False) else "Dark")
-
-    _ui_scale = float(s.get("ui_scale", 1.0) or 1.0)
+def _release_worker(worker) -> None:
     try:
-        ctk.set_widget_scaling(_ui_scale)
-        ctk.set_window_scaling(_ui_scale)
-    except Exception:
+        _ORPHAN_WORKERS.remove(worker)
+    except ValueError:
         pass
 
-    attempted_displays = []
-    original_display = os.environ.get("DISPLAY")
-    try:
-        root = _create_gui_root(
-            ctk, tk, attempted=attempted_displays)
-    except Exception as e:
-        tried = ", ".join(attempted_displays) or (
-            original_display or "<unset>")
-        _desktop_error(
-            f"No usable X11/XWayland display ({e}). Tried DISPLAY={tried}. "
-            "Check that the app launcher inherited this session's DISPLAY "
-            "and XAUTHORITY, or use the command line.")
-        return
-    retained_display = os.environ.get("DISPLAY")
-    if retained_display != original_display:
-        warn(
-            "Recovered a stale XWayland session display: "
-            f"{original_display or '<unset>'} → {retained_display}.")
-    root.title(PRETTY)
-    root.geometry("980x650")
-    root.minsize(860, 640)
-    root.configure(fg_color=T.BG)
 
-    def font(size=13, weight="normal", family=None):
-        return ctk.CTkFont(size=size, weight=weight, family=family)
+class Worker(QThread):
+    """Run an arbitrary callable off the UI thread."""
+    done = Signal(object)
+    failed = Signal(str)
+    # Byte counts, so qint64 rather than int: a Qt `int` is the C++ one, and
+    # PySide6 wraps anything past 2 GiB into it with nothing but a
+    # RuntimeWarning. See MainWindow.set_progress for what that cost (#216).
+    progress = Signal("qint64", "qint64")
 
-    MONO = "monospace"
+    def __init__(self, fn: Callable, *args, **kwargs):
+        super().__init__()
+        self._fn = fn
+        self._args = args
+        self._kwargs = kwargs
 
-    icon_img = None
-    here = Path(__file__).resolve().parent
-    for p in (here.parent / "data/icon.png",
-              here / "data/icon.png",
-              Path("/app/share/icons/hicolor/256x256/apps/") /
-              "io.github.wyze3306.BedrockOnLinux.png",
-              Path("/usr/lib/bedrock-on-linux/data/icon.png"),
-              Path("/usr/share/icons/hicolor/256x256/apps/bedrock-on-linux.png")):
-        if p.exists():
-            try:
-                icon_img = tk.PhotoImage(file=str(p))
-                root.iconphoto(True, icon_img)
-                root._icon = icon_img
-                break
-            except Exception:
-                pass
-    if icon_img is None:
+    def _takes_progress(self):
+        """Whether the callable accepts a `progress` keyword.
+
+        Read from the signature, not from __code__.co_varnames: co_varnames
+        lists local variables as well as parameters, so a callee that merely
+        assigns to a name called `progress` would be handed a keyword it
+        cannot take -- and the resulting TypeError arrives through failed(),
+        where it reads as a real failure of the work itself. Builtins and
+        functools.partial have no __code__ at all.
+        """
         try:
-            with zipfile.ZipFile(Path(sys.argv[0])) as archive:
-                encoded = base64.b64encode(archive.read("data/icon.png"))
-            icon_img = tk.PhotoImage(data=encoded)
-            root.iconphoto(True, icon_img)
-            root._icon = icon_img
-        except (OSError, KeyError, zipfile.BadZipFile, tk.TclError):
-            pass
+            parameters = inspect.signature(self._fn).parameters
+        except (TypeError, ValueError):
+            return False
+        if "progress" in parameters:
+            return True
+        return any(p.kind is inspect.Parameter.VAR_KEYWORD
+                   for p in parameters.values())
 
-    def logo_label(parent, px, bg):
-        """A scaled logo image in a ctk.CTkLabel."""
-        if icon_img is None:
-            return None
+    def run(self):
         try:
-            im = icon_img.subsample(max(1, icon_img.width() // px))
-            import warnings
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                lab = ctk.CTkLabel(parent, image=im, text="", fg_color=bg)
-            lab.image = im
-            return lab
-        except Exception:
-            return None
+            kwargs = dict(self._kwargs)
+            if self._takes_progress():
+                kwargs["progress"] = self._emit_progress
+            self.done.emit(self._fn(*self._args, **kwargs))
+        except Exception as exc:  # noqa: BLE001 - surfaced to the UI
+            self.failed.emit(str(exc) or type(exc).__name__)
 
-    def mkbtn(parent, text, cmd, kind="ghost", **kw):
-        base = {
-            "play":    dict(fg_color=T.THEME_ACCENT, hover_color=T.THEME_HOV,
-                             text_color="white"),
-            "primary": dict(fg_color=T.THEME_ACCENT, hover_color=T.THEME_HOV,
-                             text_color="white"),
-            "danger":  dict(fg_color=T.RED, hover_color=T.RED_HOV,
-                             text_color="white"),
-            "ghost":   dict(fg_color=T.CARD_2, hover_color=T.CARD_3,
-                             text_color=T.FG),
-            "flat":    dict(fg_color="transparent", hover_color=T.CARD_2,
-                             text_color=T.SUB),
-        }[kind]
-        opts = dict(corner_radius=10, font=font(13), command=cmd)
-        opts.update(base)
-        opts.update(kw)
-        return ctk.CTkButton(parent, text=text, **opts)
+    def _emit_progress(self, got, total):
+        self.progress.emit(got, total)
 
-    def center_over(
-            win, owner, bounds=None, compensate_decorations=True):
-        owner.update_idletasks()
-        win.update_idletasks()
-        if bounds is None:
-            bounds = (
-                win.winfo_vrootx(), win.winfo_vrooty(),
-                win.winfo_vrootwidth(), win.winfo_vrootheight(),
-            )
-        x, y = _centered_window_position(
-            (
-                owner.winfo_rootx(), owner.winfo_rooty(),
-                owner.winfo_width(), owner.winfo_height(),
-            ),
-            (win.winfo_width(), win.winfo_height()),
-            bounds,
-        )
-        position = _geometry_position(win.geometry())
-        if compensate_decorations and position is not None:
-            decoration_x = max(0, win.winfo_rootx() - position[0])
-            decoration_y = max(0, win.winfo_rooty() - position[1])
-            x -= decoration_x
-            y -= decoration_y
-            bound_x, bound_y, bound_width, bound_height = bounds
-            outer_width = win.winfo_width() + decoration_x * 2
-            outer_height = win.winfo_height() + decoration_y
-            x = max(
-                bound_x,
-                min(x, bound_x + max(0, bound_width - outer_width)),
-            )
-            y = max(
-                bound_y,
-                min(y, bound_y + max(0, bound_height - outer_height)),
-            )
-        win.geometry(f"{x:+d}{y:+d}")
 
-    def dialog(title, w, h, parent=None, bounds=None):
-        """A CTkToplevel with consistent chrome: centered, dark, Esc-to-close."""
-        owner = (root if parent is None else parent).winfo_toplevel()
-        d = ctk.CTkToplevel(owner)
-        d.title(title)
-        d.configure(fg_color=T.CARD)
-        d.transient(owner)
-        d.resizable(False, False)
-        d.geometry(f"{w}x{h}")
-        center_over(
-            d, owner, bounds, compensate_decorations=False)
+class LogBridge(QObject):
+    """Marshals ``log._LOG_SINK`` calls (any thread) onto the UI thread."""
+    line = Signal(str)
 
-        def recenter(lift=False):
-            if not d.winfo_exists():
-                return
-            center_over(d, owner, bounds)
-            if lift:
-                d.lift()
 
-        # Some window managers ignore geometry until the window is mapped.
-        d.after(10, recenter)
-        d.after(120, lambda: recenter(lift=True))
-        d.bind("<Escape>", lambda _event: d.destroy())
-        return d
+class AuthBridge(QObject):
+    """Marshals ``NativeAuth`` callbacks (raw worker thread) onto the UI
+    thread.
 
-    messagebox = _ThemedMessageBox(
-        ctk, tk, root, T, font, mkbtn, dialog,
-        window_scaling=_ui_scale,
-        monitor_provider=monitor_geometries,
-    )
+    ``NativeAuth.start()`` is kicked off on a plain ``threading.Thread``, not
+    a ``QThread``, so it has no Qt event loop of its own. Handing its
+    ``on_auth``/``on_online`` callbacks straight to ``QTimer.singleShot``
+    from that thread creates a timer with affinity to a thread that never
+    pumps events -- the callback is queued and then simply never fires, so
+    the "Sign In" dialog never appears and the account never goes green.
+    A ``QObject`` created on the UI thread queues its signals onto that
+    thread automatically, from any emitting thread, which is what actually
+    gets the callback to run.
+    """
+    auth = Signal(str, str)
+    online = Signal()
+    refreshed = Signal()
+    refused = Signal()
 
-    class Tooltip:
-        """Small delayed hover label for icon-only buttons."""
 
-        def __init__(self, widget, text):
-            self.widget, self.text, self.win, self._job = widget, text, None, None
-            widget.bind("<Enter>", self._schedule, add="+")
-            widget.bind("<Leave>", self._hide, add="+")
+# ======================================================================
+# Small reusable widgets
+# ======================================================================
 
-        def _schedule(self, _e=None):
-            self._job = root.after(500, self._show)
+def btn(text, cmd=None, kind="ghost", w=None, h=32, tip=None, parent=None) -> QPushButton:
+    b = QPushButton(text, parent)
+    b.setObjectName({
+        "play": "Play", "primary": "Primary", "danger": "Danger",
+        "ghost": "Ghost", "flat": "Ghost", "icon": "IconBtn",
+        "ghost-small": "GhostSmall", "danger-small": "DangerSmall",
+        "toolrow": "ToolRow", "toolrow-danger": "ToolRowDanger",
+    }.get(kind, "Ghost"))
+    if cmd:
+        b.clicked.connect(cmd)
+    if w:
+        b.setFixedWidth(w)
+    b.setFixedHeight(h)
+    b.setCursor(Qt.PointingHandCursor)
+    if tip:
+        b.setToolTip(tip)
+    return b
 
-        def _show(self):
-            if self.win is not None:
-                return
-            widget_y = self.widget.winfo_rooty() - root.winfo_rooty()
-            x = self.widget.winfo_rootx() - root.winfo_rootx() + self.widget.winfo_width() // 2
-            
-            if widget_y > root.winfo_height() // 2:
-                y = widget_y - 8
-                anchor = "s"
-            else:
-                y = widget_y + self.widget.winfo_height() + 8
-                anchor = "n"
-            
-            self.win = ctk.CTkFrame(root, fg_color=T.CARD_3, corner_radius=6)
-            lab = ctk.CTkLabel(self.win, text=self.text, fg_color="transparent", text_color=T.FG,
-                               font=font(10))
-            lab.pack(padx=8, pady=4)
-            self.win.place(x=x, y=y, anchor=anchor)
-            self.win.lift()
 
-        def _hide(self, _e=None):
-            if self._job:
-                root.after_cancel(self._job)
-                self._job = None
-            if self.win is not None:
-                self.win.destroy()
-                self.win = None
+class ChoiceCard(QFrame):
+    """One answer of a choice dialog: a title over a line of help, picked
+    by a click, Space or Enter. Shown lit when it is the current pick."""
 
-    na = NativeAuth()
-    ui = {"versions": [], "labels": [], "busy": False, "details": False,
-          "launch_active": False, "changelog_active": False,
-          "changelogs_loaded": False, "changelog_head": None,
-          "settings_head": None,
-          # Probed once: it opens the X display to read Gamescope's own root
-          # properties, and the answer cannot change while the window lives.
-          "single_window": single_window_session(), "stepped_aside": False}
-    tab_game = None
-    tab_launcher = None
+    picked = Signal()
 
-    top = ctk.CTkFrame(root, fg_color="transparent")
-    top.pack(fill="x", padx=22, pady=(18, 8))
+    def __init__(self, title, help_text, badge=None, parent=None):
+        super().__init__(parent)
+        self.setObjectName("ChoiceCard")
+        self.setProperty("checked", False)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(16, 12, 16, 14)
+        v.setSpacing(4)
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        self.title = QLabel(title)
+        self.title.setObjectName("ChoiceTitle")
+        head.addWidget(self.title)
+        if badge:
+            tag = QLabel(badge)
+            tag.setObjectName("ChoiceBadge")
+            head.addWidget(tag)
+        head.addStretch(1)
+        v.addLayout(head)
+        self.help = QLabel(help_text)
+        self.help.setObjectName("Sub")
+        self.help.setWordWrap(True)
+        v.addWidget(self.help)
+        for label in self.findChildren(QLabel):
+            label.setAttribute(Qt.WA_TransparentForMouseEvents)
 
-    brand = ctk.CTkFrame(top, fg_color=T.CARD, corner_radius=14)
-    brand.pack(side="left")
-    icon_btn = ctk.CTkFrame(brand, fg_color=T.CARD_2, corner_radius=8)
-    icon_btn.pack(side="left", padx=(6, 3), pady=5)
-    
-    ll = logo_label(icon_btn, 24, T.CARD_2)
-    if not ll:
-        ll = ctk.CTkLabel(icon_btn, text="GitHub", fg_color=T.CARD_2, text_color=T.SUB, font=("sans-serif", 10, "bold"))
-    ll.pack(padx=6, pady=6)
+    def setChecked(self, on):
+        self.setProperty("checked", bool(on))
+        self.style().unpolish(self)
+        self.style().polish(self)
 
-    brand_lbl = ctk.CTkLabel(brand, text="What's New", font=font(16, "bold"),
-                             text_color=T.FG)
-    brand_lbl.pack(side="left", padx=(3, 6), pady=8)
-    
-    brand_lbl.bind("<Button-1>", lambda _event: toggle_changelog())
-    brand_lbl.bind(
-        "<Enter>",
-        lambda _event: brand_lbl.configure(text_color=T.THEME_ACCENT),
-    )
-    brand_lbl.bind(
-        "<Leave>", lambda _event: brand_lbl.configure(text_color=T.FG)
-    )
-    Tooltip(brand_lbl, "Changelog")
+    def isChecked(self):
+        return bool(self.property("checked"))
 
-    ctk.CTkLabel(brand, text=f"v{VERSION}", font=font(12, "bold"), text_color=T.SUB
-                 ).pack(side="left", padx=(0, 10), pady=8)
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.rect().contains(
+                event.position().toPoint()):
+            self.picked.emit()
+        super().mouseReleaseEvent(event)
 
-    def _open_github(_e=None):
-        subprocess.Popen(
-            ["xdg-open", "https://github.com/Wyze3306/BedrockOnLinux"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
-    def _icon_hover(on):
-        c = T.CARD_3 if on else T.CARD_2
-        icon_btn.configure(fg_color=c)
-        if ll:
-            ll.configure(fg_color=c)
-            
-    for w in [icon_btn, ll]:
-        w.bind("<Button-1>", _open_github)
-        w.bind("<Enter>", lambda _event: _icon_hover(True))
-        w.bind("<Leave>", lambda _event: _icon_hover(False))
-        Tooltip(w, "GitHub")
-
-    acct = ctk.CTkFrame(top, fg_color=T.CARD, corner_radius=14)
-    acct.pack(side="right")
-    acct_dot = ctk.CTkLabel(acct, text="●", text_color=T.SUB, font=font(12),
-                             width=10)
-    acct_dot.pack(side="left", padx=(14, 4), pady=8)
-    acct_txt = tk.StringVar(value="Not signed in")
-    acct_txt_lbl = ctk.CTkLabel(acct, textvariable=acct_txt, text_color=T.FG,
-                 font=font(13))
-    acct_txt_lbl.pack(side="left", padx=(0, 8))
-    acct_btn = mkbtn(acct, "Sign in", lambda: acct_click(), kind="ghost",
-                      width=88, height=30, font=font(12, "bold"))
-    acct_btn.pack(side="left", padx=(0, 8), pady=8)
-    
-    acct_txt_lbl._tooltip = Tooltip(acct_txt_lbl, "")
-    acct_btn._tooltip = Tooltip(acct_btn, "")
-
-    view_area = ctk.CTkFrame(root, fg_color="transparent")
-    view_area.pack(fill="both", expand=True, padx=22, pady=6)
-
-    hero = ctk.CTkFrame(view_area, fg_color=T.CARD, corner_radius=18,
-                         border_width=1, border_color=T.BORDER)
-    hw = ctk.CTkFrame(hero, fg_color="transparent")
-    hw.place(relx=0.5, rely=0.44, anchor="center")
-    hl = logo_label(hw, 118, T.CARD)
-    if hl:
-        hl.pack()
-    ctk.CTkLabel(hw, text="Minecraft Bedrock", font=font(28, "bold"),
-                 text_color=T.FG).pack(pady=(16, 2))
-    ctk.CTkLabel(hw, text="Bedrock Edition for Linux", font=font(13),
-                 text_color=T.SUB).pack()
-
-    selected_chip = ctk.CTkLabel(
-        hw, text="", font=font(12, "bold"), text_color=T.THEME_ACCENT,
-        fg_color=T.THEME_DIM, bg_color=T.CARD, corner_radius=8)
-    selected_chip.pack(pady=(14, 0))
-
-    status = ctk.CTkFrame(root, fg_color="transparent")
-    status.pack(fill="x", padx=26, pady=(4, 0))
-    status_txt = tk.StringVar(value="Select a version to play.")
-    status_lbl = ctk.CTkLabel(status, textvariable=status_txt, text_color=T.SUB,
-                               font=font(12), anchor="w")
-    status_lbl.pack(fill="x")
-    prog = ctk.CTkProgressBar(status, height=8, corner_radius=4,
-                               progress_color=T.THEME_ACCENT, fg_color=T.CARD_2)
-    prog.set(0)
-
-    dock = ctk.CTkFrame(root, fg_color=T.CARD, corner_radius=16,
-                         border_width=1, border_color=T.BORDER)
-    dock.pack(fill="x", padx=22, pady=(10, 16))
-    
-    _sash_state = {"y": 0, "h": 220, "max_h": 600}
-    def sash_click(e):
-        if not ui.get("details"): return
-        _sash_state["y"] = e.y_root
-        _sash_state["h"] = detwrap.winfo_height()
-        allowable = view_area.winfo_height() - 340
-        _sash_state["max_h"] = _sash_state["h"] + max(0, allowable)
-    def sash_drag(e):
-        if not ui.get("details"): return
-        new_h = _sash_state["h"] - (e.y_root - _sash_state["y"])
-        if new_h < 100: new_h = 100
-        if new_h > _sash_state["max_h"]: new_h = _sash_state["max_h"]
-        detwrap.configure(height=new_h)
-        root.minsize(860, 640 + new_h)
-        
-    for _w in (status, status_lbl, prog, getattr(prog, "_canvas", prog)):
-        _w.bind("<Button-1>", sash_click, add="+")
-        _w.bind("<B1-Motion>", sash_drag, add="+")
-
-    bar = ctk.CTkFrame(dock, fg_color="transparent")
-    bar.pack(fill="x", padx=16, pady=14)
-
-    vbox = ctk.CTkFrame(bar, fg_color="transparent")
-    vbox.pack(side="left")
-    mc_var = tk.StringVar(value="")
-
-    _pick = {"win": None, "hover": False, "bind_id": None}
-
-    def close_picker():
-        bid = _pick.get("bind_id")
-        if bid:
-            root.unbind("<Configure>", bid)
-            _pick["bind_id"] = None
-            
-        try:
-            ver_arrow.configure(text="▾")
-            if not _pick.get("hover"):
-                ver_field.configure(fg_color=T.CARD_2)
-                ver_lbl.configure(text_color=T.FG)
-        except NameError:
-            pass
-        w = _pick["win"]
-        _pick["win"] = None
-        if w is not None:
-            try:
-                w.destroy()
-            except Exception:
-                pass
-
-    def set_version(label):
-        mc_var.set(label or "")
-        _update_selected_chip()
-        close_picker()
-
-    def _sync_theme(w, is_beta=None):
-        if w == acct_dot:
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter):
+            self.picked.emit()
             return
-        if is_beta is None:
-            lab = mc_var.get()
-            is_beta = "BETA" in lab if lab else False
-            
-        c_new = T.GOLD if is_beta else T.GREEN
-        h_new = T.GOLD_HOV if is_beta else T.GREEN_HOV
-        d_new = T.GOLD_DIM if is_beta else T.GREEN_DIM
-        c_old = T.GREEN if is_beta else T.GOLD
-        h_old = T.GREEN_HOV if is_beta else T.GOLD_HOV
-        d_old = T.GREEN_DIM if is_beta else T.GOLD_DIM
-        
-        T.THEME_ACCENT = c_new
-        T.THEME_HOV = h_new
-        T.THEME_DIM = d_new
-        
-        for attr in ("fg_color", "text_color", "progress_color", "hover_color", "segmented_button_selected_color", "segmented_button_selected_hover_color"):
-            try:
-                cur = w.cget(attr)
-                if cur == c_old:
-                    w.configure(**{attr: c_new})
-                elif cur == h_old:
-                    w.configure(**{attr: h_new})
-                elif cur == d_old:
-                    w.configure(**{attr: d_new})
-            except Exception:
-                pass
-        if hasattr(w, "_segmented_button"):
-            try: w._segmented_button.configure(selected_color=c_new, selected_hover_color=h_new)
-            except Exception: pass
-        if hasattr(w, "tag_configure"):
-            try: w.tag_configure("link", foreground=T.r(c_new))
-            except Exception: pass
-            try: w.tag_configure("release_title", foreground=T.r(c_new))
-            except Exception: pass
-        elif hasattr(w, "_textbox"):
-            try: w._textbox.tag_configure("link", foreground=T.r(c_new))
-            except Exception: pass
-            try: w._textbox.tag_configure("release_title", foreground=T.r(c_new))
-            except Exception: pass
-            
-        if w.__class__.__name__ == "Text" and getattr(w, "_is_logbox", False):
-            try:
-                w.configure(bg=T.r(T.CONSOLE_BG), fg=T.r(T.CONSOLE_FG), insertbackground=T.r(T.FG))
-            except Exception:
-                pass
-            
-        if getattr(w, "_is_play_btn", False):
-            try:
-                import warnings
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    if ui.get("busy"):
-                        w.configure(fg_color=T.RED, hover_color=T.RED, text_color=T.FG)
-                        w._img_norm = _create_kill_icon(16, T.FG, T.RED)
-                    else:
-                        w.configure(fg_color=T.THEME_ACCENT, hover_color=T.THEME_ACCENT, text_color=T.FG)
-                        w._img_norm = _create_play_icon(16, T.FG, T.THEME_ACCENT)
-                    w.configure(image=w._img_norm)
-            except Exception:
-                pass
-            
-        for child in w.winfo_children():
-            _sync_theme(child, is_beta)
+        super().keyPressEvent(event)
 
-    def _update_selected_chip():
-        lab = mc_var.get()
-        if not lab:
-            selected_chip.configure(text="")
-            return
-        is_beta = "BETA" in lab
 
-        s = load_settings()
-        changed = False
-        if s.get("ui_is_beta") != is_beta:
-            s["ui_is_beta"] = is_beta
-            changed = True
-            
-        cur_mc_ver = lab.split('  ')[0]
-        if s.get("mc_version") != cur_mc_ver:
-            s["mc_version"] = cur_mc_ver
-            changed = True
-            
-        if changed:
-            save_settings(s)
+class NetworkChoiceDialog(QDialog):
+    """First run: what the launcher contacts and how updates are checked.
 
-        selected_chip.configure(
-            text=f"  {lab.split('  ')[0]}"
-                 f"{'  ·  BETA' if is_beta else ''}  ",
-            text_color=T.GOLD if is_beta else T.GREEN,
-            fg_color=T.GOLD_DIM if is_beta else T.GREEN_DIM)
-            
-        try:
-            active = _pick.get("hover") or _pick.get("win")
-            ver_lbl.configure(text_color=T.THEME_ACCENT if active else T.FG)
-            ver_arrow.configure(text_color=T.SUB)
-        except Exception:
-            pass
-            
-        try:
-            if hasattr(play_btn, "_tooltip"):
-                is_kill = "Kill" in play_btn._tooltip.text
-                play_btn._tooltip.text = (
-                    f"{'Kill' if is_kill else 'Play'} {cur_mc_ver}")
-        except Exception:
-            pass
+    Nothing is fetched while it is open. ``chosen`` carries the mode the
+    player confirmed; closing it without one only emits ``rejected``.
+    """
 
-        _sync_theme(root, is_beta)
-        
-        if ui.get("changelogs_loaded") and tab_game is not None and changelog_view.winfo_ismapped():
-            from .util import mc_releases
-            load_tab_changelog(tab_game, lambda: mc_releases(fetch_all=False), render_game_changelog)
+    chosen = Signal(str)
+    ORDER = ("auto", "ask", "off")
 
-    def open_picker():
-        if _pick["win"] is not None:
-            close_picker()
-            return
-        labels = ui.get("labels") or []
-        if not labels:
-            return
-        # winfo_* returns physical (already-scaled) screen pixels, but CTk
-        # widget constructors and .place() multiply whatever we pass them by
-        # the current widget scaling again — dividing here avoids the popup
-        # being double-scaled (wrong size/position) at 150%/200% UI scale.
-        x = (ver_field.winfo_rootx() - root.winfo_rootx()) / _ui_scale
-        y = (ver_field.winfo_rooty() - root.winfo_rooty()) / _ui_scale
-        w = ver_field.winfo_width() / _ui_scale
-        
-        s = load_settings()
-        saved_h = s.get("picker_height")
-        if saved_h is not None:
-            h = min(max(100, int(saved_h)), y - 24)
+    def __init__(self, parent, theme):
+        super().__init__(parent)
+        self.setObjectName("Root")
+        self.setWindowTitle(f"{PRETTY}: updates")
+        self.setStyleSheet(theme.qss() + f"""
+            QFrame#ChoiceCard {{
+                background: {theme.card};
+                border: 1px solid {theme.border};
+                border-radius: 12px;
+            }}
+            QFrame#ChoiceCard:hover {{ background: {theme.card2}; }}
+            QFrame#ChoiceCard:focus {{ border: 1px solid {theme.sub}; }}
+            QFrame#ChoiceCard[checked="true"] {{
+                background: {theme.accent_dim};
+                border: 2px solid {theme.accent};
+            }}
+            QLabel#ChoiceTitle {{ font-size: 14px; font-weight: 700; }}
+            QLabel#ChoiceBadge {{
+                background: {theme.accent}; color: white;
+                font-size: 10px; font-weight: 700;
+                padding: 2px 8px; border-radius: 8px;
+            }}
+            QLabel#Privacy {{
+                background: {theme.card2}; border-radius: 10px;
+                padding: 10px 12px; color: {theme.sub};
+            }}
+        """)
+        self.setModal(True)
+        self.setFixedWidth(560)
+        self.mode = "auto"
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(26, 24, 26, 22)
+        outer.setSpacing(12)
+
+        title = QLabel(f"How should {PRETTY} go online?")
+        title.setObjectName("Title")
+        title.setStyleSheet("font-size: 19px;")
+        title.setWordWrap(True)
+        outer.addWidget(title)
+
+        fetched = ("So far only the Qt interface was downloaded (from "
+                   "files.pythonhosted.org)."
+                   if os.environ.get("BOL_BOOTSTRAP_FETCHED")
+                   else "Nothing has been contacted yet.")
+        intro = QLabel(
+            f"{fetched} The launcher can check GitHub for its own updates "
+            "and for a small signed data file of fixes (new Minecraft "
+            "builds, incident notices). Installing Minecraft and signing in "
+            "reach Microsoft and GitHub only when you use them.")
+        intro.setObjectName("Sub")
+        intro.setWordWrap(True)
+        intro.setTextFormat(Qt.PlainText)
+        outer.addWidget(intro)
+        outer.addSpacing(4)
+
+        self.cards = {}
+        # Wrapped labels in a fixed-width dialog get no height-for-width
+        # pass: give each help line the height its known width needs.
+        help_width = 560 - 2 * 26 - 2 * 16 - 4
+        for key in self.ORDER:
+            card = ChoiceCard(netpolicy.MODE_LABELS[key],
+                              netpolicy.MODE_HELP[key],
+                              badge="Recommended" if key == "auto" else None)
+            card.help.setMinimumHeight(card.help.heightForWidth(help_width))
+            card.picked.connect(lambda k=key: self._pick(k))
+            self.cards[key] = card
+            outer.addWidget(card)
+        self._pick("auto")
+
+        privacy = QLabel(netpolicy.NO_TELEMETRY)
+        privacy.setObjectName("Privacy")
+        privacy.setWordWrap(True)
+        outer.addSpacing(2)
+        outer.addWidget(privacy)
+
+        self.disclosure = QLabel(netpolicy.disclosure_html())
+        self.disclosure.setObjectName("Sub")
+        self.disclosure.setWordWrap(True)
+        self.disclosure.setTextFormat(Qt.RichText)
+        self.disclosure.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.disclosure_box = QScrollArea()
+        self.disclosure_box.setWidgetResizable(True)
+        self.disclosure_box.setFrameShape(QFrame.NoFrame)
+        self.disclosure_box.setWidget(self.disclosure)
+        self.disclosure_box.setFixedHeight(200)
+        self.disclosure_box.hide()
+        outer.addWidget(self.disclosure_box)
+
+        outer.addSpacing(6)
+        foot = QHBoxLayout()
+        self.details_btn = btn("What is contacted…", self._toggle_details,
+                               kind="flat", h=36)
+        foot.addWidget(self.details_btn)
+        foot.addStretch(1)
+        self.continue_btn = btn("Continue", self._confirm, kind="primary",
+                                w=130, h=36)
+        self.continue_btn.setDefault(True)
+        foot.addWidget(self.continue_btn)
+        outer.addLayout(foot)
+
+    def _pick(self, mode):
+        self.mode = mode
+        for key, card in self.cards.items():
+            card.setChecked(key == mode)
+
+    def _toggle_details(self):
+        showing = not self.disclosure_box.isVisible()
+        self.disclosure_box.setVisible(showing)
+        self.details_btn.setText("Hide the list" if showing
+                                 else "What is contacted…")
+        self._fit()
+
+    def _fit(self):
+        layout = self.layout()
+        layout.activate()
+        self.setFixedHeight(layout.totalHeightForWidth(self.width()))
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._fit()
+
+    def _confirm(self):
+        mode = self.mode
+        self.accept()
+        self.chosen.emit(mode)
+
+
+class SettingComboBox(QComboBox):
+    """A drop-down that a wheel turn on the way past leaves alone (#363).
+
+    The Settings tabs scroll, and Qt hands a wheel turn to whichever combo
+    box is under the pointer, focused or not, as a new choice. The graphics
+    card choice is saved on every change, so scrolling the Advanced tab could
+    move the game onto the processor's iGPU without anyone seeing it happen,
+    and the next PLAY crawled. Unfocused, the turn goes to the page, which is
+    what the player meant; clicked or tabbed into, the wheel works as before.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
         else:
-            h = min(360, 40 + 32 * min(len(labels), 8))
-        
-        win = ctk.CTkFrame(root, width=w, height=h, fg_color=T.CARD_2, bg_color=T.CARD, border_width=1, border_color=T.BORDER, corner_radius=12)
-        _pick["win"] = win
-        win.pack_propagate(False)
-        win.place(x=x, y=y - h - 4)
-        win.lift()
-        
-        def drag_resize(event):
-            cur_y = (ver_field.winfo_rooty() - root.winfo_rooty()) / _ui_scale
-            mouse_y = (event.y_root - root.winfo_rooty()) / _ui_scale
-            mouse_y = max(24, min(mouse_y, cur_y - 4 - 100))
-            new_h = cur_y - 4 - mouse_y
-            win.configure(height=new_h)
-            win.place(y=mouse_y)
-            
-        def end_drag(event):
-            cur_y = (ver_field.winfo_rooty() - root.winfo_rooty()) / _ui_scale
-            mouse_y = (event.y_root - root.winfo_rooty()) / _ui_scale
-            mouse_y = max(24, min(mouse_y, cur_y - 4 - 100))
-            new_h = cur_y - 4 - mouse_y
-            s2 = load_settings()
-            s2["picker_height"] = new_h
-            save_settings(s2)
-            
-        def update_position(_event=None):
-            if _pick["win"] != win: return
-            try:
-                cur_x = (ver_field.winfo_rootx() - root.winfo_rootx()) / _ui_scale
-                cur_y = (ver_field.winfo_rooty() - root.winfo_rooty()) / _ui_scale
-                cur_h = win.cget("height")
-                win.place(x=cur_x, y=cur_y - int(cur_h) - 4)
-            except Exception:
-                pass
-                
-        _pick["bind_id"] = root.bind("<Configure>", update_position, add="+")
-            
-        grip_container = ctk.CTkFrame(win, width=w - 40, height=18, fg_color="transparent", cursor="sb_v_double_arrow")
-        grip_container.pack(side="top", pady=(2, 0))
-        grip_container.pack_propagate(False)
-        
-        grip = ctk.CTkFrame(grip_container, width=40, height=4, fg_color=T.BORDER, corner_radius=2)
-        grip.place(relx=0.5, rely=0.5, anchor="center")
-        
-        for widget in (grip_container, grip):
-            widget.bind("<B1-Motion>", drag_resize)
-            widget.bind("<ButtonRelease-1>", end_drag)
-            widget.bind("<Button-1>", lambda _event: search.focus_set())
+            event.ignore()
 
-        ver_arrow.configure(text="▴")
 
-        search = ctk.CTkEntry(win, placeholder_text="Filter versions…",
-                               fg_color=T.CARD_3, border_width=0,
-                               text_color=T.FG, corner_radius=8, height=30,
-                               font=font(12))
-        search.pack(fill="x", padx=6, pady=(6, 4))
-        search.focus_set()
+class SettingSpinBox(QSpinBox):
+    """A number field that a wheel turn on the way past leaves alone, as
+    :class:`SettingComboBox`."""
 
-        sf = ctk.CTkScrollableFrame(win, fg_color=T.CARD_2, corner_radius=8)
-        sf.pack(fill="both", expand=True, padx=6, pady=(0, 6))
-        cur = mc_var.get()
-        
-        _pick["no_match"] = ctk.CTkLabel(sf, text="No matches", text_color=T.MUTED, font=font(12))
-        _pick["buttons"] = []
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
+def tool_row(text, cmd, tip=None, danger=False) -> QPushButton:
+    """A full-width, left-aligned action row for Settings ▸ Tools."""
+    return btn(text, cmd, kind="toolrow-danger" if danger else "toolrow", h=44, tip=tip)
+
+
+def card_section(parent_layout, title, desc=None) -> QVBoxLayout:
+    """A titled settings card, mirroring ``_settings_card`` from the Tk GUI."""
+    card = QFrame()
+    card.setObjectName("CardFlat")
+    v = QVBoxLayout(card)
+    v.setContentsMargins(16, 14, 16, 14)
+    v.setSpacing(6)
+    head = QLabel(title)
+    head.setObjectName("Title")
+    head.setStyleSheet("font-size:13px;")
+    v.addWidget(head)
+    if desc:
+        d = QLabel(desc)
+        d.setObjectName("Sub")
+        d.setWordWrap(True)
+        d.setStyleSheet("font-size:11px;")
+        v.addWidget(d)
+    body = QVBoxLayout()
+    body.setSpacing(8)
+    v.addLayout(body)
+    parent_layout.addWidget(card)
+    return body
+
+
+class ToggleSwitch(QAbstractButton):
+    """A painted pill-and-knob switch."""
+
+    def __init__(self, theme: "Theme", parent=None):
+        super().__init__(parent)
+        self._theme = theme
+        self.setCheckable(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(42, 24)
+
+    def set_theme(self, theme: "Theme"):
+        self._theme = theme
+        self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        rect = self.rect().adjusted(1, 1, -1, -1)
+        on = self.isChecked()
+        track = QColor(self._theme.accent if on else self._theme.card3)
+        p.setPen(Qt.NoPen)
+        p.setBrush(track)
+        p.drawRoundedRect(rect, rect.height() / 2, rect.height() / 2)
+        knob_d = rect.height() - 4
+        x = rect.right() - knob_d - 2 if on else rect.left() + 2
+        p.setBrush(QColor("#ffffff"))
+        p.drawEllipse(x, rect.top() + 2, knob_d, knob_d)
+
+
+class SwitchRow(QWidget):
+    """A labelled toggle row used everywhere in Settings."""
+    toggled = Signal(bool)
+
+    def __init__(self, text, checked=False, tip=None, theme: Optional["Theme"] = None):
+        super().__init__()
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        label = QLabel(text)
+        self.label = label
+        lay.addWidget(label)
+        lay.addStretch(1)
+        self.switch = ToggleSwitch(theme or Theme())
+        self.switch.setChecked(checked)
+        self.switch.toggled.connect(self.toggled)
+        lay.addWidget(self.switch)
+        if tip:
+            self.setToolTip(tip)
+            label.setToolTip(tip)
+            self.switch.setToolTip(tip)
+
+    def isChecked(self):
+        return self.switch.isChecked()
+
+
+class _ChipLabel(QLabel):
+    """A chip that is not drawn while it has nothing to say."""
+
+    def setText(self, text):
+        super().setText(text)
+        self.setVisible(bool(str(text).strip()))
+
+
+class Popup(QFrame):
+    """A borderless floating panel positioned relative to an anchor widget."""
+
+    def __init__(self, parent, width=260, height=300):
+        super().__init__(parent, Qt.Popup)
+        self.setObjectName("Popup")
+        self.setFixedSize(width, height)
+        self.setAttribute(Qt.WA_TranslucentBackground, False)
+
+    def show_below(self, anchor: QWidget, gap=4):
+        pos = anchor.mapToGlobal(QPoint(0, anchor.height() + gap))
+        self.move(pos)
+        self.show()
+
+    def show_beside(self, anchor: QWidget, gap=8):
+        """To the right of ``anchor``, bottom edges level, kept on screen:
+        how a menu opens from the foot of the navigation rail."""
+        self.adjustSize()
+        top_left = anchor.mapToGlobal(QPoint(anchor.width() + gap,
+                                             anchor.height() - self.height()))
+        screen = anchor.screen().availableGeometry() if anchor.screen() \
+            else None
+        if screen is not None:
+            top_left.setY(max(screen.top(), min(
+                top_left.y(), screen.bottom() - self.height())))
+        self.move(top_left)
+        self.show()
+
+    def show_above(self, anchor: QWidget, gap=4):
+        pos = anchor.mapToGlobal(QPoint(0, -self.height() - gap))
+        self.move(pos)
+        self.show()
+
+
+# ======================================================================
+# Edition picker
+# ======================================================================
+
+def rounded_pixmap(source, size, radius=None):
+    """``source`` scaled to fill a ``size`` square with rounded corners."""
+    ratio = 2
+    out = QPixmap(size * ratio, size * ratio)
+    out.setDevicePixelRatio(ratio)
+    out.fill(Qt.transparent)
+    scaled = source.scaled(size * ratio, size * ratio,
+                           Qt.KeepAspectRatioByExpanding,
+                           Qt.SmoothTransformation)
+    scaled.setDevicePixelRatio(ratio)
+    painter = QPainter(out)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setRenderHint(QPainter.SmoothPixmapTransform)
+    path = QPainterPath()
+    r = size * 0.22 if radius is None else radius
+    path.addRoundedRect(0, 0, size, size, r, r)
+    painter.setClipPath(path)
+    painter.drawPixmap(QRect(0, 0, size, size), scaled)
+    painter.end()
+    return out
+
+
+def edition_pixmap(logo, size, theme):
+    """An edition's Store logo, rounded; until it is known, a quiet tile
+    with a controller drawn on it."""
+    if logo is not None and not logo.isNull():
+        return rounded_pixmap(logo, size)
+    ratio = 2
+    out = QPixmap(size * ratio, size * ratio)
+    out.setDevicePixelRatio(ratio)
+    out.fill(Qt.transparent)
+    painter = QPainter(out)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(QColor(theme.card3))
+    painter.drawRoundedRect(0, 0, size, size, size * 0.22, size * 0.22)
+    glyph = icons.pixmap("game", theme.sub, int(size * 0.62))
+    offset = (size - int(size * 0.62)) / 2
+    painter.drawPixmap(QPointF(offset, offset), glyph)
+    painter.end()
+    return out
+
+
+def edition_caption(entry):
+    """The second line of an edition in the menu."""
+    if entry.get("id") == "release":
+        return "Minecraft Bedrock"
+    if entry.get("id") == "preview":
+        return "Minecraft Bedrock, beta builds"
+    return entry.get("name") or ""
+
+
+class EditionMenu(Popup):
+    """The editions, one row each with its badge; opens from the dock."""
+
+    def __init__(self, parent, editions, logo_for):
+        super().__init__(parent, width=270, height=12 + 52 * len(editions))
+        self._logo_for = logo_for
+        self.badges = {}
+        self.setObjectName("Popup")
+        v = QVBoxLayout(self)
+        v.setContentsMargins(6, 6, 6, 6)
+        v.setSpacing(2)
+        self.group = QButtonGroup(self)
+        self.group.setExclusive(True)
+        self.buttons = {}
+        for entry in editions:
+            b = QPushButton()
+            b.setObjectName("EditionRow")
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFixedHeight(48)
+            b.setToolTip(entry["name"])
+            # The row draws its own labels; this is its name for screen
+            # readers (and for anything else asking what the row is).
+            b.setAccessibleName(entry.get("short") or entry["name"])
+            row = QHBoxLayout(b)
+            row.setContentsMargins(10, 4, 10, 4)
+            row.setSpacing(10)
+            badge = QLabel()
+            badge.setPixmap(logo_for(entry["id"], 32))
+            badge.setAttribute(Qt.WA_TransparentForMouseEvents)
+            self.badges[entry["id"]] = badge
+            row.addWidget(badge)
+            words = QVBoxLayout()
+            words.setSpacing(0)
+            name = QLabel(entry.get("short") or entry["name"])
+            name.setStyleSheet("font-weight:700;")
+            name.setAttribute(Qt.WA_TransparentForMouseEvents)
+            words.addWidget(name)
+            caption = QLabel(edition_caption(entry))
+            caption.setObjectName("Muted")
+            caption.setAttribute(Qt.WA_TransparentForMouseEvents)
+            words.addWidget(caption)
+            row.addLayout(words, 1)
+            self.group.addButton(b)
+            self.buttons[entry["id"]] = b
+            v.addWidget(b)
+
+    def repaint_logos(self):
+        for edition_id, badge in self.badges.items():
+            badge.setPixmap(self._logo_for(edition_id, 32))
+
+
+# ======================================================================
+# Version picker
+# ======================================================================
+
+class _InstalledMark(QStyledItemDelegate):
+    """Draws "Installed" at the right of the rows that carry the mark (#376).
+
+    The row's text stays the version label alone: it is what a pick is
+    found again by, and what the filter matches.
+    """
+    TEXT = "Installed"
+    ROLE = Qt.UserRole + 1
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        if not index.data(self.ROLE):
+            return
+        theme = getattr(self.parent().window().parent(), "theme", None)
+        painter.save()
+        font = painter.font()
+        font.setPointSizeF(max(7.0, font.pointSizeF() * 0.85))
+        painter.setFont(font)
+        painter.setPen(QColor(getattr(theme, "green", "#43a047")))
+        painter.drawText(option.rect.adjusted(0, 0, -10, 0),
+                         Qt.AlignRight | Qt.AlignVCenter, self.TEXT)
+        painter.restore()
+
+
+class VersionPicker(Popup):
+    picked = Signal(str)
+    refresh_requested = Signal()
+
+    def __init__(self, parent):
+        super().__init__(parent, width=260, height=320)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(8, 8, 8, 8)
+        row = QHBoxLayout()
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Filter versions…")
+        row.addWidget(self.search, 1)
+        self.refresh_btn = btn("↻", lambda: self.refresh_requested.emit(),
+                                kind="ghost", w=28, h=28)
+        # QPushButton's base rule pads 14px each side -- fine for a text
+        # label, but on a fixed 28px box it leaves no room to draw the glyph
+        # at all, so #Ghost's transparent background made this button
+        # invisible rather than merely tight.
+        self.refresh_btn.setStyleSheet("padding: 0px;")
+        self.refresh_btn.setToolTip(
+            "Check Microsoft's build index again — the list is otherwise "
+            "cached for up to 12 hours")
+        row.addWidget(self.refresh_btn)
+        v.addLayout(row)
+        self.list = QListWidget()
+        self.list.setItemDelegate(_InstalledMark(self.list))
+        v.addWidget(self.list)
+        self.search.textChanged.connect(self._filter)
+        self.list.itemClicked.connect(lambda it: self.picked.emit(it.text()))
+
+    def set_labels(self, labels, current, installed=()):
+        """Fill the list; ``installed`` names the labels already on disk."""
+        installed = set(installed)
+        self.list.clear()
         for lab in labels:
-            is_beta = "BETA" in lab
-            c_bg = T.GOLD if is_beta else T.GREEN
-            c_dim = T.GOLD_DIM if is_beta else T.GREEN_DIM
-            
-            row = ctk.CTkButton(
-                sf, text=lab, anchor="w", height=30, corner_radius=6,
-                fg_color=c_dim if lab == cur else "transparent",
-                hover_color=c_dim,
-                text_color=c_bg if lab == cur else T.FG,
-                font=font(12), command=lambda l=lab: set_version(l))
-            if lab != cur:
-                def _enter(_event, r=row, c=c_bg):
-                    r.configure(text_color=c)
+            it = QListWidgetItem(lab)
+            if lab in installed:
+                it.setData(_InstalledMark.ROLE, True)
+                it.setToolTip("Already downloaded: PLAY starts it without "
+                              "downloading anything.")
+            self.list.addItem(it)
+            if lab == current:
+                self.list.setCurrentItem(it)
+        self.search.clear()
 
-                def _leave(_event, r=row):
-                    r.configure(text_color=T.FG)
-                row.bind("<Enter>", _enter, add="+")
-                row.bind("<Leave>", _leave, add="+")
-            _pick["buttons"].append((lab, row))
-            row.pack(fill="x", pady=1)
+    def showEvent(self, e):
+        super().showEvent(e)
+        # A Qt::Popup takes focus itself, so without this the filter field
+        # ignores everything typed until it is clicked.
+        self.search.setFocus(Qt.PopupFocusReason)
 
-        def rebuild(_e=None):
-            q = search.get().strip().lower()
-            shown_any = False
-            for lab, row in _pick["buttons"]:
-                if not q or q in lab.lower():
-                    row.pack(fill="x", pady=1)
-                    shown_any = True
-                else:
-                    row.pack_forget()
-                    
-            if not shown_any:
-                _pick["no_match"].pack(pady=10)
-            else:
-                _pick["no_match"].pack_forget()
-                
-        def on_enter(_e=None):
-            q = search.get().strip().lower()
-            shown = [lab for lab in labels if q in lab.lower()] if q else labels
-            if shown:
-                set_version(shown[0])
-            return "break"
+    def _filter(self, text):
+        text = text.strip().lower()
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            it.setHidden(bool(text) and text not in it.text().lower())
 
-        search.bind("<KeyRelease>", rebuild)
-        search.bind("<Return>", on_enter)
-        search.bind("<Escape>", lambda _event: close_picker())
-        
-        rebuild()
-        # Bind after every row exists so the wheel scrolls the list from
-        # anywhere in the popup, including over a version button.
-        _enable_scrollable_frame_wheel(sf, win)
-        win.bind("<Escape>", lambda _event: close_picker())
-        
-    def global_click(event):
-        w = _pick.get("win")
-        if w is None:
-            return
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key_Return, Qt.Key_Enter):
+            # The highlighted row wins when there is one: arrowing down the
+            # list (or walking it with a controller) and pressing Enter has
+            # to pick what is highlighted, not the first row that survived
+            # the filter.
+            current = self.list.currentItem()
+            if current is not None and not current.isHidden():
+                self.picked.emit(current.text())
+                return
+            for i in range(self.list.count()):
+                it = self.list.item(i)
+                if not it.isHidden():
+                    self.picked.emit(it.text())
+                    return
+        elif e.key() == Qt.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(e)
+
+
+class ProfileMenu(Popup):
+    switch = Signal(object)   # profile path or None for default
+    new_window = Signal(object)
+    create_profile = Signal()
+    manage = Signal()
+
+    def __init__(self, parent):
+        super().__init__(parent, width=260, height=260)
+        self._v = QVBoxLayout(self)
+        self._v.setContentsMargins(6, 6, 6, 6)
+        self._v.setSpacing(2)
+
+    def rebuild(self, profiles, active_path):
+        # setParent(None) as well as deleteLater(): deleteLater only schedules
+        # the destruction, so until the event loop next turns, the old rows are
+        # still children of this popup -- connected to the same signals, and
+        # findable. rebuild() runs immediately before show(), so detaching now
+        # is what makes the menu on screen the menu that was just built.
+        while self._v.count():
+            item = self._v.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+
+        def add_row(name, path, active):
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            b = btn(name, lambda: self.switch.emit(path), kind="ghost", h=30)
+            b.setStyleSheet("text-align:left;" + ("font-weight:700;color:%s;" % "#37b06b" if active else ""))
+            h.addWidget(b, 1)
+            wb = btn("New window", lambda: self.new_window.emit(path),
+                     kind="ghost", h=30,
+                     tip=f"Open {name} in a new window")
+            wb.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+            h.addWidget(wb)
+            self._v.addWidget(row)
+
+        add_row("Default", None, active_path is None)
+        for p in profiles:
+            path = p.get("path")
+            is_active = active_path is not None and str(Path(active_path).resolve()) == str(Path(path).resolve())
+            add_row(p.get("name", ""), path, is_active)
+
+        div = QFrame()
+        div.setFixedHeight(1)
+        div.setStyleSheet("background:#5a6273;")
+        self._v.addWidget(div)
+        self._v.addWidget(btn("+ New Profile…", lambda: self.create_profile.emit(), kind="ghost", h=30))
+        self._v.addWidget(btn("Manage Profiles…", lambda: self.manage.emit(), kind="ghost", h=30))
+        self._v.addStretch(1)
+
+
+
+# ======================================================================
+# Accounts menu
+# ======================================================================
+
+STORE_LINK_EXPLAINER = (
+    "The Microsoft Store hands the game to the account that owns it, over a "
+    "device-bound session the in-game sign-in cannot stand in for. So the "
+    "launcher asks twice, once for each job. Use the same Microsoft account "
+    "for both."
+)
+
+OFFLINE_PLAY_EXPLAINER = (
+    "Minecraft will start, but in offline mode: no Realms, no servers, no "
+    "friends and no Marketplace. Signing in for online play is a separate "
+    "step from the sign-in that downloaded the game — the launcher never "
+    "does it on its own, because playing offline is a legitimate thing to "
+    "want."
+)
+
+
+class AccountRow(QWidget):
+    """One account inside the menu: what it is for, where it stands, and the
+    one thing you can do about it."""
+    acted = Signal()
+
+    def __init__(self, title, purpose, parent=None):
+        super().__init__(parent)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(10, 8, 10, 8)
+        v.setSpacing(2)
+
+        head = QHBoxLayout()
+        head.setSpacing(6)
+        self.dot = QLabel("●")
+        head.addWidget(self.dot)
+        name = QLabel(title)
+        name.setStyleSheet("font-weight:700;")
+        head.addWidget(name)
+        head.addStretch(1)
+        self.button = btn("Sign in", self.acted.emit, kind="ghost", w=92, h=28)
+        head.addWidget(self.button)
+        v.addLayout(head)
+
+        self.status = QLabel("")
+        self.status.setObjectName("Sub")
+        v.addWidget(self.status)
+
+        why = QLabel(purpose)
+        why.setObjectName("Muted")
+        why.setWordWrap(True)
+        why.setStyleSheet("font-size:11px;")
+        v.addWidget(why)
+
+    def show_state(self, dot_color, status, action, danger=False):
+        self.dot.setStyleSheet(f"color:{dot_color};")
+        self.status.setText(status)
+        self.button.setText(action)
+        self.button.setStyleSheet(
+            f"background:{danger}; color:white;" if danger else "")
+
+
+class AccountsMenu(Popup):
+    """Both sign-ins in one place.
+
+    They were in two: the in-game one at the top of the window, the download's
+    buried in Settings, with nothing anywhere saying they were different
+    accounts at all. A player who had signed in once met "you have to sign in"
+    at PLAY with nothing to click.
+
+    Being a Qt::Popup also settles the confirmation problem the top-bar button
+    had. "Sign out?" is a question, and a question left armed on screen is one
+    the next stray click answers; a popup closes on any click outside itself,
+    so hiding is the moment to withdraw it.
+    """
+    xbox = Signal()
+    store = Signal()
+
+    def __init__(self, parent):
+        super().__init__(parent, width=352, height=272)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(2)
+
+        self.online = AccountRow(
+            "Play online",
+            "Friends, servers and Realms, from inside the game.")
+        self.online.acted.connect(self.xbox)
+        v.addWidget(self.online)
+
+        self.divider = QFrame()
+        self.divider.setFixedHeight(1)
+        v.addWidget(self.divider)
+
+        self.download = AccountRow(
+            "Download Minecraft",
+            "Fetches and updates the game from the Microsoft Store.")
+        self.download.acted.connect(self.store)
+        v.addWidget(self.download)
+
+        note = QLabel(STORE_LINK_EXPLAINER)
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        note.setStyleSheet("font-size:10px; padding:6px 10px 0 10px;")
+        v.addWidget(note)
+        v.addStretch(1)
+
+    def set_theme(self, theme: "Theme"):
+        self.divider.setStyleSheet(f"background:{theme.border};")
+
+    def hideEvent(self, event):
+        # Withdraw any armed confirmation with the menu that was asking it.
+        self.parent().disarm_account_confirms()
+        super().hideEvent(event)
+
+
+# ======================================================================
+# Main window
+# ======================================================================
+
+def window_action_for_launch(settings, single_window):
+    if (settings or {}).get("close_on_launch", False):
+        return "close"
+    return "step-aside" if single_window else "stay"
+
+
+class LaunchWorker(QThread):
+    """Runs setup + launch, and tells the UI what to do to its own window
+    (close it, step aside for a single-window session, come back) once the
+    game process actually exists."""
+    done = Signal(object)
+    failed = Signal(str)
+    # Nothing is broken and nothing was downloaded: the game simply has no
+    # account to be fetched with. That is an offer, not a launch failure, so
+    # it is reported apart from failed() rather than being recovered by
+    # matching on the message text.
+    needs_store_signin = Signal(str)
+    # qint64: this is the signal that carries the Minecraft download, and that
+    # package is well past the 2 GiB a Qt `int` holds (#216).
+    progress = Signal("qint64", "qint64")
+    close_window = Signal()
+    step_aside = Signal()
+    come_back = Signal()
+    # What the session left the player to know, said in a dialog rather than
+    # in a log nobody has open when the game closes.
+    session_notice = Signal(str)
+
+    def __init__(self, ver, editor=False, hidden=False):
+        super().__init__()
+        self._ver = ver
+        self._editor = editor
+        self._hidden = hidden
+
+    def run(self):
         try:
-            wx, wy = w.winfo_rootx(), w.winfo_rooty()
-            ww, wh = w.winfo_width(), w.winfo_height()
-            vx, vy = ver_field.winfo_rootx(), ver_field.winfo_rooty()
-            vw, vh = ver_field.winfo_width(), ver_field.winfo_height()
-            mx, my = event.x_root, event.y_root
-            
-            in_w = (wx <= mx <= wx + ww) and (wy <= my <= wy + wh)
-            in_v = (vx <= mx <= vx + vw) and (vy <= my <= vy + vh)
-            
-            if not in_w and not in_v:
-                close_picker()
-        except Exception:
-            pass
+            setup_or_join(self._ver["edition"], self._ver["tag"],
+                          progress=lambda g, t: self.progress.emit(g, t))
+            action = window_action_for_launch(load_settings(), single_window_session())
 
-    root.bind_all("<Button-1>", global_click, add="+")
+            def on_started():
+                if action == "close":
+                    self.close_window.emit()
+                elif action == "step-aside":
+                    self.step_aside.emit()
 
-    ver_field = ctk.CTkFrame(vbox, fg_color=T.CARD_2, bg_color=T.CARD, corner_radius=12,
-                              width=220, height=52)
-    ver_field.pack(anchor="w")
-    ver_field.pack_propagate(False)
-    ver_lbl = ctk.CTkLabel(ver_field, textvariable=mc_var, text_color=T.FG,
-                            font=font(16), anchor="w")
-    ver_lbl.pack(side="left", fill="x", expand=True, padx=(14, 0))
-    ver_arrow = ctk.CTkLabel(ver_field, text="▾", text_color=T.SUB, font=font(16, "bold"))
-    ver_arrow.pack(side="right", padx=(0, 12))
-    Tooltip(ver_field, "Change Version")
+            notices = []
+            try:
+                # Passed only when asked for: a visible launch is the call
+                # it has always been.
+                options = {"hidden": True} if self._hidden else {}
+                launch(on_started=on_started, notices=notices,
+                       editor=self._editor, **options)
+            finally:
+                self.come_back.emit()
+            for notice in notices:
+                self.session_notice.emit(notice)
+            self.done.emit("closed")
+        except Exception as exc:
+            self.come_back.emit()
+            message = str(exc) or type(exc).__name__
+            from .xodus import NotSignedIn
+            if isinstance(exc, NotSignedIn):
+                self.needs_store_signin.emit(message)
+            else:
+                self.failed.emit(message)
 
-    def _ver_hover(on):
-        _pick["hover"] = on
-        if on or _pick["win"] is not None:
-            ver_field.configure(fg_color=T.CARD_3)
-            ver_lbl.configure(text_color=T.THEME_ACCENT)
+
+def _version_edition_id(v):
+    """The edition id of one picker entry, whatever shape it was given in."""
+    edition = (v or {}).get("edition")
+    if isinstance(edition, dict):
+        return edition.get("id") or "release"
+    if isinstance(edition, str) and edition:
+        return edition
+    return "preview" if (v or {}).get("beta") else "release"
+
+
+def _version_label(v):
+    """What the picker shows for one entry.
+
+    A Bedrock build by its shortened number. Another title has one entry,
+    the build the Store serves: its name, and that build's number once it
+    is installed.
+    """
+    edition = v.get("edition")
+    if isinstance(edition, dict) and edition.get("catalogue") == "store":
+        name = edition.get("short") or edition.get("name") or "Minecraft"
+        return f"{name}  ·  {v.get('build') or 'latest'}"
+    # Education follows Bedrock's build numbers, and the label is how a pick
+    # is found again: never the same for two editions.
+    label = format_display_version(v["tag"], v["beta"])
+    if v["beta"]:
+        label += "  ·  BETA"
+    elif _version_edition_id(v) == "education":
+        label += "  ·  EDU"
+    return label
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.settings = load_settings()
+        self.theme = Theme(dark=not self.settings.get("light_theme", False),
+                            beta=self.settings.get("ui_is_beta", False))
+
+        self.ui_state = {
+            "versions": [], "labels": [], "busy": False, "details": False,
+            "launch_active": False, "window_gone": False, "stepped_aside": False,
+        }
+        self._force_close = False
+        # Armed two-step confirmations, read by _online_state /
+        # _store_state. Set here because _build_settings() refreshes the
+        # store row before the accounts menu is wired.
+        self._acct_confirm = False
+        self._store_confirm = False
+        # slot name -> the QThread currently held for it; see _start_worker.
+        self._workers: dict[str, QThread] = {}
+        self.na = NativeAuth()
+        self._switches: list[SwitchRow] = []
+        # Controller navigation (bol.navigation): built once every widget the
+        # ring can land on exists, at the end of __init__.
+        self.nav: Optional[ControllerNav] = None
+        self._nav_devices: tuple = ()
+        self._log_bridge = LogBridge()
+        self._log_bridge.line.connect(self._on_log_line)
+        log._LOG_SINK = lambda m: self._log_bridge.line.emit(m)
+        # See AuthBridge: NativeAuth's callbacks fire on a plain worker
+        # thread with no event loop, so they cannot drive QTimer.singleShot
+        # or touch widgets directly. Route them through a QObject built on
+        # the UI thread instead, whose queued-connection signals land here
+        # safely no matter which thread emits them.
+        self._auth_bridge = AuthBridge()
+        self._auth_bridge.auth.connect(self._on_auth)
+        self._auth_bridge.online.connect(self._on_online)
+        self._auth_bridge.refreshed.connect(self._on_refreshed)
+        self._auth_bridge.refused.connect(self._on_refused)
+
+        self.setWindowTitle(PRETTY)
+        self.resize(1120, 700)
+        self.setMinimumSize(1000, 640)
+
+        self._load_icon()
+
+        root = QWidget()
+        root.setObjectName("Root")
+        self.setCentralWidget(root)
+        frame = QHBoxLayout(root)
+        frame.setContentsMargins(16, 16, 22, 16)
+        frame.setSpacing(16)
+        # The navigation rail: every page one click away, the page shown
+        # lit up. Built before the pages, which the rail only names.
+        frame.addWidget(self._build_rail())
+        outer = QVBoxLayout()
+        outer.setContentsMargins(0, 2, 0, 0)
+        outer.setSpacing(8)
+        frame.addLayout(outer, 1)
+        # Banners (_banner) go here, under the top bar: the root layout is
+        # the rail beside the page, where a banner became a column.
+        self._outer = outer
+
+        outer.addLayout(self._build_topbar())
+
+        self.stack = QStackedWidget()
+        outer.addWidget(self.stack, 1)
+        self.hero_page = self._build_hero()
+        self.settings_page = self._build_settings()
+        self.changelog_page = self._build_changelog()
+        self.profiles_page = self._build_profiles_page()
+        # Built the first time they are opened: most sessions never do.
+        self.mods_page = None
+        self.content_page = None
+        self.stack.addWidget(self.hero_page)
+        self.stack.addWidget(self.settings_page)
+        self.stack.addWidget(self.changelog_page)
+        self.stack.addWidget(self.profiles_page)
+        self.stack.setCurrentWidget(self.hero_page)
+        self.stack.currentChanged.connect(lambda _: self._sync_rail())
+        self._sync_rail()
+
+        self.status_row = self._build_status_row()
+        outer.addLayout(self.status_row)
+
+        outer.addWidget(self._build_dock())
+
+        self.log_drawer = self._build_log_drawer()
+        outer.addWidget(self.log_drawer)
+        self.log_drawer.hide()
+
+        self.apply_theme()
+        self._wire_version_picker()
+        self._wire_profile_menu()
+        self._wire_accounts_menu()
+        self._refresh_account_row("in" if msa_signed_in() else "out")
+
+        self._changelog_loaded = False
+
+        # Nothing connects by itself until the player has seen what the
+        # launcher contacts and said how updates are checked (bol.netpolicy).
+        self._network_started = False
+        if netpolicy.decided(self.settings):
+            self._start_network()
         else:
-            ver_field.configure(fg_color=T.CARD_2)
-            ver_lbl.configure(text_color=T.FG)
-            
-    for _w in (ver_field, ver_lbl, ver_arrow):
-        _w.bind("<Enter>", lambda _event: _ver_hover(True))
-        _w.bind("<Leave>", lambda _event: _ver_hover(False))
-        _w.bind("<Button-1>", lambda _event: open_picker())
+            QTimer.singleShot(0, self._show_network_notice)
+        # Three seconds on screen is a launcher that starts: the one an
+        # update replaced is no longer needed (bol.rollback).
+        QTimer.singleShot(3000, rollback.confirm)
+        QTimer.singleShot(0, self._report_rollback)
 
-    rbox = ctk.CTkFrame(bar, fg_color="transparent")
-    rbox.pack(side="right")
-    
-    hbox = ctk.CTkFrame(rbox, fg_color="transparent")
-    hbox.pack(fill="x")
+        if self.settings.get("show_changelog_on_startup", False):
+            QTimer.singleShot(0, self.toggle_changelog)
 
-    play_btn = mkbtn(hbox, "  PLAY", lambda: do_play(), kind="play",
-                      width=110, height=52, corner_radius=12,
-                      font=font(16, "bold"), text_color=T.FG)
-    play_btn.configure(anchor="center")
-    play_btn._is_play_btn = True
-    import warnings
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        play_btn._img_norm = _create_play_icon(16, T.FG, T.THEME_ACCENT)
-        play_btn.configure(image=play_btn._img_norm, fg_color=T.THEME_ACCENT, hover_color=T.THEME_ACCENT)
-    play_btn.pack(side="right")
-    play_btn._tooltip = Tooltip(play_btn, "Play Game")
+        # BOL_CONTROLLER=0 turns navigation off for one session without
+        # touching the saved setting.
+        if (self.settings.get("controller_nav", True)
+                and os.environ.get("BOL_CONTROLLER") != "0"):
+            self.apply_controller_nav(True)
 
-    settings_btn = mkbtn(hbox, "⛭", lambda: toggle_settings(), kind="ghost",
-                          width=52, height=52, corner_radius=12, font=font(36))
-    settings_btn.pack(side="right", padx=(0, 8))
-    Tooltip(settings_btn, "Settings")
+    def _start_worker(self, slot, worker) -> bool:
+        """Start `worker`, holding the only reference the GUI thread keeps.
 
-    det_btn = mkbtn(hbox, "Details", lambda: toggle_details(), kind="ghost",
-                     width=70, height=52, corner_radius=12, font=font(16))
-    det_btn.pack(side="right", padx=(0, 8))
-    Tooltip(det_btn, "Show Activity Logs")
+        A QThread whose last Python reference goes away is destroyed by the
+        C++ side while it is still running, which Qt reports as "QThread:
+        Destroyed while thread is still running" and then aborts on. Every
+        background job here was stored in a plain attribute, so triggering
+        the same action twice -- two clicks on Import, a quick Stable/Preview
+        toggle -- overwrote a running thread with its successor.
 
-    detwrap = ctk.CTkFrame(dock, fg_color=T.CARD_2, corner_radius=12, height=220)
-    detwrap.pack_propagate(False)
-    log_head = ctk.CTkFrame(detwrap, fg_color="transparent")
-    log_head.pack(fill="x", padx=10, pady=(8, 0))
-    ctk.CTkLabel(log_head, text="ACTIVITY LOG", text_color=T.MUTED,
-                 font=font(10, "bold")).pack(side="left")
+        Slots are never emptied, only replaced once idle: dropping the
+        reference from finished() would put it back in the same race it
+        exists to prevent. Returns False when the slot is still busy, which
+        is also how repeat clicks are refused.
+        """
+        previous = self._workers.get(slot)
+        if previous is not None and previous.isRunning():
+            return False
+        self._workers[slot] = worker
+        worker.start()
+        return True
 
-    logbox = tk.Text(detwrap, height=10, bg=T.r(T.CONSOLE_BG), fg=T.r(T.CONSOLE_FG), bd=0,
-                      font=(MONO, 10), highlightthickness=0,
-                      padx=12, pady=10, insertbackground=T.r(T.FG), wrap="word")
-    logbox._is_logbox = True
+    def _release_workers(self) -> None:
+        """Let the window go without taking a running thread with it.
 
-    def clear_log():
-        logbox.delete("1.0", "end")
+        `_workers` holds the only reference to each background job, so it
+        dies with the window -- and a QThread destroyed while it is still
+        running aborts the process. The close path cannot wait for them
+        either: the changelog fetch and the update check are network reads.
+        Still-running workers are parked instead and drop themselves when
+        they are genuinely done. The launch worker included: closing the
+        window when Minecraft starts is a feature, and it is what supervises
+        the session afterwards.
+        """
+        # The report window owns two threads of its own and waits for them
+        # when it closes: close it before the window that parents it goes.
+        report_dialog = getattr(self, "_report_dialog", None)
+        if report_dialog is not None and _alive(report_dialog):
+            report_dialog.done(0)
+        for worker in self._workers.values():
+            if worker is not None and worker.isRunning():
+                _park_worker(worker)
+        self._workers.clear()
 
-    def copy_log():
-        root.clipboard_clear()
-        root.clipboard_append(logbox.get("1.0", "end-1c"))
-        copy_log_btn.configure(text="Copied ✓")
-        root.after(1200, lambda: copy_log_btn.configure(text="Copy"))
+    # ------------------------------------------------------------ icon
+    def _load_icon(self):
+        for candidate in icon_candidates():
+            if candidate.exists():
+                self.icon_pixmap = QPixmap(str(candidate))
+                self.setWindowIcon(QIcon(self.icon_pixmap))
+                return
+        self.icon_pixmap = None
 
-    copy_log_btn = mkbtn(log_head, "Copy", copy_log, kind="flat",
-                          width=56, height=24, font=font(11))
-    copy_log_btn.pack(side="right")
-    mkbtn(log_head, "Clear", clear_log, kind="flat",
-          width=52, height=24, font=font(11)).pack(side="right", padx=(0, 4))
+    # ------------------------------------------------------------ theme
+    def _switch(self, text, checked=False, tip=None) -> SwitchRow:
+        """Themed toggle row; tracked so a later theme change repaints it."""
+        row = SwitchRow(text, checked, tip, theme=self.theme)
+        self._switches.append(row)
+        return row
 
-    logbox.pack(fill="both", expand=True, padx=10, pady=(6, 10))
-    for _tg, (_lbl, _a1, _a2, _lc, _mc) in _LEVELS.items():
-        _nm = _lbl.strip()
-        logbox.tag_configure("L_" + _nm, foreground=_lc,
-                              font=(MONO, 10, "bold"))
-        logbox.tag_configure("M_" + _nm, foreground=_mc)
+    def apply_theme(self):
+        self.theme.beta = self.settings.get("ui_is_beta", False)
+        self.theme.dark = not self.settings.get("light_theme", False)
+        QApplication.instance().setStyleSheet(self.theme.qss())
+        self._paint_edition_toggle()
+        for row in getattr(self, "_switches", ()):
+            row.switch.set_theme(self.theme)
+        if getattr(self, "rail_buttons", None):
+            self._paint_rail_icons()
+        if getattr(self, "edition_menu", None) is not None:
+            self.edition_menu.repaint_logos()
+            self._paint_edition_field(self._checked_edition_id())
+        if getattr(self, "nav", None) is not None:
+            self.nav.set_accent(self.theme.accent)
+        if getattr(self, "mods_page", None) is not None and \
+                self.stack.currentWidget() is self.mods_page:
+            self.mods_page.refresh_builds()
+        if _alive(getattr(self, "accounts_menu", None)):
+            self.accounts_menu.set_theme(self.theme)
+            self._refresh_accounts()
 
-    def toggle_details():
-        ui["details"] = not ui["details"]
-        if ui["details"]:
-            h = int(detwrap.cget("height"))
-            root.minsize(860, 640 + h)
-            for _w in (status, status_lbl, prog):
-                try: _w.configure(cursor="sb_v_double_arrow")
-                except: pass
-            try: prog._canvas.configure(cursor="sb_v_double_arrow")
-            except: pass
-            detwrap.pack(fill="both", padx=14, pady=(0, 14))
-            det_btn.configure(text_color=T.FG, fg_color=T.CARD_3)
+    # ------------------------------------------------------------ top bar
+    RAIL_WIDE = 212
+    RAIL_NARROW = 64
+
+    def _build_rail(self) -> QFrame:
+        rail = QFrame(); rail.setObjectName("Rail")
+        self.rail = rail
+        v = QVBoxLayout(rail)
+        v.setContentsMargins(10, 12, 10, 12)
+        v.setSpacing(4)
+
+        brand = QHBoxLayout(); brand.setSpacing(8)
+        self._rail_brand_row = brand
+        icon_lbl = QLabel()
+        if self.icon_pixmap:
+            icon_lbl.setPixmap(self.icon_pixmap.scaled(
+                30, 30, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        icon_lbl.setToolTip(PRETTY)
+        brand.addWidget(icon_lbl)
+        self.rail_brand = QLabel("BedrockOnLinux"); self.rail_brand.setObjectName("Brand")
+        brand.addWidget(self.rail_brand, 1)
+        # Folds the rail down to its icons, and back; remembered. A small
+        # chevron beside the name; folded, it sits under the icon.
+        self.rail_fold = QPushButton("‹")
+        self.rail_fold.setObjectName("FoldBtn")
+        self.rail_fold.setCursor(Qt.PointingHandCursor)
+        self.rail_fold.setFixedSize(24, 24)
+        self.rail_fold.setToolTip("Fold the menu to its icons")
+        self.rail_fold.clicked.connect(lambda: self.set_rail_collapsed(True))
+        brand.addWidget(self.rail_fold)
+        v.addLayout(brand)
+        self.rail_unfold = QPushButton("›")
+        self.rail_unfold.setObjectName("FoldBtn")
+        self.rail_unfold.setCursor(Qt.PointingHandCursor)
+        self.rail_unfold.setFixedSize(24, 24)
+        self.rail_unfold.setToolTip("Show the menu's names")
+        self.rail_unfold.clicked.connect(lambda: self.set_rail_collapsed(False))
+        v.addWidget(self.rail_unfold, 0, Qt.AlignHCenter)
+        v.addSpacing(10)
+
+        self.rail_group = QButtonGroup(self)
+        self.rail_group.setExclusive(True)
+        self.rail_buttons = {}
+        self._rail_texts = {}
+
+        def item(key, icon_name, text, slot, tip):
+            b = QPushButton()
+            b.setObjectName("NavItem")
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFixedHeight(38)
+            b.setToolTip(tip)
+            b.clicked.connect(lambda _=False: slot())
+            self.rail_group.addButton(b)
+            self.rail_buttons[key] = b
+            b.setIconSize(QSize(20, 20))
+            self._rail_texts[key] = (icon_name, text)
+            v.addWidget(b)
+            return b
+
+        item("home", "home", "Play", self.go_home, "Choose a version and play")
+        item("content", "addons", "Add-ons && Maps", self.open_content,
+             "Add-ons, maps, texture packs and skins from MCPEDL and "
+             "CurseForge")
+        # Kept under its old name: the Mods page was a pill of the top bar.
+        self.mods_card = item("mods", "mods", "Mods", self.open_mods,
+                              "LeviLamina mods: browse, install, import")
+        item("profiles", "profiles", "Profiles", self.open_profiles,
+             "Separate sign-ins, worlds and settings")
+        item("settings", "settings", "Settings", self.open_settings,
+             "Launcher and game settings")
+        item("changelog", "news", "What's New", self.open_changelog,
+             "What changed in each version")
+        v.addStretch(1)
+
+        # Who plays: the profile and the accounts, at the foot of the rail.
+        self.prof_card = QFrame(); self.prof_card.setObjectName("Pill")
+        self.prof_card.setCursor(Qt.PointingHandCursor)
+        pl = QHBoxLayout(self.prof_card); pl.setContentsMargins(10, 6, 8, 6)
+        pl.setSpacing(8)
+        self.prof_icon = QLabel()
+        pl.addWidget(self.prof_icon)
+        self.prof_label = QLabel(current_profile_name())
+        self.prof_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        pl.addWidget(self.prof_label, 1)
+        self.prof_arrow = QLabel("▸")
+        pl.addWidget(self.prof_arrow)
+        self.prof_card.mousePressEvent = lambda e: self.open_profile_menu()
+        v.addWidget(self.prof_card)
+
+        self.acct_card = QFrame(); self.acct_card.setObjectName("Pill")
+        self.acct_card.setCursor(Qt.PointingHandCursor)
+        al = QHBoxLayout(self.acct_card); al.setContentsMargins(10, 6, 8, 6)
+        al.setSpacing(8)
+        self.acct_dot = QLabel("●")
+        al.addWidget(self.acct_dot)
+        self.acct_text = QLabel("Sign in")
+        self.acct_text.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        al.addWidget(self.acct_text, 1)
+        self.acct_arrow = QLabel("▸")
+        al.addWidget(self.acct_arrow)
+        self.acct_card.mousePressEvent = lambda e: self.open_accounts_menu()
+        v.addWidget(self.acct_card)
+        v.addSpacing(4)
+
+        self.rail_foot = QWidget()
+        foot = QHBoxLayout(self.rail_foot); foot.setContentsMargins(4, 0, 0, 0)
+        ver_lbl = QLabel(f"v{VERSION}"); ver_lbl.setObjectName("Muted")
+        foot.addWidget(ver_lbl)
+        foot.addStretch(1)
+        foot.addWidget(btn("Report", self.open_report, kind="ghost-small",
+                           h=24, tip="Report a problem: send what is needed "
+                                     "to diagnose it, with nothing personal "
+                                     "in it"))
+        foot.addWidget(btn("GitHub", self._open_github, kind="ghost-small",
+                           h=24))
+        v.addWidget(self.rail_foot)
+        self.set_rail_collapsed(self.settings.get("rail_collapsed", False),
+                                save=False)
+        return rail
+
+    # Below this width the rail folds by itself, whatever was chosen: the
+    # dock's five edition toggles and PLAY need the room.
+    RAIL_AUTO_FOLD = 1120
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if getattr(self, "rail", None) is not None:
+            folded = self.rail.width() == self.RAIL_NARROW
+            if folded != self._rail_folded():
+                self._paint_rail()
+
+    def _rail_folded(self):
+        return bool(self.settings.get("rail_collapsed", False)) or \
+            self.width() < self.RAIL_AUTO_FOLD
+
+    def set_rail_collapsed(self, collapsed, save=True):
+        """Fold the rail to its icons, or open it to their names; the
+        choice is remembered."""
+        collapsed = bool(collapsed)
+        if save and self.settings.get("rail_collapsed", False) != collapsed:
+            self.settings = load_settings()
+            self.settings["rail_collapsed"] = collapsed
+            save_settings(self.settings)
+        self.settings["rail_collapsed"] = collapsed
+        self._paint_rail()
+
+    def _paint_rail_icons(self):
+        """Tint the menu's and the home tiles' icons for the theme."""
+        t = self.theme
+        for key, b in self.rail_buttons.items():
+            b.setIcon(icons.toggle_icon(self._rail_texts[key][0], t.sub,
+                                        t.fg, t.accent))
+        self.prof_icon.setPixmap(icons.pixmap("user", t.sub, 18))
+        for label, name in getattr(self, "_tile_icons", ()):
+            label.setPixmap(icons.pixmap(name, t.accent, 22))
+
+    def _paint_rail(self):
+        collapsed = self._rail_folded()
+        self.rail.setFixedWidth(self.RAIL_NARROW if collapsed
+                                else self.RAIL_WIDE)
+        for key, b in self.rail_buttons.items():
+            _icon, text = self._rail_texts[key]
+            b.setText("" if collapsed else f"  {text}")
+            b.setToolTip(text.replace("&&", "&") if collapsed
+                         else b.toolTip())
+            b.setStyleSheet("text-align:center; padding:0;"
+                            if collapsed else "")
+        self._paint_rail_icons()
+        self.rail_fold.setVisible(not collapsed)
+        self.rail_unfold.setVisible(collapsed)
+        self._rail_brand_row.setAlignment(Qt.AlignHCenter if collapsed
+                                          else Qt.Alignment())
+        self.rail_brand.setVisible(not collapsed)
+        self.rail_foot.setVisible(not collapsed)
+        for widget in (self.prof_label, self.prof_arrow, self.acct_text,
+                       self.acct_arrow):
+            widget.setVisible(not collapsed)
+        for card in (self.prof_card, self.acct_card):
+            card.layout().setContentsMargins(*((0, 6, 0, 6) if collapsed
+                                               else (10, 6, 8, 6)))
+            card.setFixedHeight(38 if collapsed else 34)
+        for icon in (self.prof_icon, self.acct_dot):
+            icon.setAlignment(Qt.AlignCenter)
+            icon.setSizePolicy(QSizePolicy.Expanding if collapsed
+                               else QSizePolicy.Fixed, QSizePolicy.Preferred)
+
+        self.prof_card.setToolTip(f"Profile: {current_profile_name()}")
+        # Too narrow to unfold: the button says why instead of doing nothing.
+        narrow = self.width() < self.RAIL_AUTO_FOLD
+        self.rail_unfold.setEnabled(not narrow)
+        self.rail_unfold.setToolTip("Widen the window to show the menu's "
+                                    "names" if narrow
+                                    else "Show the menu's names")
+
+    # Page name shown above it, by page.
+    _PAGE_TITLES = {
+        "home": "Play", "content": "Add-ons & Maps", "mods": "Mods",
+        "profiles": "Profiles", "settings": "Settings",
+        "changelog": "What's New",
+    }
+
+    def _page_key(self, page=None):
+        page = self.stack.currentWidget() if page is None else page
+        for key, attr in (("home", "hero_page"), ("content", "content_page"),
+                          ("mods", "mods_page"), ("profiles", "profiles_page"),
+                          ("settings", "settings_page"),
+                          ("changelog", "changelog_page")):
+            if page is not None and page is getattr(self, attr, None):
+                return key
+        return "home"
+
+    def _sync_rail(self):
+        """Light up the rail item of the page now shown, and name it."""
+        key = self._page_key()
+        button = getattr(self, "rail_buttons", {}).get(key)
+        if button is not None and not button.isChecked():
+            button.setChecked(True)
+        if getattr(self, "page_title", None) is not None:
+            self.page_title.setText(self._PAGE_TITLES.get(key, ""))
+
+    def _show_page(self, page, entered=None):
+        self.stack.setCurrentWidget(page)
+        self._nav_follow_page(entered)
+
+    def go_home(self):
+        self._show_page(self.hero_page)
+
+    def open_settings(self):
+        if self.stack.currentWidget() is not self.settings_page:
+            self.toggle_settings()
+
+    def open_changelog(self):
+        if self.stack.currentWidget() is not self.changelog_page:
+            self.toggle_changelog()
+
+    def open_profiles(self):
+        if self.stack.currentWidget() is not self.profiles_page:
+            self.toggle_profiles()
+
+    def open_mods(self):
+        if self.mods_page is None or \
+                self.stack.currentWidget() is not self.mods_page:
+            self.toggle_mods()
+
+    def open_content(self, kind=None, query=None, slug=None):
+        """Show the Add-ons & Maps page, optionally on a kind, a search or
+        one project's page."""
+        if self.content_page is None:
+            # Imported with the page: most sessions never open it.
+            from .gui_content import ContentPage
+            self.content_page = ContentPage(self)
+            self.stack.addWidget(self.content_page)
+        if self.stack.currentWidget() is not self.content_page:
+            self.stack.setCurrentWidget(self.content_page)
+            self.content_page.opened()
+            self._nav_follow_page(self.content_page)
+        if kind:
+            self.content_page.show_kind(kind)
+        if query:
+            self.content_page.search_for(query)
+        if slug:
+            self.content_page.open_slug(slug)
+
+    def toggle_content(self):
+        if self.content_page is not None and \
+                self.stack.currentWidget() is self.content_page:
+            self.go_home()
         else:
-            root.minsize(860, 640)
-            for _w in (status, status_lbl, prog):
-                try: _w.configure(cursor="")
-                except: pass
-            try: prog._canvas.configure(cursor="")
-            except: pass
-            detwrap.pack_forget()
-            det_btn.configure(text_color=T.FG, fg_color=T.CARD_2)
+            self.open_content()
 
-    def set_status(t, color=T.SUB):
-        root.after(0, lambda: (status_txt.set(t),
-                                status_lbl.configure(text_color=color)))
+    def _build_topbar(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        self.page_title = QLabel("Play"); self.page_title.setObjectName("PageTitle")
+        row.addWidget(self.page_title)
+        row.addStretch(1)
+        return row
 
-    def _show_bar():
-        if not prog.winfo_ismapped():
-            prog.pack(fill="x", pady=(8, 2))
+    def _open_github(self):
+        subprocess.Popen(["xdg-open", "https://github.com/Wyze3306/BedrockOnLinux"],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    def bar_busy():
-        def ap():
-            _show_bar()
-            prog.configure(mode="indeterminate")
-            prog.start()
-        root.after(0, ap)
+    # ------------------------------------------------------------ hero
+    def _build_hero(self) -> QWidget:
+        page = QWidget()
+        col = QVBoxLayout(page)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(12)
 
-    def set_progress(g, t):
-        def ap():
-            _show_bar()
-            prog.stop()
-            prog.configure(mode="determinate")
-            prog.set(g / max(1, t))
-            status_txt.set(f"Downloading Minecraft…  {int(100 * g / max(1, t))}%")
-            status_lbl.configure(text_color=T.FG)
-        root.after(0, ap)
+        card = QFrame(); card.setObjectName("Card")
+        h = QHBoxLayout(card)
+        h.setContentsMargins(26, 22, 22, 22)
+        h.setSpacing(22)
+        # The edition chosen next to PLAY: its Store logo and its name.
+        self.hero_icon = QLabel()
+        self.hero_icon.setFixedSize(104, 104)
+        if self.icon_pixmap:
+            self.hero_icon.setPixmap(self.icon_pixmap.scaled(104, 104, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        h.addWidget(self.hero_icon, 0, Qt.AlignVCenter)
+        titles = QVBoxLayout(); titles.setSpacing(4)
+        titles.addStretch(1)
+        self.hero_title = QLabel("Minecraft Bedrock"); self.hero_title.setObjectName("Hero")
+        titles.addWidget(self.hero_title)
+        self.hero_sub = QLabel("Bedrock Edition for Linux"); self.hero_sub.setObjectName("Sub")
+        titles.addWidget(self.hero_sub)
+        self.selected_chip = _ChipLabel(); self.selected_chip.setObjectName("Chip")
+        self.selected_chip.setText("")
+        titles.addWidget(self.selected_chip, 0, Qt.AlignLeft)
+        titles.addStretch(1)
+        h.addLayout(titles, 1)
 
-    def end_progress():
-        def ap():
-            prog.stop()
-            prog.pack_forget()
-        root.after(0, ap)
+        tiles = QGridLayout(); tiles.setSpacing(10)
+        self._tile_icons = []
+        for index, (glyph, name, hint, slot) in enumerate((
+                ("addons", "Add-ons & Maps", "MCPEDL · CurseForge",
+                 self.open_content),
+                ("mods", "Mods", "LeviLamina", self.open_mods),
+                ("import", "Import a file", ".mcpack · .mcworld · .mcaddon",
+                 self._import_from_home),
+                ("folder", "Worlds & packs", "Open the game folder",
+                 lambda: self._open_folder(game_content_dir())))):
+            tiles.addWidget(self._home_tile(glyph, name, hint, slot),
+                            index // 2, index % 2)
+        h.addLayout(tiles)
+        col.addWidget(card, 1)
 
-    def _friendly(line):
-        m = line
-        for tag in ("::", "OK", "!!", "xx"):
-            if m.startswith(tag):
-                m = m[len(tag):].strip()
-                break
-        low = m.lower()
-        if "downloading minecraft" in low:
-            return None
-        if ("building winegdk" in low or "cloning winegdk" in low
-                or "updating winegdk" in low):
-            return ("Setting up the game engine — first run, "
-                    "this can take a while…")
-        if "installing minecraft" in low or "reinstalling minecraft" in low:
-            return "Installing Minecraft…"
-        if "preparing gdk-proton" in low or "extracting" in low:
-            return "Preparing the engine…"
-        if "pre-auth" in low or "signing in" in low:
-            return "Signing in to Xbox Live…"
+        from .gui_content import FeaturedShelf  # noqa: PLC0415
+        self.featured = FeaturedShelf(self)
+        # The banner gives way first; the shelf keeps the height its cards
+        # need.
+        col.addWidget(self.featured, 2)
+        # Loaded by _start_network, once the first-run notice is answered.
+        if not self.settings.get("home_featured", True):
+            self.featured.hide()
+        return page
+
+    def _home_tile(self, glyph, name, hint, slot) -> QFrame:
+        tile = QFrame(); tile.setObjectName("Tile")
+        tile.setCursor(Qt.PointingHandCursor)
+        tile.setFixedSize(210, 64)
+        tile.setToolTip(name)
+        t = QHBoxLayout(tile); t.setContentsMargins(14, 8, 12, 8); t.setSpacing(10)
+        icon = QLabel(); icon.setFixedSize(22, 22)
+        icon.setPixmap(icons.pixmap(glyph, self.theme.accent, 22))
+        self._tile_icons.append((icon, glyph))
+        t.addWidget(icon)
+        words = QVBoxLayout(); words.setSpacing(0)
+        label = QLabel(name); label.setStyleSheet("font-weight:700;")
+        words.addWidget(label)
+        note = QLabel(hint); note.setObjectName("Muted")
+        words.addWidget(note)
+        t.addLayout(words, 1)
+        tile.mousePressEvent = lambda e: slot() if e.button() == Qt.LeftButton else None
+        return tile
+
+    def _save_home_featured(self, on):
+        self._save_setting("home_featured", on)
+        self.featured.setVisible(on)
+        if on and not self.featured.shelves:
+            self.featured.load()
+
+    def _import_from_home(self):
+        self.open_content()
+        self.content_page.import_files()
+
+    # ------------------------------------------------------------ status row
+    def _build_status_row(self) -> QVBoxLayout:
+        col = QVBoxLayout()
+        line = QHBoxLayout()
+        self.status_label = QLabel("Ready to play.")
+        self.status_label.setObjectName("Sub")
+        line.addWidget(self.status_label)
+        line.addStretch(1)
+        # Which button does what, shown only while a controller is connected.
+        # The names are spelled out rather than drawn as circled glyphs: the
+        # Ⓐ/Ⓑ characters are missing from most Linux default fonts and would
+        # come out as boxes.
+        self.nav_legend = QLabel()
+        self.nav_legend.setObjectName("Muted")
+        self.nav_legend.setTextFormat(Qt.RichText)
+        self.nav_legend.hide()
+        line.addWidget(self.nav_legend)
+        col.addLayout(line)
+        self.progress = QProgressBar()
+        self.progress.setTextVisible(False)
+        self.progress.hide()
+        col.addWidget(self.progress)
+        return col
+
+    # ------------------------------------------------------------ dock
+    def _build_dock(self) -> QFrame:
+        dock = QFrame(); dock.setObjectName("Card")
+        h = QHBoxLayout(dock)
+        h.setContentsMargins(16, 14, 16, 14)
+
+        # Edition: one pill, its badge and name; the menu lists them all.
+        editions = list_editions(include_beta=True)
+        self.edition_field = QFrame(); self.edition_field.setObjectName("PillOnCard")
+        self.edition_field.setFixedHeight(52)
+        self.edition_field.setMinimumWidth(150)
+        self.edition_field.setCursor(Qt.PointingHandCursor)
+        self.edition_field.setToolTip("Choose the game or edition")
+        efl = QHBoxLayout(self.edition_field)
+        efl.setContentsMargins(10, 0, 12, 0); efl.setSpacing(10)
+        self.edition_badge = QLabel()
+        efl.addWidget(self.edition_badge)
+        self.edition_name = QLabel("")
+        self.edition_name.setStyleSheet("font-weight:700;")
+        efl.addWidget(self.edition_name, 1)
+        efl.addWidget(QLabel("▾"))
+        self.edition_field.mousePressEvent = lambda e: self.open_edition_menu()
+        h.addWidget(self.edition_field)
+
+        self._edition_logos = {}
+        self.edition_menu = EditionMenu(self, editions, self.edition_logo)
+        self.edition_group = self.edition_menu.group
+        self.edition_buttons = self.edition_menu.buttons
+        self._edition_entries = {e["id"]: e for e in editions}
+        for edition_id, b in self.edition_buttons.items():
+            b.clicked.connect(
+                lambda _checked=False, eid=edition_id: self._pick_edition(eid))
+            b.toggled.connect(
+                lambda on, eid=edition_id: on and self._paint_edition_field(eid))
+        self.stable_btn = self.edition_buttons["release"]
+        self.preview_btn = self.edition_buttons["preview"]
+        self.education_btn = self.edition_buttons.get("education")
+
+        # Version field
+        self.ver_field = QFrame(); self.ver_field.setObjectName("PillOnCard")
+        self.ver_field.setFixedSize(196, 52)
+        self.ver_field.setCursor(Qt.PointingHandCursor)
+        vfl = QHBoxLayout(self.ver_field); vfl.setContentsMargins(14, 0, 12, 0)
+        self.ver_label = QLabel("Loading…")
+        vfl.addWidget(self.ver_label, 1)
+        vfl.addWidget(QLabel("▾"))
+        self.ver_field.mousePressEvent = lambda e: self.open_picker()
+        h.addWidget(self.ver_field)
+
+        h.addStretch(1)
+
+        self.details_btn = btn("Details", self.toggle_details, kind="ghost", w=76, h=52,
+                                tip="Show Activity Logs")
+        h.addWidget(self.details_btn)
+        self.play_btn = btn("▶  PLAY", self.do_play, kind="play", w=120, h=52, tip="Play Game")
+        h.addWidget(self.play_btn)
+
+        edition_id = self.settings.get("ui_edition")
+        if edition_id not in self.edition_buttons:
+            edition_id = ("preview" if self.settings.get("show_betas", False)
+                          else "release")
+        self.edition_buttons[edition_id].setChecked(True)
+        return dock
+
+    def _paint_edition_toggle(self):
+        pass  # QSS handles the checked-state colouring via #EditionRow:checked
+
+    # What the home banner calls each edition.
+    _HERO_NAMES = {
+        "release": ("Minecraft Bedrock", "Bedrock Edition for Linux"),
+        "preview": ("Minecraft Preview", "Bedrock's beta builds, on Linux"),
+    }
+
+    def edition_logo(self, edition_id, size):
+        return edition_pixmap(self._edition_logos.get(edition_id), size,
+                              self.theme)
+
+    def _load_edition_logos(self):
+        from . import storeart  # noqa: PLC0415 - network, worker only
+        editions = list(self._edition_entries.values())
+        worker = Worker(lambda: storeart.logos(editions))
+        worker.done.connect(self._edition_logos_loaded)
+        self._start_worker("edition-logos", worker)
+
+    def _edition_logos_loaded(self, logos):
+        for edition_id, data in (logos or {}).items():
+            pixmap = QPixmap()
+            if pixmap.loadFromData(data):
+                self._edition_logos[edition_id] = pixmap
+        self.edition_menu.repaint_logos()
+        self._paint_edition_field(self._checked_edition_id())
+
+    def _paint_edition_field(self, edition_id):
+        entry = self._edition_entries.get(edition_id) or {}
+        self.edition_badge.setPixmap(self.edition_logo(edition_id, 30))
+        self.edition_name.setText(entry.get("short") or entry.get("name")
+                                  or edition_id)
+        if getattr(self, "hero_title", None) is None:
+            return
+        name = entry.get("name") or "Minecraft"
+        for suffix in (" for Windows", " - Windows"):
+            name = name.replace(suffix, "")
+        title, sub = self._HERO_NAMES.get(edition_id, (name, "On Linux"))
+        self.hero_title.setText(title)
+        self.hero_sub.setText(sub)
+        logo = self._edition_logos.get(edition_id)
+        if logo is not None:
+            self.hero_icon.setPixmap(rounded_pixmap(logo, 104, 22))
+        elif self.icon_pixmap:
+            self.hero_icon.setPixmap(self.icon_pixmap.scaled(
+                104, 104, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def open_edition_menu(self):
+        self.edition_menu.show_above(self.edition_field, gap=8)
+
+    def _pick_edition(self, edition_id):
+        self.edition_menu.close()
+        self.select_edition(edition_id)
+
+    # ------------------------------------------------------------ log drawer
+    def _build_log_drawer(self) -> QFrame:
+        wrap = QFrame(); wrap.setObjectName("ActivityLog")
+        wrap.setFixedHeight(220)
+        v = QVBoxLayout(wrap)
+        head = QHBoxLayout()
+        lab = QLabel("ACTIVITY LOG"); lab.setObjectName("Muted")
+        head.addWidget(lab)
+        head.addStretch(1)
+        head.addWidget(btn("Clear", lambda: self.log_view.clear(), kind="flat",
+                            w=64, h=24, tip="Empty the activity log"))
+        # Wide enough for "Copied ✓", which replaces the label on click.
+        self.copy_log_btn = btn("Copy", self._copy_log, kind="flat", w=84, h=24,
+                                 tip="Copy the whole log, for a bug report")
+        head.addWidget(self.copy_log_btn)
+        v.addLayout(head)
+        self.log_view = QTextEdit(); self.log_view.setReadOnly(True)
+        v.addWidget(self.log_view)
+        return wrap
+
+    def _copy_log(self):
+        QApplication.clipboard().setText(self.log_view.toPlainText())
+        self.copy_log_btn.setText("Copied ✓")
+        QTimer.singleShot(1200, lambda: _alive(self.copy_log_btn) and self.copy_log_btn.setText("Copy"))
+
+    def toggle_details(self):
+        self.ui_state["details"] = not self.ui_state["details"]
+        self.log_drawer.setVisible(self.ui_state["details"])
+
+    # ------------------------------------------------------------ logging
+    _FRIENDLY = (
+        ("downloading minecraft", None),
+        ("building winegdk", "Setting up the game engine — first run, this can take a while…"),
+        ("cloning winegdk", "Setting up the game engine — first run, this can take a while…"),
+        ("updating winegdk", "Setting up the game engine — first run, this can take a while…"),
+        ("installing minecraft", "Installing Minecraft…"),
+        ("reinstalling minecraft", "Installing Minecraft…"),
+        ("preparing gdk-proton", "Preparing the engine…"),
+        ("extracting", "Preparing the engine…"),
+        ("pre-auth", "Signing in to Xbox Live…"),
+        ("signing in", "Signing in to Xbox Live…"),
+        ("offline mode", "Starting Minecraft in offline mode…"),
+        ("starting minecraft", "Starting Minecraft…"),
+        ("launching minecraft", "Starting Minecraft…"),
+    )
+
+    def _friendly(self, line: str):
+        low = line.lower()
         if "minecraft is running" in low:
-            return ("Minecraft is running — close the game to come back here.",
-                    True)
-        # Keep the launch visibly on track: an unusable Xbox Live session no
-        # longer stops it, so say what the game is starting as.
-        if "offline mode" in low:
-            return "Starting Minecraft in offline mode…"
-        if "starting minecraft" in low or "launching minecraft" in low:
-            return "Starting Minecraft…"
+            return "Minecraft is running — close the game to come back here.", True
         if "game closed" in low:
-            return ("Minecraft closed.", True)
+            return "Minecraft closed.", True
+        for needle, msg in self._FRIENDLY:
+            if needle in low:
+                return msg, False
         return None
 
-    def glog(line):
+    def set_status(self, text, color=None):
+        """The status line, colour included.
+
+        Always writing the stylesheet is the point: a failure paints the line
+        red, and nothing that came after it used to paint it back, so one
+        failed launch left "Preparing…" and "Downloading…" red for the rest
+        of the session.
+        """
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(
+            f"color:{color};" if color else "")
+
+    def _append_log_html(self, markup: str):
+        """Append pre-escaped markup and keep the view on the newest line."""
+        self.log_view.append(markup)
+        bar = self.log_view.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    @Slot(str)
+    def _on_log_line(self, line: str):
         lvl = _LEVELS.get(line[:2])
         if lvl:
-            nm = lvl[0].strip()
-            logbox.insert("end", lvl[0] + "  ", "L_" + nm)
-            logbox.insert("end", line[2:].strip() + "\n", "M_" + nm)
+            label, _a1, _a2, level_color, msg_color = lvl
+            self._append_log_html(
+                f'<span style="color:{level_color}; font-weight:700;">{html.escape(label)}</span>'
+                f'  <span style="color:{msg_color};">{html.escape(line[2:].strip())}</span>')
         else:
-            logbox.insert("end", line + "\n")
-        logbox.see("end")
-        if not ui["busy"]:
+            # The wrapping span is not decoration. QTextEdit.append() decides
+            # between rich and plain text with Qt::mightBeRichText(), and an
+            # escaped string that contains no tag does not look like markup --
+            # so "-> downloading 1.21.130.7" was appended verbatim and rendered
+            # as "-&gt; downloading 1.21.130.7". Only `::`, `OK`, `!!` and `xx`
+            # carry a level, so `==` and `->` -- the two most common prefixes
+            # in a launch -- always took this branch.
+            self._append_log_html(f"<span>{html.escape(line)}</span>")
+        if not self.ui_state.get("busy"):
             return
         if line.startswith("xx"):
-            set_status(line[2:].strip(), T.RED)
+            self.set_status(line[2:].strip(), self.theme.red)
             return
-        txt = _friendly(line)
-        if txt:
-            steady = False
-            if isinstance(txt, tuple):
-                txt, steady = txt
+        friendly = self._friendly(line)
+        if friendly:
+            txt = friendly[0] if isinstance(friendly, tuple) else friendly
+            steady = friendly[1] if isinstance(friendly, tuple) else False
+            self.set_status(txt, self.theme.green if steady else None)
             if steady:
-                set_status(txt, T.GREEN if "running" in txt.lower() else T.SUB)
-                end_progress()
+                self.progress.hide()
             else:
-                set_status(txt, T.FG)
-                bar_busy()
-    log._LOG_SINK = lambda m: root.after(0, glog, m)
+                self._show_bar_busy()
 
-    def acct_state(ph):
-        gt = msa_gamertag() or "Xbox Live"
-        if ph == "in":
-            acct_dot.configure(text_color=T.GREEN)
-            acct_txt_lbl.configure(cursor="", text_color=T.FG)
-            acct_txt.set("Signed in")
-            acct_txt_lbl._tooltip.text = f"Signed in as {gt}"
-            acct_btn.configure(text="Sign out", fg_color=T.CARD_2, hover_color=T.CARD_3, text_color=T.FG)
-            acct_btn._tooltip.text = f"Sign out of {gt}"
-            acct_btn._mode = "out"
-            acct_btn._confirm_out = False
-            acct_btn._confirm_cancel = False
-        elif ph == "auth":
-            acct_txt_lbl.configure(cursor="", text_color=T.FG)
-            acct_dot.configure(text_color=T.GOLD)
-            acct_txt.set("Sign-in pending…")
-            acct_txt_lbl._tooltip.text = "Sign-in pending"
-            acct_btn.configure(text="Cancel", fg_color=T.CARD_2, hover_color=T.CARD_3, text_color=T.FG)
-            acct_btn._tooltip.text = "Cancel sign-in"
-            acct_btn._mode = "cancel"
-            acct_btn._confirm_out = False
-            acct_btn._confirm_cancel = False
-        else:
-            acct_txt_lbl.configure(cursor="", text_color=T.FG)
-            acct_dot.configure(text_color=T.SUB)
-            acct_txt.set("Not signed in")
-            acct_txt_lbl._tooltip.text = "Not signed in"
-            acct_btn.configure(text="Sign in", fg_color=T.CARD_2, hover_color=T.CARD_3, text_color=T.FG)
-            acct_btn._tooltip.text = "Sign in to Microsoft"
-            acct_btn._mode = "in"
-            acct_btn._confirm_out = False
-            acct_btn._confirm_cancel = False
+    def _show_bar_busy(self):
+        self.progress.show()
+        self.progress.setRange(0, 0)  # indeterminate
 
-    def acct_click():
-        mode = getattr(acct_btn, "_mode", "in")
-        if mode == "auth_loading":
+    def set_progress(self, got, total):
+        """Show a byte count against a total, both of them 64-bit.
+
+        A Minecraft package is 2.3 GiB and neither a Qt `int` nor a
+        QProgressBar holds that. The counts used to be handed straight to
+        both: PySide6 wrapped the total into a negative 32-bit int, `max(1,
+        total)` turned that into 1, and the status line read the download out
+        as `100 * got` — "Downloading Minecraft…  24346886100%" (#216). The
+        bar beneath it stayed empty for the whole download, because a value
+        outside a QProgressBar's range is not clamped, it is ignored.
+        """
+        got, total = int(got), int(total)
+        if total <= 0:
+            # Nothing to measure against: sweep rather than invent a figure.
+            self._show_bar_busy()
             return
-        if mode == "out":
-            if getattr(acct_btn, "_confirm_out", False):
-                na.stop()
+        got = min(max(got, 0), total)
+        self.progress.show()
+        self.progress.setRange(0, BAR_STEPS)
+        self.progress.setValue(BAR_STEPS * got // total)
+        self.set_status(f"Downloading Minecraft…  {100 * got // total}%")
+
+    def end_progress(self):
+        self.progress.hide()
+
+    # ------------------------------------------------------------ version picker
+    def _wire_version_picker(self):
+        self.version_popup = VersionPicker(self)
+        self.version_popup.picked.connect(self.set_version)
+        self.version_popup.refresh_requested.connect(
+            self._refresh_versions_from_picker)
+
+    def _installed_labels(self):
+        """The picker labels whose build is on disk right now (#376).
+
+        Read from the game folders rather than from the catalogue loaded at
+        startup, so a build downloaded since then is marked too.
+        """
+        on_disk = {}
+        marked = set()
+        for label, version in zip(self.ui_state.get("labels") or [],
+                                  self.ui_state.get("versions") or []):
+            edition_id = _version_edition_id(version)
+            if edition_id not in on_disk:
                 try:
-                    # msa_logout() takes the prefix lock itself; wrapping the
-                    # call here would nest two flock() acquisitions on the same
-                    # file from separate descriptors and always be refused.
-                    msa_logout()
-                except BolError as exc:
-                    warn(str(exc))
-                    acct_state("in" if msa_signed_in() else "out")
-                    return
-                acct_state("out")
-            else:
-                acct_btn._confirm_out = True
-                gt = msa_gamertag() or "Xbox Live"
-                acct_btn.configure(text="Sign out?", fg_color=T.RED, hover_color=T.RED_HOV, text_color="white")
-                acct_btn._tooltip.text = f"Sign out of {gt}?"
-        elif mode == "cancel":
-            if getattr(acct_btn, "_confirm_cancel", False):
-                na.stop()
-                acct_state("in" if msa_signed_in() else "out")
-                if ui.get("auth_dialog") and ui["auth_dialog"].winfo_exists():
-                    ui["auth_dialog"].destroy()
-            else:
-                acct_btn._confirm_cancel = True
-                acct_btn.configure(text="Cancel?", fg_color=T.RED, hover_color=T.RED_HOV, text_color="white")
-        else:
-            acct_btn._mode = "auth_loading"
-            acct_btn.configure(text="Loading…")
-            threading.Thread(target=lambda: na.start(on_auth, on_online),
-                              daemon=True).start()
+                    on_disk[edition_id] = installed_versions(edition_id)
+                except Exception:
+                    on_disk[edition_id] = None
+            builds = on_disk[edition_id]
+            if (version["tag"] in builds if builds is not None
+                    else version.get("installed")):
+                marked.add(label)
+        return marked
 
-    def _cancel_signout(e):
-        cp = str(e.widget)
-        bp = str(acct_btn)
-        if getattr(acct_btn, "_confirm_out", False):
-            if cp != bp and not cp.startswith(bp + "."):
-                acct_btn._confirm_out = False
-                acct_btn.configure(text="Sign out", fg_color=T.CARD_2, hover_color=T.CARD_3, text_color=T.FG)
-                gt = msa_gamertag() or "Xbox Live"
-                acct_btn._tooltip.text = f"Sign out of {gt}"
-        if getattr(acct_btn, "_confirm_cancel", False):
-            if cp != bp and not cp.startswith(bp + "."):
-                acct_btn._confirm_cancel = False
-                acct_btn.configure(text="Cancel", fg_color=T.CARD_2, hover_color=T.CARD_3, text_color=T.FG)
-    root.bind_all("<Button-1>", _cancel_signout, add="+")
-
-    def on_auth(url, code):
-        root.after(0, lambda: (acct_state("auth"), code_dialog(url, code)))
-
-    def on_online():
-        root.after(0, lambda: acct_state("in"))
-        if ui.get("auth_dialog") and ui["auth_dialog"].winfo_exists():
-            root.after(0, ui["auth_dialog"].destroy)
-        def _bg_fetch():
-            from .auth import msa_load, msa_refresh, xbl_preauth, _account_cache_epoch
-            from .config import DATA
-            try:
-                tok = msa_load()
-                if not tok: return
-                fresh = msa_refresh(tok.get("refresh_token"))
-                if fresh and fresh.get("access_token"):
-                    ep = _account_cache_epoch(DATA / "winegdk-preauth")
-                    if xbl_preauth(fresh.get("access_token"), ep):
-                        root.after(0, lambda: acct_state("in"))
-            except Exception:
-                pass
-        threading.Thread(target=_bg_fetch, daemon=True).start()
-
-    def code_dialog(url, code):
-        url = f"https://login.live.com/oauth20_remoteconnect.srf?otc={code}"
-        d = dialog("Sign in to Microsoft", 380, 370)
-        ui["auth_dialog"] = d
-        def on_close():
-            na.stop()
-            acct_state("in" if msa_signed_in() else "out")
-            d.destroy()
-        d.protocol("WM_DELETE_WINDOW", on_close)
-        d.bind("<Escape>", lambda _event: on_close())
-        row = ctk.CTkFrame(d, fg_color="transparent")
-        row.pack(anchor="center", pady=(24, 8))
-        mkbtn(row, "Sign In to your Microsoft account",
-            lambda: _open_web_url(url), kind="primary",
-            font=font(16, "bold"), height=42, width=280, text_color=T.FG).pack(side="left")
-
-        ctk.CTkLabel(d, text="Scan this QR or open the link and enter this code:",
-                     text_color=T.SUB).pack(anchor="center", pady=(8, 12))
-
-        qr_frame = ctk.CTkFrame(d, fg_color="transparent", width=150, height=150)
-        qr_frame.pack_propagate(False)
-        qr_frame.pack(anchor="center", pady=(0, 16))
-        
-        bg_color = d.cget("fg_color")
-        if isinstance(bg_color, tuple):
-            bg_color = d._apply_appearance_mode(bg_color)
-        qr_lbl = tk.Label(qr_frame, bg=bg_color, bd=0)
-        qr_lbl.place(relx=0.5, rely=0.5, anchor="center")
-
-        if icon_img is not None:
-            factors = [10, 9, 8, 7, 6, 7, 8, 9]
-            step_idx = 0
-            def animate_qr():
-                nonlocal step_idx
-                if getattr(qr_lbl, "_is_loaded", False) or not qr_lbl.winfo_exists():
-                    return
-                try:
-                    im = icon_img.subsample(factors[step_idx])
-                    qr_lbl.configure(image=im)
-                    qr_lbl.image = im
-                except Exception: pass
-                step_idx = (step_idx + 1) % len(factors)
-                qr_lbl.after(125, animate_qr)
-            animate_qr()
-
-        def _load_qr():
-            from .qrcodegen import QrCode
-            from PIL import Image
-            try:
-                qr = QrCode.encode_text(url, QrCode.Ecc.LOW)
-                border = 2
-                size = qr.get_size() + border * 2
-                img = Image.new("1", (size, size), 1)
-                pixels = img.load()
-                for y in range(qr.get_size()):
-                    for x in range(qr.get_size()):
-                        if qr.get_module(x, y):
-                            pixels[x + border, y + border] = 0
-                img = img.resize((150, 150), Image.Resampling.NEAREST).convert("RGB")
-                def _apply_qr():
-                    if not qr_frame.winfo_exists():
-                        return
-                    ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(150, 150))
-                    qr_lbl._is_loaded = True
-                    qr_lbl.destroy()
-                    ctk.CTkLabel(qr_frame, text="", image=ctk_img).pack(expand=True, fill="both")
-                    qr_frame._img = ctk_img
-                root.after(200, _apply_qr)
-            except Exception:
-                root.after(0, lambda: qr_lbl.winfo_exists() and (setattr(qr_lbl, "_is_loaded", True), qr_lbl.configure(image="", text="(Unavailable)", fg="gray")))
-        threading.Thread(target=_load_qr, daemon=True).start()
-
-        code_row = ctk.CTkFrame(d, fg_color="transparent")
-        code_row.pack(anchor="center", pady=(8, 24))
-        
-        c_ent = ctk.CTkEntry(code_row, width=175, fg_color="transparent", border_width=0,
-                             text_color=T.BLUE, justify="center",
-                             font=ctk.CTkFont(family=MONO, size=32, weight="bold"))
-        c_ent.insert(0, code)
-        c_ent.configure(state="readonly")
-        c_ent.pack(side="left")
-
-        copy_btn = None
-
-        def copy_code():
-            root.clipboard_clear()
-            root.clipboard_append(code)
-            copy_btn.configure(text="✓")
-            root.after(1200, lambda: copy_btn.winfo_exists() and copy_btn.configure(text="🗎"))
-
-        copy_btn = mkbtn(code_row, "🗎", copy_code, kind="ghost", width=32,
-                          height=32, font=font(16), corner_radius=8)
-        copy_btn.pack(side="left", padx=(2, 0))
-
-    def refresh_versions():
-        beta = load_settings().get("show_betas", False)
-        try:
-            ui["versions"] = list_mc_versions(beta)
-        except Exception as e:
-            log._LOG_SINK(f"xx versions: {e}")
+    def open_picker(self):
+        labels = [l for l, v in zip(self.ui_state.get("labels") or [],
+                                     self.ui_state.get("versions") or [])
+                  if self._edition_matches(v)]
+        if not labels:
             return
-        from .util import format_display_version
-        labels = [format_display_version(v["tag"], v["beta"]) + ("  ·  BETA" if v["beta"] else "")
-                  for v in ui["versions"]]
+        self.version_popup.set_labels(labels, self.ver_label.text(),
+                                      self._installed_labels())
+        self.version_popup.setFixedWidth(max(260, self.ver_field.width()))
+        self.version_popup.show_above(self.ver_field)
 
-        def ap():
-            ui["labels"] = labels
-            cur = (load_settings().get("mc_version") or "")
-            pick = next((x for x in labels
-                         if x.split("  ")[0] == cur
-                         or x.split("  ")[0].startswith(cur + ".")),
-                        labels[0] if labels else "")
-            if labels:
-                mc_var.set(pick)
-                _update_selected_chip()
-        root.after(0, ap)
+    def set_version(self, label):
+        self.version_popup.close()
+        self.ver_label.setText(label)
+        self._update_selected_chip()
 
-    def selected_version():
-        if not ui["versions"] or not mc_var.get():
+    def _checked_edition_id(self):
+        for edition_id, button in getattr(self, "edition_buttons", {}).items():
+            if button.isChecked():
+                return edition_id
+        return "release"
+
+    def _edition_matches(self, v, wanted=None):
+        return _version_edition_id(v) == (wanted or self._checked_edition_id())
+
+    def select_edition(self, edition_id):
+        self.settings = load_settings()
+        self.settings["show_betas"] = edition_id == "preview"
+        self.settings["ui_edition"] = edition_id
+        save_settings(self.settings)
+        matches = [l for l, v in zip(self.ui_state.get("labels") or [],
+                                      self.ui_state.get("versions") or [])
+                   if self._edition_matches(v, edition_id)]
+        if matches:
+            self.set_version(matches[0])
+        else:
+            self.selected_chip.setText("")
+
+    def _update_selected_chip(self):
+        lab = self.ver_label.text()
+        if not lab or lab == "Loading…":
+            self.selected_chip.setText("")
+            return
+        picked = self.selected_version()
+        edition_id = (_version_edition_id(picked) if picked else
+                      ("preview" if "BETA" in lab else "release"))
+        is_beta = edition_id == "preview"
+        self.settings = load_settings()
+        changed = False
+        if self.settings.get("ui_is_beta") != is_beta:
+            self.settings["ui_is_beta"] = is_beta
+            changed = True
+        # What the picker shows is a shortened label -- "26.44" for
+        # 1.26.44.3 -- and what gets saved has to be the build itself. Saving
+        # the label named no build anything could find: setup answered "no
+        # longer listed" and installed the newest instead, so a launcher
+        # restarted after playing an older build quietly downloaded another
+        # 2.5 GB of game nobody had asked for (#214).
+        display = lab.split("  ")[0]
+        cur_mc_ver = picked["tag"] if picked else display
+        if self.settings.get("mc_version") != cur_mc_ver:
+            self.settings["mc_version"] = cur_mc_ver
+            changed = True
+        if picked and self.settings.get("ui_edition") != edition_id:
+            self.settings["ui_edition"] = edition_id
+            changed = True
+        if changed:
+            save_settings(self.settings)
+        suffix = ("  ·  BETA" if is_beta
+                  else "  ·  EDU" if edition_id == "education" else "")
+        self.selected_chip.setText(f"  {display}{suffix}  ")
+        self.edition_buttons.get(edition_id, self.stable_btn).setChecked(True)
+        self.theme.beta = is_beta
+        self.apply_theme()
+        cur_kill = self.ui_state.get("busy")
+        self.play_btn.setToolTip(f"{'Kill' if cur_kill else 'Play'} {display}")
+
+    def selected_version(self):
+        lab = self.ver_label.text()
+        if not self.ui_state["versions"] or not lab:
             return None
-        from .util import format_display_version
-        labels = [format_display_version(v["tag"], v["beta"]) + ("  ·  BETA" if v["beta"] else "")
-                  for v in ui["versions"]]
+        labels = [_version_label(v)
+                  for v in self.ui_state["versions"]]
         try:
-            return ui["versions"][labels.index(mc_var.get())]
+            idx = labels.index(lab)
+            return self.ui_state["versions"][idx]
         except ValueError:
             return None
 
-    def busy(on):
-        ui["busy"] = on
-        import warnings
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            if on:
-                play_btn._img_norm = _create_kill_icon(16, T.FG, T.RED)
-                play_btn.configure(
-                    text="  KILL",
-                    image=play_btn._img_norm,
-                    fg_color=T.RED,
-                    hover_color=T.RED,
-                    text_color=T.FG,
-                    command=lambda: kill_wine()
-                )
-                if hasattr(play_btn, "_tooltip"):
-                    cur_ver = mc_var.get().split('  ')[0].strip() if mc_var.get() else "Game"
-                    play_btn._tooltip.text = f"Kill {cur_ver}"
-            else:
-                play_btn._img_norm = _create_play_icon(16, T.FG, T.THEME_ACCENT)
-                play_btn.configure(
-                    text="  PLAY",
-                    image=play_btn._img_norm,
-                    fg_color=T.THEME_ACCENT,
-                    hover_color=T.THEME_ACCENT,
-                    text_color=T.FG,
-                    command=lambda: do_play()
-                )
-                if hasattr(play_btn, "_tooltip"):
-                    cur_ver = mc_var.get().split('  ')[0].strip() if mc_var.get() else "Game"
-                    play_btn._tooltip.text = f"Play {cur_ver}"
+    def refresh_versions(self, ignore_cache=False):
+        def work():
+            # Always fetch the full catalogue, stable and preview alike.
+            # Which edition is *shown* is a purely client-side filter
+            # (_edition_matches / open_picker / select_edition all filter
+            # self.ui_state["versions"] after the fact) -- this only runs
+            # once per app launch, so gating the fetch itself by the
+            # currently-saved show_betas left the other edition's versions
+            # never loaded for the rest of the session. That's what made
+            # Preview un-selectable after a restart that happened to land
+            # on Stable: the version list was fetched with
+            # include_beta=False and never refetched, so no amount of
+            # clicking "Preview" afterward could produce a match.
+            editions = list_editions(include_beta=True)
+            versions = []
+            for ed in editions:
+                # Per edition, so one catalogue being unreachable costs that
+                # edition and not the whole picker. Without this a Preview
+                # outage left the player with no Stable builds either.
+                try:
+                    builds = list_versions(ed["id"], ignore_cache=ignore_cache)
+                except Exception as exc:
+                    log._LOG_SINK(f"xx versions for {ed['id']}: {exc}")
+                    continue
+                for b in builds:
+                    versions.append({"tag": b["version"], "beta": ed.get("beta", False),
+                                      "edition": ed, "installed": b.get("installed", False),
+                                      "build": b.get("build")})
+            return versions
 
-    def step_aside_for_game():
-        """Unmap the launcher window once the game process exists.
+        if ignore_cache:
+            self.version_popup.refresh_btn.setEnabled(False)
 
-        Gamescope — Steam Game Mode — presents one application window at a
-        time, so a mapped launcher window keeps the game's own off screen: the
-        game is audible but never appears (#130). Stepping aside for as long
-        as the game runs is what makes the launcher usable there; skipping the
-        launcher is not. A desktop session shows both windows, so nothing
-        moves.
+        def done(versions):
+            if ignore_cache and _alive(self.version_popup):
+                self.version_popup.refresh_btn.setEnabled(True)
+            self._on_versions_loaded(versions)
 
-        Called from the launch thread, so the window work is handed to Tk.
+        def failed(exc):
+            if ignore_cache and _alive(self.version_popup):
+                self.version_popup.refresh_btn.setEnabled(True)
+            log._LOG_SINK(f"xx versions: {exc}")
+
+        worker = Worker(work)
+        worker.done.connect(done)
+        worker.failed.connect(failed)
+        if not self._start_worker("versions", worker) and ignore_cache \
+                and _alive(self.version_popup):
+            # Already fetching (e.g. the once-per-launch load is still in
+            # flight) -- nothing will call done()/failed() to undo the
+            # disable above, so undo it here instead of leaving the button
+            # stuck.
+            self.version_popup.refresh_btn.setEnabled(True)
+
+    def _refresh_versions_from_picker(self):
+        """The picker's ↻: re-check the build index past its 12-hour cache.
+
+        Reached by someone who knows a build is out and does not see it yet
+        -- the ordinary path only fetches once per launch (see
+        refresh_versions), so without this the only way to see a build that
+        appeared since was to restart the app after the cache expired.
         """
-        if not ui.get("single_window") or ui.get("stepped_aside"):
-            return
-        ui["stepped_aside"] = True
+        self.refresh_versions(ignore_cache=True)
 
-        def hide():
+    def _on_versions_loaded(self, versions):
+        if not _alive(self) or not _alive(self.ver_label):
+            return
+        if not versions:
+            log._LOG_SINK("xx no versions loaded")
+            return
+        self.ui_state["versions"] = versions
+        labels = [_version_label(v)
+                  for v in versions]
+        self.ui_state["labels"] = labels
+        if _alive(self.version_popup) and self.version_popup.isVisible():
+            current = self.version_popup.list.currentItem()
+            current_label = current.text() if current else self.ver_label.text()
+            open_labels = [l for l, v in zip(labels, versions)
+                           if self._edition_matches(v)]
+            self.version_popup.set_labels(open_labels, current_label,
+                                          self._installed_labels())
+        self.ver_label.setText(
+            labels[self._saved_version_index(versions)])
+        self._update_selected_chip()
+
+    @staticmethod
+    def _saved_version_index(versions):
+        """Which build the saved selection means; the newest when none does.
+
+        Matched on the build tag, because that is what a selection is. Two
+        older shapes still turn up in a settings file written by an earlier
+        release and both keep working: the shortened label the chip used to
+        save ("26.44"), and a partial version. Falling through to the newest
+        build is the part that has to be rare -- it is a silent 2.5 GB
+        download the next time PLAY is pressed.
+        """
+        settings = load_settings()
+        wanted = (settings.get("mc_version") or "").strip()
+        if not wanted:
+            return 0
+        # Every title the Store alone serves has the same tag ("current"),
+        # so the edition picks between them; then the tag alone, as before.
+        edition = (settings.get("ui_edition") or settings.get("mc_edition")
+                   or "").strip()
+        for index, version in enumerate(versions):
+            if version["tag"] == wanted and edition and \
+                    _version_edition_id(version) == edition:
+                return index
+        for index, version in enumerate(versions):
+            if version["tag"] == wanted:
+                return index
+        for index, version in enumerate(versions):
+            if (version["tag"].startswith(wanted + ".")
+                    or format_display_version(version["tag"],
+                                              version["beta"]) == wanted):
+                return index
+        return 0
+
+    # ------------------------------------------------------------ profile menu
+    def _wire_profile_menu(self):
+        self.profile_popup = ProfileMenu(self)
+        self.profile_popup.switch.connect(self._switch_profile_target)
+        self.profile_popup.new_window.connect(lambda p: open_profile_window(p))
+        self.profile_popup.create_profile.connect(self._prompt_create_profile)
+        self.profile_popup.manage.connect(self._open_profile_manager)
+
+    def open_profile_menu(self):
+        info = current_profile_info()
+        self.profile_popup.rebuild(list_profiles(), info.get("path"))
+        self.profile_popup.setFixedWidth(max(260, self.prof_card.width()))
+        self.profile_popup.show_beside(self.prof_card)
+
+    def _profile_switch_blocked(self) -> bool:
+        if self.ui_state.get("launch_active"):
+            self.warn_box("Minecraft is running",
+                "Close Minecraft first and wait for the game to exit before "
+                "switching profiles in this window.\n\nAnother profile can "
+                "play at the same time: start it from the Profiles page, or "
+                "open it in a second launcher window with \"New window\".")
+            return True
+        if self.ui_state.get("busy"):
+            self.warn_box("Operation in progress",
+                "Wait for the current preparation task to finish before "
+                "switching profiles.")
+            return True
+        return False
+
+    def _switch_profile_target(self, profile_path):
+        self.profile_popup.close()
+        if self._profile_switch_blocked():
+            return
+        self.close()
+        relaunch_with_profile(profile_path)
+
+    def _prompt_create_profile(self):
+        self.profile_popup.close()
+        if self.ui_state.get("busy") and not self.ui_state.get("launch_active"):
+            self.warn_box("Operation in progress",
+                "Wait for the current preparation task to finish before "
+                "creating a profile.")
+            return
+        name, ok = QInputDialog.getText(self, "Create account profile",
+            "Profile name (each profile has its own Xbox login, prefix and worlds):")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        try:
+            profile_dir = create_profile(name)
+            if profile_shortcuts_supported():
+                try:
+                    write_profile_shortcut(name, profile_dir=profile_dir)
+                except Exception:
+                    pass
+            if self.ui_state.get("launch_active"):
+                if self.question_box("Profile Created",
+                        f"Profile '{name}' was created successfully.\n\n"
+                        "Minecraft is currently running, so this window can't "
+                        "switch now. Open the new profile in a new window?"):
+                    open_profile_window(profile_dir)
+            else:
+                self._switch_profile_target(profile_dir)
+        except Exception as exc:
+            self.error_box("Account profile", str(exc))
+
+    def _prompt_create_profile_and_refresh(self):
+        self._prompt_create_profile()
+        if self.stack.currentWidget() is self.profiles_page:
+            self.refresh_profiles()
+
+    def _open_profile_manager(self):
+        self.profile_popup.close()
+        self.toggle_profiles()
+        self.prof_label.setText(current_profile_name())
+        self.prof_card.setToolTip(f"Profile: {current_profile_name()}")
+
+    # ------------------------------------------------------------ accounts
+    def _refresh_account_row(self, phase):
+        """Record where the online sign-in stands, then redraw both places
+        that show it. Kept as the single entry point the auth callbacks and
+        the sign-in flow already call."""
+        self._acct_mode = {
+            "in": "out", "auth": "cancel", "refused": "relink",
+        }.get(phase, "in")
+        if phase != "auth":
+            self._acct_confirm = False
+        self._refresh_accounts()
+
+    def _online_state(self):
+        """(dot colour, status line, button label, danger) for the online
+        account, from _acct_mode and any armed confirmation."""
+        mode = getattr(self, "_acct_mode", "in")
+        red = self.theme.red
+        if mode == "loading":
+            return self.theme.gold, "Starting sign-in…", "Loading…", None
+        if mode == "out":                      # signed in; the action is out
+            gt = msa_gamertag()
+            return (self.theme.green,
+                    f"Signed in as {gt}" if gt else "Signed in",
+                    "Sign out?" if self._acct_confirm else "Sign out",
+                    red if self._acct_confirm else None)
+        if mode == "cancel":                   # a device code is on screen
+            return (self.theme.gold, "Waiting for the sign-in to finish…",
+                    "Cancel?" if self._acct_confirm else "Cancel",
+                    red if self._acct_confirm else None)
+        if mode == "relink":
+            return (self.theme.gold,
+                    "Microsoft refused the saved sign-in",
+                    "Sign in again", None)
+        return self.theme.sub, "Not signed in", "Sign in", None
+
+    def _store_state(self):
+        """The same, for the download account."""
+        if self.ui_state.get("store_login_active"):
+            # A sign-in window that stops making progress is the whole of
+            # issue #214, and a row that can only say "Signing in…" leaves
+            # nothing to do about it but restart the launcher.
+            return (self.theme.gold, "Waiting for the sign-in window…",
+                    "Cancel?" if self._store_confirm else "Cancel",
+                    self.theme.red if self._store_confirm else None)
+        try:
+            from . import xodus
+            linked = xodus.signed_in()
+        except Exception:
+            linked = False
+        if linked:
+            return (self.theme.green, "Signed in",
+                    "Sign out?" if self._store_confirm else "Sign out",
+                    self.theme.red if self._store_confirm else None)
+        return self.theme.sub, "Not signed in", "Sign in", None
+
+    def _refresh_accounts(self):
+        """Redraw the pill and the menu from the two account states."""
+        if not _alive(self) or not _alive(self.acct_dot):
+            return
+        online_dot, online_status, online_action, online_danger = self._online_state()
+        store_dot, store_status, store_action, store_danger = self._store_state()
+
+        # The pill carries the combined state: green only when both are in,
+        # because "Signed in" while the download account is missing is exactly
+        # the half-truth that sent people to PLAY with nothing to click.
+        if online_dot == self.theme.green and store_dot == self.theme.green:
+            pill_dot = self.theme.green
+        elif self.theme.gold in (online_dot, store_dot) or online_dot == self.theme.green:
+            pill_dot = self.theme.gold
+        else:
+            pill_dot = self.theme.sub
+        self.acct_dot.setStyleSheet(f"color:{pill_dot};")
+        mode = getattr(self, "_acct_mode", "in")
+        gt = msa_gamertag() if mode == "out" else None
+        self.acct_text.setText(
+            gt or ("Signing in…" if mode in ("loading", "cancel")
+                   else "Sign in"))
+        self.acct_card.setToolTip(
+            f"Play online: {online_status}\nDownload Minecraft: {store_status}")
+
+        menu = getattr(self, "accounts_menu", None)
+        if _alive(menu):
+            menu.online.show_state(online_dot, online_status, online_action,
+                                    online_danger)
+            menu.download.show_state(store_dot, store_status, store_action,
+                                      store_danger)
+
+    def _wire_accounts_menu(self):
+        self.accounts_menu = AccountsMenu(self)
+        self.accounts_menu.xbox.connect(self.acct_click)
+        self.accounts_menu.store.connect(self.store_click)
+        self.accounts_menu.set_theme(self.theme)
+
+    def open_accounts_menu(self):
+        self._refresh_accounts()
+        self.accounts_menu.setFixedWidth(max(352, self.acct_card.width()))
+        self.accounts_menu.show_beside(self.acct_card)
+
+    def disarm_account_confirms(self):
+        """Called when the menu hides: a confirmation must never outlive the
+        menu that was asking for it.
+
+        Redraws rather than only clearing the flags, so the rows are already
+        back to "Sign out" the moment the menu closes instead of the next time
+        it happens to be opened.
+        """
+        if not _alive(self):
+            return
+        if not (self._acct_confirm or self._store_confirm):
+            return
+        self._acct_confirm = False
+        self._store_confirm = False
+        self._refresh_accounts()
+
+    # ---------------------------------------------------------- online account
+    def acct_click(self):
+        mode = getattr(self, "_acct_mode", "in")
+        if mode == "loading":
+            # The device-code request is already in flight. Without this a
+            # second click starts a second one, and the player is handed two
+            # codes for the same sign-in.
+            return
+        if mode == "out":
+            if self._acct_confirm:
+                self.na.stop()
+                try:
+                    msa_logout()
+                except BolError as exc:
+                    warn(str(exc))
+                self._acct_confirm = False
+                self._refresh_account_row("in" if msa_signed_in() else "out")
+            else:
+                self._acct_confirm = True
+                self._refresh_accounts()
+        elif mode == "cancel":
+            if self._acct_confirm:
+                self.na.stop()
+                self.ui_state.pop("play_after_signin", None)
+                self._acct_confirm = False
+                self._refresh_account_row("in" if msa_signed_in() else "out")
+                if getattr(self, "_auth_dialog", None) and _alive(self._auth_dialog):
+                    self._auth_dialog.close()
+            else:
+                self._acct_confirm = True
+                self._refresh_accounts()
+        else:
+            if mode == "relink":
+                # The token file exists but Microsoft has rejected the token
+                # inside it. NativeAuth deliberately refuses to start over an
+                # existing token, so retire that account generation before
+                # asking for a fresh device code. The Store/download account
+                # is separate and is not touched here.
+                try:
+                    msa_logout()
+                except BolError as exc:
+                    warn(str(exc))
+                    return
+            self._acct_mode = "loading"
+            self._refresh_accounts()
+            threading.Thread(
+                target=lambda: self.na.start(
+                    self._auth_bridge.auth.emit,
+                    self._auth_bridge.online.emit),
+                daemon=True).start()
+
+    # ---------------------------------------------------------- download account
+    def store_click(self):
+        if self.ui_state.get("store_login_active"):
+            if self._store_confirm:
+                self._store_confirm = False
+                self._cancel_store_login()
+            else:
+                self._store_confirm = True
+                self._refresh_accounts()
+            return
+        from . import xodus
+        if not xodus.signed_in():
+            self.accounts_menu.close()
+            self._link_store_account()
+            return
+        if self._store_confirm:
+            self._store_confirm = False
+            self._unlink_store_account()
+        else:
+            self._store_confirm = True
+            self._refresh_accounts()
+
+    def _unlink_store_account(self):
+        from . import xodus
+        w = Worker(xodus.logout)
+        w.done.connect(lambda _r: _alive(self) and self._refresh_store_row())
+        w.failed.connect(lambda e: _alive(self) and self.error_box(
+            "Microsoft Store account", e))
+        self._start_worker("store-account", w)
+
+    # How long a sign-in may sit there before the launcher says something
+    # about it. Microsoft's page is normally through in well under this; past
+    # it, the window of issue #214 looks exactly like a window someone simply
+    # has not finished typing into, and only one of the two has anything the
+    # launcher can suggest.
+    _STORE_LOGIN_HINT_MS = 120_000
+
+    def _link_store_account(self, then=None):
+        """Run the download's Microsoft sign-in from wherever it was asked for.
+
+        Xodus opens its own webview window and can take a while, so the
+        launcher says what it is waiting for rather than looking idle. `then`
+        is whatever needed the account in the first place -- PLAY, usually,
+        which resumes on its own once it is there instead of making the player
+        press it again.
+        """
+        if self.ui_state.get("store_login_active"):
+            # Returning quietly here is how a sign-in that never finished
+            # turned every later attempt into a button that does nothing
+            # (#214): the window is already open, somewhere, and saying so is
+            # the only thing that leads anywhere.
+            self._store_login_already_open()
+            return
+        from . import xodus
+        self.ui_state["store_login_active"] = True
+        self._refresh_store_row()
+        self.set_status("Finish the Microsoft sign-in in the window that opens…")
+        self._show_bar_busy()
+        # Only the hint armed by *this* sign-in may fire: a second one
+        # started later must not be talked about by the first one's timer.
+        token = self.ui_state["store_login_token"] = (
+            self.ui_state.get("store_login_token", 0) + 1)
+        QTimer.singleShot(self._STORE_LOGIN_HINT_MS,
+                          lambda: self._store_login_slow(token))
+
+        def settled():
+            self.ui_state["store_login_active"] = False
+            self._store_confirm = False
+            if not _alive(self):
+                return False
+            self.end_progress()
+            self._refresh_store_row()
+            return True
+
+        def finished(_result):
+            if not settled():
+                return
+            self.set_status("Microsoft account linked.", self.theme.green)
+            if then:
+                then()
+
+        def failed(message):
+            from .xodus import LOGIN_CANCELLED_MESSAGE
+            cancelled = message == LOGIN_CANCELLED_MESSAGE
+            if not settled():
+                return
+            if cancelled:
+                # Asked for, from the row that says "Cancel": reporting it in
+                # a box the player has to dismiss would be the launcher
+                # complaining about being obeyed.
+                self.set_status("Microsoft sign-in cancelled.", self.theme.gold)
+                return
+            self.set_status("Microsoft account not linked.", self.theme.red)
+            self.error_box("Microsoft account", message[:2000])
+
+        w = Worker(xodus.login)
+        w.done.connect(finished)
+        w.failed.connect(failed)
+        if not self._start_worker("store-account", w):
+            self.ui_state["store_login_active"] = False
+            self.end_progress()
+
+    def _store_login_already_open(self):
+        """Say where the sign-in that is already running went."""
+        box = self._box(QMessageBox.Warning, "Sign-in already open",
+                        "A Microsoft sign-in window is already open for the "
+                        "Minecraft download.\n\nFinish it, or close it — if "
+                        "it is stuck on a page that never stops loading, "
+                        "cancel it here and start it again.")
+        cancel = box.addButton("Cancel the sign-in", QMessageBox.DestructiveRole)
+        box.addButton("Keep waiting", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is cancel:
+            self._cancel_store_login()
+
+    def _store_login_slow(self, token):
+        """Nothing has failed, but the window has been up a long time."""
+        if not _alive(self) or not self.ui_state.get("store_login_active"):
+            return
+        if self.ui_state.get("store_login_token") != token:
+            return
+        self.set_status(
+            "Still waiting for the Microsoft sign-in. If its window is stuck "
+            "loading, cancel it from the account menu and try again.",
+            self.theme.gold)
+
+    def _cancel_store_login(self):
+        """Close the sign-in window from the launcher.
+
+        xodus.cancel_login() signals the whole webview process group and
+        waits for it, so it runs off the UI thread; the login worker's own
+        failed() reports the cancellation once the process is gone.
+        """
+        from . import xodus
+        self.set_status("Closing the Microsoft sign-in window…", self.theme.gold)
+        w = Worker(xodus.cancel_login)
+        w.done.connect(lambda closed: _alive(self)
+                       and self._store_login_cancel_done(closed))
+        self._start_worker("store-cancel", w)
+
+    def _store_login_cancel_done(self, closed):
+        """Clear the waiting state when there was no process left to close.
+
+        Normally the login worker's failed() does this, on its way out of a
+        process that has just been signalled. A flag left set with nothing
+        running behind it is the state that makes every later sign-in a
+        button that does nothing, so it is cleared here too.
+        """
+        if closed or not self.ui_state.get("store_login_active"):
+            return
+        self.ui_state["store_login_active"] = False
+        self._store_confirm = False
+        self.end_progress()
+        self._refresh_store_row()
+        self.set_status("Microsoft sign-in cancelled.", self.theme.gold)
+
+    def _offer_store_account_link(self, reason="",
+                                   title="Sign in to download Minecraft",
+                                   action="Sign in", decline="Not now"):
+        """Offer the download's sign-in where it is actually missed.
+
+        A choice that is really an action reads far better under its own name
+        than under "Yes", which makes the player re-read the question to work
+        out what "Yes" is about to do. Returns True only when they asked to
+        sign in now.
+        """
+        box = self._box(QMessageBox.Question, title,
+                        (f"{reason}\n\n" if reason else "") + STORE_LINK_EXPLAINER)
+        no = box.addButton(decline, QMessageBox.RejectRole)
+        yes = box.addButton(action, QMessageBox.AcceptRole)
+        box.setDefaultButton(yes)
+        box.exec()
+        return box.clickedButton() is not no
+
+    def _offer_download_sign_in(self, then=None):
+        """Chain the download's sign-in onto the one just completed.
+
+        Two sign-ins is the shape of the system rather than a choice, and
+        asking for the second here keeps them together, while the player is
+        still in the middle of signing in. Returns True when a sign-in was
+        started, so a caller waiting to do something afterwards knows whether
+        to wait for ``then`` or to carry on itself.
+        """
+        from . import xodus
+        if self.ui_state.get("store_login_active") or xodus.signed_in():
+            return False
+        if self._offer_store_account_link(
+                "You are signed in for playing online. Minecraft itself is "
+                "downloaded with a second, separate sign-in.",
+                title="One more sign-in"):
+            self._link_store_account(then=then)
+            return True
+        return False
+
+    def _offer_online_sign_in(self):
+        """PLAY was pressed with no account for online play.
+
+        Nothing has failed -- offline is a real way to play -- so this warns
+        rather than blocks. It exists because the sign-in people remember
+        doing is the download's, which happens on its own at PLAY; the online
+        one never does, and its absence used to show up only inside the game,
+        as Realms and servers quietly missing (#240).
+
+        Returns "signin" or "play".
+        """
+        box = self._box(QMessageBox.Warning, "Not signed in for online play",
+                        OFFLINE_PLAY_EXPLAINER)
+        again = QCheckBox("Don't warn me again")
+        box.setCheckBox(again)
+        # RejectRole so Escape lands here too: dismissing the warning leaves
+        # the launcher doing what it did before the warning existed.
+        box.addButton("Play offline", QMessageBox.RejectRole)
+        sign = box.addButton("Sign in", QMessageBox.AcceptRole)
+        box.setDefaultButton(sign)
+        box.exec()
+        if again.isChecked():
+            self._save_setting("warn_offline_play", False)
+        # Anything other than the explicit "Sign in" -- including a dismissal
+        # with no button at all -- leaves PLAY doing what it has always done.
+        return "signin" if box.clickedButton() is sign else "play"
+
+    def _online_sign_in_settled(self):
+        """Whether PLAY may go ahead now.
+
+        False means the warning sent the player to the sign-in instead, and
+        PLAY resumes on its own once that finishes.
+        """
+        if msa_signed_in() or not self.settings.get("warn_offline_play", True):
+            return True
+        if getattr(self, "_acct_mode", "in") in ("loading", "cancel"):
+            # A device code is already in flight or on screen; warning about
+            # the sign-in the player is in the middle of doing helps nobody.
+            return True
+        if self._offer_online_sign_in() == "play":
+            return True
+        self.ui_state["play_after_signin"] = True
+        if _alive(getattr(self, "accounts_menu", None)):
+            self.accounts_menu.close()
+        self.acct_click()
+        return False
+
+    def _on_auth(self, url, code):
+        # Reached via AuthBridge.auth, already queued onto the UI thread.
+        if not _alive(self):
+            return
+        self._refresh_account_row("auth")
+        self._code_dialog(url, code)
+
+    def _on_online(self):
+        # Reached via AuthBridge.online, already queued onto the UI thread.
+        if not _alive(self):
+            return
+        # Read before closing the dialog below: closing it runs the same
+        # teardown a cancel does, which withdraws a pending PLAY.
+        resume = bool(self.ui_state.pop("play_after_signin", False))
+        self._refresh_account_row("in")
+        if getattr(self, "_auth_dialog", None) and _alive(self._auth_dialog):
+            self._auth_dialog.close()
+        self._warm_xbox_preauth()
+        # Ask for the second sign-in while the player is still in the middle
+        # of signing in, rather than letting them find out at PLAY.
+        started = self._offer_download_sign_in(then=self.do_play if resume else None)
+        # PLAY was what asked for this sign-in, so finish what it started --
+        # unless the download's sign-in is now running, which will do it.
+        if resume and not started:
+            self.do_play()
+
+    def _on_refreshed(self):
+        # Reached via AuthBridge.refreshed, emitted from the raw worker
+        # thread inside _warm_xbox_preauth. This has to be a real bound
+        # method (not a lambda) connected here: a plain lambda has no
+        # owning QObject, so Qt/PySide can't resolve a receiver thread for
+        # it and silently falls back to invoking it directly on whichever
+        # thread calls emit() -- i.e. back on the worker thread, touching
+        # widgets off the UI thread. A bound method of this QObject gives
+        # Qt a real receiver thread to marshal the call onto.
+        if not _alive(self):
+            return
+        self._refresh_account_row("in")
+
+    def _on_refused(self):
+        """Show that a present token is not necessarily a usable sign-in."""
+        if not _alive(self):
+            return
+        self._refresh_account_row("refused")
+
+    def _warm_xbox_preauth(self):
+        """Mint the Xbox token chain now rather than at PLAY.
+
+        launch.py calls xbl_preauth again on its own, so nothing breaks
+        without this -- but a still-fresh cache from here is what lets that
+        call skip its network round trip, moving the whole SISU/XSTS chain
+        off PLAY and into the moment the player is already waiting on a
+        sign-in. It also settles the account row: the row goes green on the
+        MSA token alone, and only this says whether Xbox agreed.
+        """
+        def work():
+            from .auth import (
+                account_epoch_is_current, msa_refresh_result,
+                msa_save_for_account_epoch, msa_session_snapshot, xbl_preauth)
             try:
-                root.withdraw()
+                token, epoch = msa_session_snapshot()
+                if not token:
+                    return
+                fresh, error = msa_refresh_result(token.get("refresh_token"))
+                if not fresh:
+                    # A transport failure raises and follows the best-effort
+                    # path below. Only Microsoft's explicit invalid_grant
+                    # means this account needs a fresh device-code sign-in;
+                    # transient service errors must not sign the player out.
+                    if (error == "invalid_grant"
+                            and account_epoch_is_current(epoch)):
+                        self._auth_bridge.refused.emit()
+                    return
+                # Microsoft may rotate refresh tokens. The old warm-up threw
+                # that replacement away, so a later launch could find only a
+                # revoked token even though the GUI still looked signed in.
+                # Save it under the same logout generation before continuing.
+                if not msa_save_for_account_epoch(
+                        {"refresh_token": fresh["refresh_token"],
+                         "obtained": int(time.time())}, epoch):
+                    return
+                if xbl_preauth(fresh.get("access_token"), epoch):
+                    # Runs on the raw worker thread started below, which has
+                    # no Qt event loop -- go through AuthBridge rather than
+                    # QTimer.singleShot (see AuthBridge docstring).
+                    self._auth_bridge.refreshed.emit()
             except Exception:
+                # Best-effort warm-up: PLAY re-runs the whole chain and is
+                # where a real failure has to be reported, with its
+                # diagnostic attached.
                 pass
-        root.after(0, hide)
 
-    def come_back_from_game():
-        """Map the launcher window again, whether the game ran or failed."""
-        if not ui.get("stepped_aside"):
+        threading.Thread(target=work, daemon=True).start()
+
+    def _code_dialog(self, url, code):
+        full_url = f"https://login.live.com/oauth20_remoteconnect.srf?otc={code}"
+        dlg = QDialog(self)
+        dlg.setObjectName("Root")
+        dlg.setWindowTitle("Sign in to Microsoft")
+        dlg.setStyleSheet(self.theme.qss())
+        dlg.setMinimumWidth(400)
+        self._auth_dialog = dlg
+
+        def on_close():
+            self.na.stop()
+            self.ui_state.pop("play_after_signin", None)
+            self._refresh_account_row("in" if msa_signed_in() else "out")
+            dlg.close()
+        dlg.finished.connect(lambda _r: on_close())
+
+        outer = QVBoxLayout(dlg)
+        outer.setContentsMargins(20, 20, 20, 20)
+        outer.setSpacing(14)
+
+        head = QLabel("Sign in with Microsoft"); head.setObjectName("Title")
+        outer.addWidget(head)
+        sub = QLabel("Use the account that owns Minecraft.")
+        sub.setObjectName("Sub")
+        sub.setWordWrap(True)
+        outer.addWidget(sub)
+
+        card = QFrame(); card.setObjectName("Card")
+        cv = QVBoxLayout(card)
+        cv.setContentsMargins(18, 18, 18, 18)
+        cv.setSpacing(12)
+
+        step1 = QLabel("1. Open the sign-in page")
+        step1.setStyleSheet("font-weight:700;")
+        cv.addWidget(step1)
+        cv.addWidget(btn("Open Microsoft sign-in \u2197",
+                        lambda: subprocess.Popen(["xdg-open", full_url],
+                                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
+                        kind="primary", h=42))
+
+        step2 = QLabel("2. Enter this code")
+        step2.setStyleSheet("font-weight:700; margin-top:4px;")
+        cv.addWidget(step2)
+
+        code_pill = QFrame(); code_pill.setObjectName("Pill")
+        code_v = QVBoxLayout(code_pill)
+        code_v.setContentsMargins(14, 10, 14, 10)
+        code_lbl = QLabel(code)
+        code_lbl.setAlignment(Qt.AlignCenter)
+        code_lbl.setStyleSheet("font-family: monospace; font-size: 30px; font-weight: 700; "
+                                f"color: {self.theme.blue}; letter-spacing: 4px;")
+        code_v.addWidget(code_lbl)
+        cv.addWidget(code_pill)
+
+        self._copy_btn = btn("Copy code", lambda: self._copy_signin_code(code), kind="ghost", h=32)
+        cv.addWidget(self._copy_btn)
+
+        outer.addWidget(card)
+
+        waiting = QLabel("Waiting for you to finish signing in in your browser\u2026")
+        waiting.setObjectName("Muted")
+        waiting.setWordWrap(True)
+        outer.addWidget(waiting)
+
+        close_row = QHBoxLayout()
+        close_row.addStretch(1)
+        close_row.addWidget(btn("Cancel", dlg.close, kind="ghost", w=90, h=32))
+        outer.addLayout(close_row)
+
+        dlg.resize(420, 420)
+        dlg.show()
+
+    def _copy_signin_code(self, code):
+        QApplication.clipboard().setText(code)
+        if getattr(self, "_copy_btn", None):
+            self._copy_btn.setText("Copied \u2713")
+            QTimer.singleShot(1500, lambda: self._copy_btn.setText("Copy code"))
+
+    # ------------------------------------------------------------ play / kill
+    def do_play(self, *, editor=False, hidden=False):
+        if self.ui_state["busy"]:
             return
-        ui["stepped_aside"] = False
-
-        def show():
-            try:
-                root.deiconify()
-                root.lift()
-                root.focus_force()
-            except Exception:
-                pass
-        root.after(0, show)
-
-    def do_play():
-        if ui["busy"]:
+        ver = self.selected_version()
+        if ver is None:
+            self.warn_box("No version selected", "Pick a Minecraft version first.")
             return
-        busy(True)
-        set_status("Preparing…", T.FG)
-        bar_busy()
+        if self.ui_state.get("store_login_active"):
+            # The download needs the account that sign-in is for, so starting
+            # it now buys one certain failure: setup gets as far as the
+            # download, finds no account and stops. Three of those in a row
+            # is what issue #214 was reported with.
+            self._store_login_already_open()
+            return
+        # The Xbox sign-in is Bedrock's; Minecraft Education asks for its
+        # own school or work account once it starts.
+        xbox_live = (ver.get("edition") or {}).get("xbox_live", True)
+        if xbox_live and not self._online_sign_in_settled():
+            return
+        if not self._preview_data_settled(ver):
+            return
+        self._set_busy(True)
+        self.set_status("Preparing…")
+        self._show_bar_busy()
+
+        w = LaunchWorker(ver, editor=editor, hidden=hidden)
+        w.progress.connect(self.set_progress)
+        w.done.connect(self._play_finished)
+        w.failed.connect(self._play_failed)
+        w.needs_store_signin.connect(self._store_signin_needed)
+        w.close_window.connect(self._close_for_game)
+        w.step_aside.connect(self._step_aside_for_game)
+        w.come_back.connect(self._come_back_from_game)
+        w.session_notice.connect(self._show_session_notice)
+        self.ui_state["launch_active"] = True
+        if not self._start_worker("play", w):
+            # The previous launch thread is still on its way out. Leaving the
+            # window busy would leave PLAY a KILL button with nothing to kill.
+            self.ui_state["launch_active"] = False
+            self.end_progress()
+            self._set_busy(False)
+
+    def _preview_data_settled(self, ver) -> bool:
+        """Ask, the first time, whether Preview starts from the stable game's
+        worlds. False when the player closed the question instead.
+
+        Preview keeps a data folder of its own -- Mojang's choice, so that a
+        world it upgrades never reaches the stable game -- and without this
+        the first Preview launch looked like every world, setting and server
+        had gone. The launch makes the copy; this only records a no.
+        """
+        if ((ver.get("edition") or {}).get("id") != "preview"
+                or not saves.preview_copy_pending()):
+            return True
+        box = self._box(
+            QMessageBox.Question, "Bring your worlds to Preview?",
+            "Minecraft Preview keeps its own worlds, settings and servers, "
+            "apart from Minecraft's, and has none yet.\n\n"
+            "Copy yours into it? Minecraft keeps the originals: a world "
+            "Preview opens is upgraded to a version Minecraft does not have "
+            "yet, so the two never share one.")
+        copy = box.addButton("Copy my worlds", QMessageBox.AcceptRole)
+        empty = box.addButton("Start Preview empty", QMessageBox.DestructiveRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(copy)
+        box.exec()
+        if box.clickedButton() is empty:
+            saves.keep_preview_separate()
+            return True
+        return box.clickedButton() is copy
+
+    def _show_session_notice(self, message):
+        if self.ui_state.get("window_gone"):
+            desktop_notify(message[:400], "Your worlds are safe")
+            return
+        self.info_box("Your worlds are safe", message)
+
+    def _close_for_game(self):
+        """The player asked for this in Settings ▸ General: the window goes
+        for good the moment the game starts, while this process stays alive
+        in the background to see the launch/session out."""
+        if self.ui_state.get("window_gone"):
+            return
+        self.ui_state["window_gone"] = True
+        self.na.stop()
+        self._force_close = True
+        self.close()
+
+    def _step_aside_for_game(self):
+        """Single-window sessions (e.g. Steam Game Mode) show one window at
+        a time, so hide instead of closing; ``_come_back_from_game`` restores it."""
+        if self.ui_state.get("stepped_aside"):
+            return
+        self.ui_state["stepped_aside"] = True
+        self.hide()
+
+    def _come_back_from_game(self):
+        if not self.ui_state.get("stepped_aside"):
+            return
+        self.ui_state["stepped_aside"] = False
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _play_finished(self, _result):
+        self.ui_state["launch_active"] = False
+        self.ui_state.pop("store_signin_offered", None)
+        self.ui_state.pop("gpu_ack_resumed", None)
+        if self.ui_state.get("window_gone"):
+            QApplication.instance().quit()
+            return
+        self.set_status("Minecraft closed.")
+        self.end_progress()
+        self._set_busy(False)
+        self._offer_pending_restart()
+
+    def _play_failed(self, message):
+        self.ui_state["launch_active"] = False
+        self.ui_state.pop("store_signin_offered", None)
+        log._LOG_SINK(f"xx {message}")
+        if self.ui_state.get("window_gone"):
+            desktop_notify(message[:400], "Minecraft could not start")
+            QApplication.instance().quit()
+            return
+        self.set_status("Minecraft could not start.", self.theme.red)
+        self.end_progress()
+        self._set_busy(False)
+        # PLAY resumes by itself after an acknowledgement, once: should that
+        # attempt be refused again, the refusal is shown as it is.
+        resumed = self.ui_state.pop("gpu_ack_resumed", False)
+        try:
+            ack = gpu_crash_acknowledgement_status()
+        except Exception:
+            ack = None
+        if ack and ack.can_acknowledge and not resumed:
+            self._offer_gpu_ack(ack, prefix=message[:2000] + "\n\n",
+                                 title="Minecraft could not start",
+                                 then=self._play_again_after_ack)
+        else:
+            # With the way to report it one click away (see error_box).
+            self.error_box("Minecraft could not start", message[:2000],
+                           report=True)
+        self._offer_pending_restart()
+
+    def open_report(self, title="", comment=""):
+        """The "Report a problem" window (bol.gui_report)."""
+        from .gui_report import open_report_dialog
+        return open_report_dialog(self, title=title or "",
+                                  comment=comment or "")
+
+    def _play_again_after_ack(self):
+        """The player pressed PLAY and answered Yes: carry on with PLAY.
+
+        Acknowledging used to end on a note saying PLAY would run its checks
+        again, and nothing else; the player had to press PLAY a second time.
+        Every check still runs on this attempt.
+        """
+        previous = self._workers.get("play")
+        if previous is not None and previous.isRunning():
+            # It emitted failed() as it returned, and the dialog in between
+            # was modal: this is a matter of milliseconds.
+            previous.wait(5000)
+        self.ui_state["gpu_ack_resumed"] = True
+        self.set_status("Acknowledged — starting Minecraft…")
+        self.do_play()
+
+    def _store_signin_needed(self, message):
+        """PLAY got as far as the download and found no account for it.
+
+        Reporting this as "Minecraft could not start" was true and useless:
+        the player is told something failed, with nothing in the window to act
+        on, and the account it means is not the one they signed into. Offer
+        that account instead, and resume PLAY on its own once it is there.
+        """
+        self.ui_state["launch_active"] = False
+        log._LOG_SINK(f"xx {message}")
+        if self.ui_state.get("window_gone"):
+            desktop_notify(message[:400], "Minecraft could not start")
+            QApplication.instance().quit()
+            return
+        self.end_progress()
+        self._set_busy(False)
+        self.set_status("Microsoft sign-in needed to download Minecraft.",
+                        self.theme.gold)
+        if self.ui_state.pop("store_signin_offered", False):
+            # PLAY already went through the sign-in once for this attempt and
+            # the download still says there is no account. Offering the same
+            # window again is the loop from issue #214, not a fix.
+            self.error_box("Minecraft could not be downloaded", message[:2000])
+        elif self._offer_store_account_link(message):
+            self.ui_state["store_signin_offered"] = True
+            self._link_store_account(then=self.do_play)
+        self._offer_pending_restart()
+
+    def _set_busy(self, on):
+        self.ui_state["busy"] = on
+        if on:
+            self.play_btn.setObjectName("Kill")
+            self.play_btn.setText("⏹  KILL")
+            self.play_btn.clicked.disconnect()
+            self.play_btn.clicked.connect(kill_wine)
+        else:
+            self.play_btn.setObjectName("Play")
+            self.play_btn.setText("▶  PLAY")
+            self.play_btn.clicked.disconnect()
+            self.play_btn.clicked.connect(self.do_play)
+        self.play_btn.style().unpolish(self.play_btn)
+        self.play_btn.style().polish(self.play_btn)
+
+    def _offer_gpu_ack(self, ack_status, prefix="", title="Acknowledge previous GPU incident",
+                       then=None):
+        return _offer_gpu_incident_acknowledgement(
+            self, ack_status, prefix=prefix, title=title, then=then)
+
+    # ------------------------------------------------------------ settings / changelog toggles
+    def toggle_settings(self):
+        if self.stack.currentWidget() is self.settings_page:
+            self.stack.setCurrentWidget(self.hero_page)
+            self._nav_follow_page()
+        else:
+            self.stack.setCurrentWidget(self.settings_page)
+            self._on_settings_tab(self.settings_tabs.currentIndex())
+            self._nav_follow_page(self.settings_page)
+
+    def toggle_changelog(self):
+        if self.stack.currentWidget() is self.changelog_page:
+            self.stack.setCurrentWidget(self.hero_page)
+            self._nav_follow_page()
+        else:
+            self.stack.setCurrentWidget(self.changelog_page)
+            self.load_changelogs()
+            self._nav_follow_page(self.changelog_page)
+
+    def _nav_follow_page(self, page=None):
+        """Move the controller highlight onto the page just opened.
+
+        Only when it is already showing: a page opened with the mouse must not
+        make a focus ring appear out of nowhere. Without this the highlight
+        would sit on the gear button it came from while the user looks at a
+        panel full of controls it has not reached.
+        """
+        nav = getattr(self, "nav", None)
+        if nav is None or not nav.is_showing():
+            return
+        if page is None:
+            nav.move_to_entry()
+        else:
+            nav.enter(page)
+
+    # ------------------------------------------------------------ settings page
+    def _build_settings(self) -> QWidget:
+        # Flat: the page title is above it and the menu is the way back, so
+        # the tabs and their cards sit straight on the window.
+        page = QFrame(); page.setObjectName("Page")
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        tabs = QTabWidget()
+        outer.addWidget(tabs, 1)
+
+        tabs.addTab(self._scrollable(self._build_general_tab()), "General")
+        self._versions_tab = tabs.addTab(
+            self._scrollable(self._build_versions_tab()), "Versions")
+        tabs.addTab(self._scrollable(self._build_advanced_tab()), "Advanced")
+        tabs.addTab(self._scrollable(self._build_tools_tab()), "Tools")
+        self._network_tab = tabs.addTab(
+            self._scrollable(self._build_network_tab()), "Network")
+        # Adding up what every build weighs means walking tens of thousands
+        # of files, so it happens when someone opens the tab that shows the
+        # figure -- not on the way to a window that may never show it.
+        self.settings_tabs = tabs
+        tabs.currentChanged.connect(self._on_settings_tab)
+        return page
+
+    def _on_settings_tab(self, index):
+        if index == getattr(self, "_versions_tab", -1):
+            self.refresh_builds()
+            self.refresh_backups()
+        if index == getattr(self, "_network_tab", -1):
+            self._refresh_network_status()
+
+    def _scrollable(self, inner: QWidget) -> QScrollArea:
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setWidget(inner)
+        return area
+
+    def _build_general_tab(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+
+        appearance = card_section(v, "Appearance")
+        theme_row = self._switch("Light theme", self.settings.get("light_theme", False),
+                               "Switch the launcher between dark and light appearance.")
+        theme_row.toggled.connect(self._save_theme_toggle)
+        appearance.addWidget(theme_row)
+
+        startup = card_section(v, "Startup")
+        cl_row = self._switch("Show changelog on startup",
+                            self.settings.get("show_changelog_on_startup", False),
+                            "Open the What's New tab automatically each time the launcher starts.")
+        cl_row.toggled.connect(lambda on: self._save_setting("show_changelog_on_startup", on))
+        startup.addWidget(cl_row)
+
+        featured_row = self._switch(
+            "Show popular add-ons on the home page",
+            self.settings.get("home_featured", True),
+            "Fetches this week's most popular add-ons, maps and texture "
+            "packs from MCPEDL when the launcher starts.")
+        featured_row.toggled.connect(self._save_home_featured)
+        startup.addWidget(featured_row)
+
+        confine_row = self._switch("Keep the mouse inside the window",
+                                 self.settings.get("confine_cursor", False),
+                                 "Fixes the cursor escaping the game in windowed mode.")
+        confine_row.toggled.connect(lambda on: self._save_setting("confine_cursor", on))
+        startup.addWidget(confine_row)
+
+        close_row = self._switch("Close the launcher when Minecraft starts",
+                               self.settings.get("close_on_launch", False),
+                               "The window closes as soon as the game starts, instead of "
+                               "waiting for it. Off by default.")
+        close_row.toggled.connect(lambda on: self._save_setting("close_on_launch", on))
+        startup.addWidget(close_row)
+
+        update_row = self._switch(
+            "Update Minecraft when started from a shortcut",
+            self.settings.get("auto_update_game", False),
+            "A direct launch shortcut installs the newest build before the "
+            "game starts, instead of staying on the one picked here. Off by "
+            "default: a server that has not updated yet refuses a newer game.")
+        update_row.toggled.connect(lambda on: self._save_setting("auto_update_game", on))
+        startup.addWidget(update_row)
+
+        controller = card_section(v, "Controller",
+            "Move a highlight around the launcher with a gamepad, for Steam "
+            "Game Mode and any other couch setup with no mouse in reach.")
+        controller_row = self._switch(
+            "Navigate with a controller",
+            self.settings.get("controller_nav", True),
+            "D-pad or left stick moves the highlight, A activates it, B goes "
+            "back, the shoulder buttons change tab and Start plays. The "
+            "highlight only appears once the controller is used, and goes "
+            "away as soon as the mouse moves.")
+        controller_row.toggled.connect(self._toggle_controller_nav)
+        controller.addWidget(controller_row)
+        self.controller_status = QLabel()
+        self.controller_status.setObjectName("Muted")
+        self.controller_status.setWordWrap(True)
+        controller.addWidget(self.controller_status)
+        self._refresh_controller_status()
+
+        accounts = card_section(v, "Accounts",
+            "Minecraft is downloaded from the Microsoft Store with the account "
+            "that owns it — a separate, device-bound session from the "
+            "in-game sign-in above.")
+        store_row = QHBoxLayout()
+        self.store_label = QLabel("Store account: …")
+        store_row.addWidget(self.store_label)
+        store_row.addStretch(1)
+        self.store_btn = btn("Link…", self._toggle_store_account, kind="ghost", w=88, h=28)
+        store_row.addWidget(self.store_btn)
+        accounts.addLayout(store_row)
+        self._refresh_store_row()
+
+        offline_row = self._switch("Warn before playing offline",
+                                 self.settings.get("warn_offline_play", True),
+                                 "PLAY says so first when nothing is signed in "
+                                 "for online play, instead of leaving Realms, "
+                                 "servers and friends to come up missing "
+                                 "in-game.")
+        offline_row.toggled.connect(lambda on: self._save_setting("warn_offline_play", on))
+        accounts.addWidget(offline_row)
+
+        presence_row = self._switch("Appear online to your Xbox friends",
+                                  self.settings.get("xbl_presence", True),
+                                  "Nothing in the game tells Xbox Live it is "
+                                  "running under Wine, so the launcher does "
+                                  "it while you play. Off means your friends "
+                                  "see you as offline and cannot join your "
+                                  "world or invite you.")
+        presence_row.toggled.connect(lambda on: self._save_setting("xbl_presence", on))
+        accounts.addWidget(presence_row)
+
+        v.addStretch(1)
+        return w
+
+    def _toggle_controller_nav(self, on):
+        self._save_setting("controller_nav", on)
+        self.apply_controller_nav(on)
+
+    def _save_theme_toggle(self, on):
+        self._save_setting("light_theme", on)
+        self.apply_theme()
+
+    def _save_setting(self, key, value):
+        self.settings = load_settings()
+        self.settings[key] = value
+        save_settings(self.settings)
+
+    def _refresh_store_row(self):
+        """Settings ▸ Accounts still shows the download account; the menu in
+        the top-right is the other place it lives now, and both are drawn
+        from the same state."""
+        if not _alive(self):
+            return
+        if _alive(getattr(self, "store_label", None)) and _alive(self.store_btn):
+            if self.ui_state.get("store_login_active"):
+                self.store_label.setText(
+                    "Store account: waiting for the sign-in window…")
+                self.store_btn.setText("Cancel")
+            else:
+                from . import xodus
+                linked = xodus.signed_in()
+                self.store_label.setText(
+                    "Store account: " + ("linked" if linked else "not linked"))
+                self.store_btn.setText("Unlink" if linked else "Link…")
+        self._refresh_accounts()
+
+    def _toggle_store_account(self):
+        from . import xodus
+        if self.ui_state.get("store_login_active"):
+            self._cancel_store_login()
+            return
+        if xodus.signed_in():
+            self._unlink_store_account()
+        else:
+            self._link_store_account()
+
+    # ------------------------------------------------------- installed builds
+    # What a build folder is, in one place, because it is the sentence the
+    # whole tab exists to say: the download and nothing else. Worlds, options,
+    # screenshots, skins and packs live in the profile's Wine prefix, beside
+    # the account that made them, and no removal here touches them.
+    _BUILDS_EXPLAINER = (
+        "Every build is downloaded into a folder of its own, so going back to "
+        "one you already have is instant — and so three builds tried out are "
+        "three copies of a game that size. Remove the ones you are finished "
+        "with here.\n\n"
+        "Your worlds, settings, screenshots, skins and packs are not kept in "
+        "these folders. They belong to the profile, and every version of "
+        "Minecraft opens the same ones (Preview keeps a set of its own), so "
+        "removing a build never removes anything you made — and playing that "
+        "version again simply downloads it back."
+    )
+
+    _BACKUPS_EXPLAINER = (
+        "Before a different version opens your worlds, the launcher keeps a "
+        "copy of everything you made in that edition: worlds, settings, the "
+        "Servers tab, skins and packs. A world a newer version has opened is "
+        "upgraded for good, and the copy made before it is the way back. The "
+        "last five are kept."
+    )
+
+    def _build_versions_tab(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+
+        builds = card_section(v, "Downloaded Minecraft versions",
+                              self._BUILDS_EXPLAINER)
+        self.builds_summary = QLabel("Reading what is installed…")
+        self.builds_summary.setObjectName("Muted")
+        self.builds_summary.setWordWrap(True)
+        builds.addWidget(self.builds_summary)
+
+        self.builds_list = QVBoxLayout()
+        self.builds_list.setSpacing(6)
+        builds.addLayout(self.builds_list)
+
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        actions.addWidget(btn("Refresh", self.refresh_builds, kind="ghost",
+                              w=84, h=30,
+                              tip="Read the installed builds and their sizes "
+                                  "again."))
+        builds.addLayout(actions)
+
+        backups = card_section(v, "Backups of your worlds",
+                               self._BACKUPS_EXPLAINER)
+        self.backups_summary = QLabel("Reading the backups…")
+        self.backups_summary.setObjectName("Muted")
+        self.backups_summary.setWordWrap(True)
+        backups.addWidget(self.backups_summary)
+
+        self.backups_list = QVBoxLayout()
+        self.backups_list.setSpacing(6)
+        backups.addLayout(self.backups_list)
+
+        backup_actions = QHBoxLayout()
+        backup_actions.addWidget(btn(
+            "Copy my worlds to Preview", self._copy_to_preview, kind="ghost",
+            h=30, tip="Give Minecraft Preview a copy of Minecraft's worlds, "
+                      "settings and servers. What Preview has now is backed "
+                      "up first."))
+        backup_actions.addStretch(1)
+        backup_actions.addWidget(btn(
+            "Open folder", self._open_backups, kind="ghost", w=110, h=30,
+            tip=str(saves.BACKUPS)))
+        backups.addLayout(backup_actions)
+
+        v.addStretch(1)
+        return w
+
+    # ------------------------------------------------------- world backups
+    def refresh_backups(self):
+        if not _alive(getattr(self, "backups_summary", None)):
+            return
+        while self.backups_list.count():
+            item = self.backups_list.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        backups = saves.list_backups()
+        if not backups:
+            self.backups_summary.setText(
+                "No backup yet — one is made the first time a different "
+                "version is about to open your worlds.")
+            return
+        total = sum(backup.get("size") or 0 for backup in backups)
+        self.backups_summary.setText(
+            f"{len(backups)} backup{'s' if len(backups) != 1 else ''}, "
+            f"{self._fmt_size(total)} in total.")
+        for backup in backups:
+            self.backups_list.addWidget(self._backup_row(backup))
+
+    @staticmethod
+    def _backup_title(backup):
+        edition = saves.EDITION_NAMES.get(backup.get("edition"), "Minecraft")
+        reason = backup.get("reason")
+        if reason == "version-change" and backup.get("version"):
+            return f"{edition}, before {backup['version']}"
+        if reason == "before-restore":
+            return f"{edition}, before a restore"
+        if reason == "before-preview-copy":
+            return f"{edition}, before the copy from Minecraft"
+        if reason == "after-interrupted-swap":
+            return f"{edition}, made while a restore was interrupted"
+        return edition
+
+    def _backup_notes(self, backup):
+        notes = [time.strftime("%Y-%m-%d %H:%M",
+                               time.localtime(backup.get("created") or 0))]
+        if backup.get("reason") == "version-change" and backup.get("previous"):
+            notes.append(f"saved by {backup['previous']}")
+        worlds = backup.get("worlds") or 0
+        notes.append(f"{worlds} world{'s' if worlds != 1 else ''}")
+        notes.append(self._fmt_size(backup.get("size") or 0))
+        return "  ·  ".join(notes)
+
+    def _backup_row(self, backup):
+        row = QFrame()
+        row.setObjectName("CardFlat")
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(8)
+
+        text = QVBoxLayout()
+        text.setSpacing(2)
+        title = QLabel(self._backup_title(backup))
+        title.setStyleSheet("font-weight:600;")
+        text.addWidget(title)
+        notes = QLabel(self._backup_notes(backup))
+        notes.setObjectName("Muted")
+        notes.setStyleSheet("font-size:11px;")
+        notes.setWordWrap(True)
+        text.addWidget(notes)
+        layout.addLayout(text, 1)
+
+        layout.addWidget(btn("Open", lambda: self._open_folder(backup["path"]),
+                             kind="ghost-small", w=64, h=28,
+                             tip=str(backup["path"])))
+        layout.addWidget(btn("Restore", lambda: self._restore_backup(backup),
+                             kind="ghost-small", w=76, h=28,
+                             tip="Put these worlds, settings and servers "
+                                 "back. What is there now is backed up "
+                                 "first."))
+        return row
+
+    def _open_folder(self, path):
+        subprocess.Popen(["xdg-open", str(path)],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def _open_backups(self):
+        saves.BACKUPS.mkdir(parents=True, exist_ok=True)
+        self._open_folder(saves.BACKUPS)
+
+    def _saved_data_blocked(self, action) -> bool:
+        if self.ui_state.get("launch_active") or _mc_running():
+            self.warn_box("Minecraft is running",
+                          f"Close the game before you {action}.")
+            return True
+        return False
+
+    def _restore_backup(self, backup):
+        if self._saved_data_blocked("restore a backup"):
+            return
+        edition = saves.EDITION_NAMES.get(backup.get("edition"), "Minecraft")
+        box = self._box(
+            QMessageBox.Question, f"Restore {self._backup_title(backup)}?",
+            f"Your {edition} worlds, settings and servers go back to how "
+            f"they were on {self._backup_notes(backup).split('  ·  ')[0]}."
+            "\n\nWhat is there now is backed up first, so this can be "
+            "undone from this list.")
+        restore = box.addButton("Restore", QMessageBox.AcceptRole)
+        box.addButton("Cancel", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is not restore:
+            return
+        self.backups_summary.setText("Restoring…")
+        self._run_saved_data_job(
+            "backup-restore", saves.restore_backup, backup["path"],
+            done=f"{edition} worlds and settings restored.",
+            title="Restore backup")
+
+    def _copy_to_preview(self):
+        if self._saved_data_blocked("copy your worlds"):
+            return
+        if not self.question_box(
+                "Copy your worlds to Preview?",
+                "Minecraft Preview gets a copy of Minecraft's worlds, "
+                "settings and servers in place of its own. What Preview has "
+                "now is backed up first, and Minecraft keeps its originals."):
+            return
+        self.backups_summary.setText("Copying into Preview…")
+        self._run_saved_data_job(
+            "preview-copy", saves.copy_to_preview_when_idle,
+            done="Minecraft Preview now has a copy of your worlds.",
+            title="Copy to Preview")
+
+    def _run_saved_data_job(self, slot, func, *args, done, title):
+        worker = Worker(func, *args)
+
+        def finished(_result):
+            if not _alive(self):
+                return
+            self.set_status(done, self.theme.green)
+            self.refresh_backups()
+
+        def failed(message):
+            if not _alive(self):
+                return
+            self.refresh_backups()
+            self.error_box(title, message[:2000])
+
+        worker.done.connect(finished)
+        worker.failed.connect(failed)
+        if not self._start_worker(slot, worker):
+            self.refresh_backups()
+
+    def refresh_builds(self):
+        """Re-read what is on disk, off the UI thread.
+
+        Each build is a tree of tens of thousands of files, and adding up
+        what they weigh is what makes this worth a worker rather than a
+        function call in a paint path.
+        """
+        if not _alive(getattr(self, "builds_summary", None)):
+            return
+        self.builds_summary.setText("Reading what is installed…")
+        worker = Worker(installed_builds)
+        worker.done.connect(
+            lambda builds: _alive(self) and self._show_builds(builds))
+        worker.failed.connect(
+            lambda message: _alive(self) and self.builds_summary.setText(
+                f"Could not read the installed builds: {message}"))
+        self._start_worker("builds", worker)
+
+    def _show_builds(self, builds):
+        if not _alive(getattr(self, "builds_summary", None)):
+            return
+        while self.builds_list.count():
+            item = self.builds_list.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        if not builds:
+            self.builds_summary.setText(
+                "No Minecraft build is installed yet — PLAY downloads the "
+                "version selected on the main screen.")
+            return
+        total = sum(build["size"] or 0 for build in builds)
+        summary = (f"{len(builds)} build{'s' if len(builds) != 1 else ''} "
+                   f"installed, {self._fmt_size(total)} in total.")
+        # The figure the whole tab is about: what removing one would buy.
+        try:
+            summary += (f" {self._fmt_size(shutil.disk_usage(str(GAMES)).free)}"
+                        " free on this drive.")
+        except OSError:
+            pass
+        self.builds_summary.setText(summary)
+        for build in builds:
+            self.builds_list.addWidget(self._build_row(build))
+        # Built after this tab, so on the first pass there is no label to
+        # write the new figure into yet.
+        if _alive(getattr(self, "free_space_label", None)):
+            self._refresh_free_space()
+
+    def _build_notes(self, build):
+        """The short, true things to say about one build under its name."""
+        notes = [self._fmt_size(build["size"] or 0)]
+        if build["in_use"]:
+            notes.append("in use")
+        if not build["playable"]:
+            # A Store build that lost the package its executable is decrypted
+            # from: it looks installed and cannot start (#216).
+            notes.append("incomplete — PLAY downloads it again")
+        if build["legacy"]:
+            notes.append("installed before the move to the Microsoft Store")
+        elif not build["managed"]:
+            notes.append("your own folder — the launcher will not remove it")
+        return "  ·  ".join(notes)
+
+    def _build_row(self, build):
+        row = QFrame()
+        row.setObjectName("CardFlat")
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(8)
+
+        text = QVBoxLayout()
+        text.setSpacing(2)
+        title = QLabel(f"{build['name']}  {build['version']}")
+        title.setStyleSheet("font-weight:600;")
+        text.addWidget(title)
+        notes = QLabel(self._build_notes(build))
+        notes.setObjectName("Muted")
+        notes.setStyleSheet("font-size:11px;")
+        notes.setWordWrap(True)
+        text.addWidget(notes)
+        layout.addLayout(text, 1)
+
+        layout.addWidget(btn("Open", lambda: self._open_build(build),
+                             kind="ghost-small", w=64, h=28,
+                             tip=str(build["path"])))
+        if build["managed"]:
+            layout.addWidget(btn("Remove", lambda: self._remove_build(build),
+                                 kind="danger-small", w=76, h=28,
+                                 tip="Delete this download. Worlds and "
+                                     "settings are kept."))
+        return row
+
+    def _open_build(self, build):
+        subprocess.Popen(["xdg-open", str(build["path"])],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def _remove_build(self, build):
+        if self.ui_state.get("launch_active") or _mc_running():
+            self.warn_box("Minecraft is running",
+                          "Close the game before removing a build.")
+            return
+        where = str(build["path"])
+        detail = (
+            f"This deletes the {self._fmt_size(build['size'] or 0)} download "
+            f"in\n{where}\n\n"
+            "Your worlds, settings, screenshots and packs are kept — they "
+            "are stored with your profile, not with the build.")
+        if build["in_use"]:
+            detail += ("\n\nThis is the build the launcher currently starts. "
+                       "PLAY will download it again if you pick it.")
+        box = self._box(QMessageBox.Warning,
+                        f"Remove {build['name']} {build['version']}?", detail)
+        remove = box.addButton("Remove", QMessageBox.DestructiveRole)
+        box.addButton("Keep", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is not remove:
+            return
+        self.builds_summary.setText(f"Removing {build['version']}…")
+        worker = Worker(remove_build, build["path"])
+        worker.done.connect(
+            lambda freed: _alive(self) and self._build_removed(build, freed))
+        worker.failed.connect(
+            lambda message: _alive(self) and self._build_removal_failed(message))
+        # Its own slot: a listing still adding up sizes must not swallow the
+        # removal that was just confirmed.
+        if not self._start_worker("build-remove", worker):
+            self.refresh_builds()
+
+    def _build_removed(self, build, freed):
+        self.set_status(
+            f"Removed {build['name']} {build['version']} — "
+            f"{self._fmt_size(freed)} freed.", self.theme.green)
+        # The main screen marks the builds that are already downloaded, and
+        # one of them just stopped being.
+        self.refresh_versions()
+        self.refresh_builds()
+
+    def _build_removal_failed(self, message):
+        self.refresh_builds()
+        self.error_box("Remove build", message[:2000])
+
+    def _gpu_choice_row(self):
+        """Settings ▸ Advanced ▸ Graphics card (#275)."""
+        row = QHBoxLayout()
+        label = QLabel("Graphics card:")
+        tip = ("Which graphics card Minecraft renders on. Automatic leaves it "
+               "to the system, which on a laptop is the integrated one; pick "
+               "the discrete card to play on it.")
+        label.setToolTip(tip)
+        row.addWidget(label)
+        combo = SettingComboBox()
+        combo.setToolTip(tip)
+        combo.addItem("Automatic (system default)", gpus.AUTO)
+        try:
+            cards = gpus.list_gpus()
+        except Exception:
+            cards = []
+        for card in cards:
+            suffix = " — runs the display" if card.boot_vga else ""
+            combo.addItem(f"{card.name} ({card.slot}){suffix}", card.slot)
+        current = str(self.settings.get(gpus.SETTING) or gpus.AUTO)
+        index = combo.findData(current)
+        if index < 0:
+            # Chosen once, gone since (an eGPU): say so rather than show
+            # Automatic for a setting that still names a card.
+            combo.addItem(f"Card not found ({current})", current)
+            index = combo.count() - 1
+        combo.setCurrentIndex(index)
+        combo.currentIndexChanged.connect(
+            lambda idx: self._save_setting(gpus.SETTING, combo.itemData(idx)))
+        self.gpu_combo = combo
+        row.addWidget(combo, 1)
+        return row
+
+    def _build_advanced_tab(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+
+        graphics = card_section(v, "Graphics")
+        rt = self._switch("Ray tracing", self.settings.get("ray_tracing", True),
+                        "Hands DXR to Minecraft for its Ray Traced mode. Needs an "
+                        "RTX-class GPU and a ray-tracing-capable world.")
+        rt.toggled.connect(lambda on: self._save_setting("ray_tracing", on))
+        graphics.addWidget(rt)
+
+        fr = self._switch("Limit frame rate to the display",
+                        self.settings.get("limit_frame_rate", True),
+                        "Caps an unlimited game at the display's rate. On "
+                        "Wayland or gamescope it also paces vsync just under "
+                        "it, for less mouse delay.")
+        fr.toggled.connect(lambda on: self._save_setting("limit_frame_rate", on))
+        graphics.addWidget(fr)
+
+        lr = self._switch("Legacy compatibility renderer",
+                        self.settings.get("renderer", "auto") == "opengl",
+                        "Last resort for GPUs without Vulkan 1.3 — drops DXVK/vkd3d.")
+        lr.toggled.connect(lambda on: self._save_setting("renderer", "opengl" if on else "auto"))
+        graphics.addWidget(lr)
+
+        graphics.addLayout(self._gpu_choice_row())
+
+        env = card_section(v, "Environment")
+        env.addWidget(QLabel("Custom environment variables"))
+        env_entry = QLineEdit(self.settings.get("custom_env") or "")
+        env_entry.setPlaceholderText("e.g., PROTON_USE_WINED3D=1 KEY=VALUE")
+        env_entry.textChanged.connect(lambda t: self._save_setting("custom_env", t))
+        env.addWidget(env_entry)
+
+        env.addWidget(QLabel("Gamescope arguments"))
+        gs_entry = QLineEdit(self.settings.get("gamescope") or "")
+        gs_entry.setPlaceholderText("1 for auto, or e.g. -w 1920 -h 1080 -f")
+        gs_entry.textChanged.connect(lambda t: self._save_setting("gamescope", t))
+        env.addWidget(gs_entry)
+
+        self._build_storage_card(v)
+
+        diagnostics = card_section(v, "Diagnostics")
+        diag = self._switch("Advanced diagnostics", self.settings.get("diagnostics", False),
+                          "Verbose logs, for attaching to bug reports.")
+        diag.toggled.connect(lambda on: self._save_setting("diagnostics", on))
+        diagnostics.addWidget(diag)
+
+        v.addStretch(1)
+        return w
+
+    def _build_storage_card(self, v):
+        storage = card_section(v, "Storage",
+            "Where the engine, downloaded Minecraft versions, saves and "
+            "settings are stored. Changing this requires a restart.")
+
+        path_row = QHBoxLayout()
+        self.loc_label = QLabel(get_install_location())
+        self.loc_label.setStyleSheet("font-family: monospace;")
+        path_row.addWidget(self.loc_label, 1)
+        copy_btn = btn("Copy", self._copy_install_path, kind="ghost", w=54, h=28, tip="Copy path")
+        copy_btn.setStyleSheet("font-size:11px;")
+        open_btn = btn("Open", self._open_install_folder, kind="ghost", w=54, h=28,
+                        tip="Open in file manager")
+        open_btn.setStyleSheet("font-size:11px;")
+        path_row.addWidget(copy_btn)
+        path_row.addWidget(open_btn)
+        storage.addLayout(path_row)
+
+        self.free_space_label = QLabel("")
+        self.free_space_label.setObjectName("Muted")
+        storage.addWidget(self.free_space_label)
+        self._refresh_free_space()
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_row.addWidget(btn("Browse…", self._do_browse_location, kind="ghost", w=84, h=32,
+                               tip="Choose a new folder and move your existing worlds, "
+                                   "settings and login there."))
+        btn_row.addWidget(btn("Reset", self._do_reset_location, kind="flat", w=64, h=32,
+                               tip="Clear the saved preference and go back to the default location."))
+        storage.addLayout(btn_row)
+
+        self.loc_status_label = QLabel("")
+        self.loc_status_label.setStyleSheet(f"color:{self.theme.gold};")
+        storage.addWidget(self.loc_status_label)
+
+    def _refresh_free_space(self):
+        try:
+            p = Path(self.loc_label.text())
+            check_p = p if p.exists() else p.parent
+            free = shutil.disk_usage(check_p).free
+            self.free_space_label.setText(f"{self._fmt_size(free)} free on this drive")
+        except Exception:
+            self.free_space_label.setText("")
+
+    @staticmethod
+    def _fmt_size(n):
+        for unit in ("B", "KB", "MB", "GB"):
+            if n < 1024.0:
+                return f"{n:.1f} {unit}"
+            n /= 1024.0
+        return f"{n:.1f} TB"
+
+    def _copy_install_path(self):
+        QApplication.clipboard().setText(self.loc_label.text())
+
+    def _open_install_folder(self):
+        subprocess.Popen(["xdg-open", self.loc_label.text()],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def _relocate_blocked(self):
+        if self.ui_state.get("launch_active") or _mc_running():
+            self.warn_box("Minecraft is running",
+                          "Close Minecraft first before changing the game files location.")
+            return True
+        if self.ui_state.get("busy"):
+            self.warn_box("Operation in progress",
+                          "Wait for the current preparation task to finish before "
+                          "changing the game files location.")
+            return True
+        return False
+
+    def _do_browse_location(self):
+        if self._relocate_blocked():
+            return
+        if not is_relocation_allowed():
+            self.error_box("Relocation disabled",
+                "BOL_HOME is set in the environment. The location cannot be "
+                "changed via the GUI.")
+            return
+        chosen = QFileDialog.getExistingDirectory(self, "Choose a folder for BedrockOnLinux's files")
+        if not chosen:
+            return
+        old_dir = Path(get_install_location())
+        new_dir = Path(chosen).expanduser()
+        if paths_overlap(old_dir, new_dir):
+            if old_dir.resolve() == new_dir.resolve():
+                return
+            self.error_box("Invalid location",
+                "The new location can't be inside the current location "
+                "(or the other way around). Choose a separate folder.")
+            return
+
+        warning_msg = (
+            "Game Location Change\n\n"
+            f"Current location: {old_dir}\nNew location: {new_dir}\n\n"
+            "Your worlds, saves, settings, and login tokens will be moved.\n"
+            "The game engine will be re-downloaded for compatibility.\n\n"
+            "Proceed with relocation?")
+        if not self.question_box("Confirm Relocation", warning_msg):
+            return
+
+        existing_data = any((new_dir / item).exists() for item in DIRS_TO_MOVE + FILES_TO_MOVE)
+        if existing_data and not self.question_box(
+                "Existing data detected",
+                "The new location already contains user data. Proceeding will "
+                "overwrite matching folders (backed up with .old). Continue?"):
+            return
+
+        total_size = 0
+        for sub in DIRS_TO_MOVE:
+            src = old_dir / sub
+            if src.exists() and not src.is_symlink():
+                total_size += sum(f.stat().st_size for f in src.rglob("*") if f.is_file())
+        for fname in FILES_TO_MOVE:
+            src = old_dir / fname
+            if src.exists() and src.is_file():
+                total_size += src.stat().st_size
+
+        new_path = new_dir if new_dir.exists() else new_dir.parent
+        try:
+            free_space = shutil.disk_usage(new_path).free
+        except Exception as e:
+            self.error_box("Could not check free space", str(e))
+            return
+        if total_size > free_space:
+            self.error_box("Not enough free space",
+                f"The new location has {self._fmt_size(free_space)} free, but "
+                f"you need {self._fmt_size(total_size)}.")
+            return
+
+        self.ui_state["busy"] = True
+        self.loc_status_label.setText("Moving user data…")
 
         def work():
-            try:
-                ver = selected_version()
-                do_setup(mc_ver=ver, progress=set_progress)
-                set_status("Starting Minecraft…", T.FG)
-                ui["launch_active"] = True
-                try:
-                    launch(on_started=step_aside_for_game)
-                finally:
-                    # Before the failure dialog below: it is a child of a
-                    # window that has to be on screen to carry it.
-                    come_back_from_game()
-                set_status("Minecraft closed.", T.SUB)
-            except Exception as e:
-                message = str(e) or type(e).__name__
-                try:
-                    ack = gpu_crash_acknowledgement_status()
-                except Exception:
-                    ack = None
-                if ack and ack.can_acknowledge:
-                    if ack.previous_boot_fault:
-                        message += (
-                            "\n\nAfter repairing/updating the graphics driver "
-                            "and rebooting, open Settings → Tools to "
-                            "acknowledge this verified previous-boot fault."
-                        )
-                    else:
-                        message += (
-                            "\n\nThis interrupted launch belongs to a previous "
-                            "boot and no fatal driver event was detected. "
-                            "After checking why it stopped, open Settings → "
-                            "Tools to acknowledge it."
-                        )
-                log._LOG_SINK(f"xx {message}")
-                set_status("Minecraft could not start.", T.RED)
-                root.after(0, lambda text=message: messagebox.showerror(
-                    "Minecraft could not start", text[:2000], parent=root))
-            finally:
-                # A launcher left unmapped would be unreachable, so restore it
-                # here too, on any path the inner handler could have missed.
-                come_back_from_game()
-                ui["launch_active"] = False
-                end_progress()
-                root.after(0, lambda: busy(False))
-        threading.Thread(target=work, daemon=False).start()
+            with prefix_operation_lock("relocate user data"):
+                migrate_data(old_dir, new_dir)
 
-    settings_view = ctk.CTkFrame(view_area, fg_color=T.CARD, corner_radius=18,
-                                  border_width=1, border_color=T.BORDER)
+        w = Worker(work)
 
-    def toggle_settings():
-        if settings_view.winfo_ismapped():
-            settings_view.pack_forget()
-            hero.pack(fill="both", expand=True)
-            settings_btn.configure(fg_color=T.CARD_2)
-        else:
-            hero.pack_forget()
-            changelog_view.pack_forget()
-            settings_view.pack(fill="both", expand=True)
-            settings_btn.configure(fg_color=T.CARD_3)
+        def ok(_r):
+            self.ui_state["busy"] = False
+            self.loc_status_label.setText("")
+            self.loc_label.setText(str(new_dir))
+            self._refresh_free_space()
+            self.info_box("Relocation Successful",
+                "User data moved successfully. The engine will be re-downloaded "
+                "on the next start. The launcher will now restart.")
+            self.relaunch_app()
 
-    def toggle_changelog():
-        if changelog_view.winfo_ismapped():
-            changelog_view.pack_forget()
-            hero.pack(fill="both", expand=True)
-        else:
-            hero.pack_forget()
-            settings_view.pack_forget()
-            changelog_view.pack(fill="both", expand=True)
-            settings_btn.configure(fg_color=T.CARD_2)
-            load_changelogs()
+        def fail(msg):
+            self.ui_state["busy"] = False
+            self.loc_status_label.setText("")
+            self.error_box("Relocation Error", f"Could not relocate user data:\n{msg}")
 
-    def _build_settings():
-        d = root
-        outer = ctk.CTkFrame(settings_view, fg_color="transparent")
-        outer.pack(fill="both", expand=True, padx=20, pady=18)
+        w.done.connect(ok)
+        w.failed.connect(fail)
+        self._start_worker("relocate", w)
 
-        ui["settings_head"] = ctk.CTkFrame(outer, fg_color="transparent")
-        ui["settings_head"].pack(fill="x", pady=(0, 12))
-        ctk.CTkLabel(ui["settings_head"], text="Settings", font=font(16, "bold"),
-                     text_color=T.FG).pack(side="left")
-        mkbtn(ui["settings_head"], "← Back", toggle_settings, kind="flat", width=76,
-              height=28, font=font(12)).pack(side="right")
+    def _do_reset_location(self):
+        if self._relocate_blocked():
+            return
+        if not is_relocation_allowed():
+            self.error_box("Relocation disabled",
+                "BOL_HOME is set in the environment. The location cannot be "
+                "reset via the GUI.")
+            return
+        if get_install_location() == default_install_location():
+            return
+        if not self.question_box("Reset location",
+                f"Reset to the default location ({default_install_location()})?\n\n"
+                "This only clears the saved preference — it does not move or "
+                "delete any files. Restart required."):
+            return
+        clear_install_location()
+        self.loc_label.setText(default_install_location())
+        self._refresh_free_space()
+        self.info_box("Reset Complete", "Location reset to default. The launcher will now restart.")
+        self.relaunch_app()
 
-        tabs = ctk.CTkTabview(
-            outer, fg_color=T.CARD_2, segmented_button_fg_color=T.CARD_2,
-            segmented_button_selected_color=T.THEME_ACCENT,
-            segmented_button_selected_hover_color=T.THEME_HOV,
-            segmented_button_unselected_color=T.CARD_2,
-            text_color=T.FG, corner_radius=12)
-        tabs.pack(fill="both", expand=True)
-        
-        def _mk_sf(parent):
-            sf = ctk.CTkScrollableFrame(parent, fg_color=T.CARD_2)
-            def _check(*_):
-                try:
-                    c = sf._parent_canvas
-                    if sf.winfo_reqheight() > c.winfo_height() and c.winfo_height() > 10:
-                        sf._scrollbar.grid()
-                    else:
-                        sf._scrollbar.grid_remove()
-                except Exception: pass
-            sf.bind("<Configure>", _check, add="+")
-            try: sf._parent_canvas.bind("<Configure>", _check, add="+")
-            except Exception: pass
-            sf.pack(fill="both", expand=True)
-            return sf
+    def _build_tools_tab(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
 
-        tab_general = _mk_sf(tabs.add("General"))
-        tab_advanced = _mk_sf(tabs.add("Advanced"))
-        tab_tools = _mk_sf(tabs.add("Tools"))
+        content = card_section(v, "Content")
+        content.addWidget(tool_row("Import content (.mcpack / .mcworld / .mcaddon / .mcskin)…",
+                               self._do_import,
+                               tip="Add worlds, resource/behaviour packs, add-ons or "
+                                   "skins to Minecraft."))
+        content.addWidget(tool_row("Inject a client DLL…", self._do_inject,
+                               tip="Load a client-side .dll into the running game. "
+                                   "Native / AppImage only."))
+        content.addWidget(tool_row("Open Minecraft folder",
+                               lambda: subprocess.Popen(["xdg-open", str(game_content_dir())],
+                                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
+                               tip="Open the folder holding your worlds, templates "
+                                   "and screenshots in your file manager."))
 
-        ctk.CTkLabel(tab_general, text="UI scale", text_color=T.FG,
-                     font=font(13)).pack(anchor="w", pady=(4, 2), padx=4)
-        ctk.CTkLabel(tab_general,
-                     text="Useful on high-DPI / 4K displays. "
-                          "Changing this restarts the app.",
-                     text_color=T.SUB, font=font(11)
-                     ).pack(anchor="w", pady=(0, 8), padx=4)
+        injector_sec = card_section(v, "Injector Settings")
 
-        scale_pill = ctk.CTkFrame(tab_general, fg_color=T.CARD_2, corner_radius=10)
-        scale_pill.pack(anchor="w", pady=(0, 14), padx=4)
-
-        _scale_opts = [("100%", 1.0), ("150%", 1.5), ("200%", 2.0)]
-        _cur_scale = float(load_settings().get("ui_scale", 1.0) or 1.0)
-        _scale_btns = {}
-
-        def _refresh_scale_btns(active):
-            for val, btn in _scale_btns.items():
-                if val == active:
-                    btn.configure(fg_color=T.THEME_ACCENT, text_color="#ffffff",
-                                  hover_color=T.THEME_HOV)
-                else:
-                    btn.configure(fg_color="transparent", text_color=T.SUB,
-                                  hover_color=T.CARD_3)
-
-        def pick_scale(factor):
-            if factor == _cur_scale:
-                return
-            s2 = load_settings()
-            s2["ui_scale"] = factor
-            save_settings(s2)
-            _refresh_scale_btns(factor)
-            relaunch_app()
-
-        for label, val in _scale_opts:
-            b = ctk.CTkButton(
-                scale_pill, text=label, width=64, height=30,
-                corner_radius=8, font=font(12, "bold"),
-                border_width=0, command=lambda v=val: pick_scale(v))
-            b.pack(side="left", padx=3, pady=3)
-            _scale_btns[val] = b
-        _refresh_scale_btns(_cur_scale if _cur_scale in _scale_btns else 1.0)
-
-        theme_v = tk.BooleanVar(value=load_settings().get("light_theme", False))
-        
-        def save_theme():
-            s2 = load_settings()
-            s2["light_theme"] = theme_v.get()
-            save_settings(s2)
-            ctk.set_appearance_mode("Light" if theme_v.get() else "Dark")
-            _sync_theme(root)
-            
-        ctk.CTkSwitch(tab_general, text="Use light theme",
-                      variable=theme_v, command=save_theme,
-                      progress_color=T.THEME_ACCENT, font=font(13)
-                      ).pack(anchor="w", pady=8, padx=4)
-
-        changelog_startup_v = tk.BooleanVar(value=load_settings().get("show_changelog_on_startup", False))
-        
-        def save_changelog_startup():
-            s2 = load_settings()
-            s2["show_changelog_on_startup"] = changelog_startup_v.get()
-            save_settings(s2)
-            
-        ctk.CTkSwitch(tab_general, text="Show changelog on startup",
-                      variable=changelog_startup_v, command=save_changelog_startup,
-                      progress_color=T.THEME_ACCENT, font=font(13)
-                      ).pack(anchor="w", pady=8, padx=4)
-
-        beta_v = tk.BooleanVar(value=load_settings().get("show_betas", False))
-
-        def save_beta():
-            s2 = load_settings()
-            s2["show_betas"] = beta_v.get()
-            save_settings(s2)
-            threading.Thread(target=refresh_versions, daemon=True).start()
-            load_changelogs(force=True)
-        ctk.CTkSwitch(tab_general, text="Show beta / preview versions",
-                      variable=beta_v, command=save_beta,
-                      progress_color=T.THEME_ACCENT, font=font(13)
-                      ).pack(anchor="w", pady=8, padx=4)
-
-        confine_v = tk.BooleanVar(
-            value=load_settings().get("confine_cursor", False))
-
-        def save_confine():
-            s2 = load_settings()
-            s2["confine_cursor"] = confine_v.get()
-            save_settings(s2)
-        ctk.CTkSwitch(tab_general, text="Keep the mouse inside the window\n"
-                      "(fixes the cursor escaping in windowed mode)",
-                      variable=confine_v, command=save_confine,
-                      progress_color=T.THEME_ACCENT, font=font(13)
-                      ).pack(anchor="w", pady=8, padx=4)
-
-        diag_v = tk.BooleanVar(value=load_settings().get("diagnostics", False))
-
-        def save_diag():
-            s2 = load_settings()
-            s2["diagnostics"] = diag_v.get()
-            save_settings(s2)
-        ctk.CTkSwitch(tab_advanced, text="Advanced diagnostics\n"
-                      "(verbose logs — for bug reports)",
-                      variable=diag_v, command=save_diag,
-                      progress_color=T.THEME_ACCENT, font=font(13)
-                      ).pack(anchor="w", pady=(4, 12), padx=4)
-
-        legacy_renderer_v = tk.BooleanVar(
-            value=load_settings().get("renderer", "auto") == "opengl")
-
-        def save_renderer():
-            s2 = load_settings()
-            s2["renderer"] = (
-                "opengl" if legacy_renderer_v.get() else "auto"
-            )
-            save_settings(s2)
-
-        ctk.CTkSwitch(
-            tab_advanced,
-            text="Legacy compatibility renderer\n"
-                 "(last resort for GPUs without Vulkan 1.3: swaps D3D9–D3D12\n"
-                 "to WineD3D, dropping DXVK and vkd3d — artifacts likely)",
-            variable=legacy_renderer_v, command=save_renderer,
-            progress_color=T.THEME_ACCENT, font=font(13),
-        ).pack(anchor="w", pady=(0, 12), padx=4)
-
-        ctk.CTkLabel(tab_advanced, text="Custom environment variables",
-                     text_color=T.SUB, font=font(11, "bold"),
-                     anchor="w").pack(anchor="w", pady=(0, 4), padx=4)
-
-        def save_custom_env(_event=None):
-            s2 = load_settings()
-            s2["custom_env"] = env_entry.get()
-            save_settings(s2)
-
-        env_entry = ctk.CTkEntry(
-            tab_advanced,
-            placeholder_text="e.g., PROTON_USE_WINED3D=1 KEY=VALUE",
-            fg_color=T.CARD_3, border_width=0, text_color=T.FG,
-            placeholder_text_color=T.MUTED, corner_radius=10, height=36,
-            font=font(13))
-        env_entry.pack(fill="x", pady=(0, 12), padx=4)
-        saved_env = load_settings().get("custom_env") or ""
-        if saved_env:
-            env_entry.insert(0, saved_env)
-        env_entry.bind("<KeyRelease>", save_custom_env)
-        env_entry.bind("<FocusOut>", save_custom_env)
-        env_entry.bind("<Return>", lambda _event: "break")
-        
-        ctk.CTkLabel(tab_advanced, text="Gamescope arguments",
-                     text_color=T.SUB, font=font(11, "bold"),
-                     anchor="w").pack(anchor="w", pady=(0, 4), padx=4)
-
-        def save_gamescope(_event=None):
-            s2 = load_settings()
-            s2["gamescope"] = gamescope_entry.get()
-            save_settings(s2)
-
-        gamescope_entry = ctk.CTkEntry(
-            tab_advanced,
-            placeholder_text="1 for auto, or e.g. -w 1920 -h 1080 -f",
-            fg_color=T.CARD_3, border_width=0, text_color=T.FG,
-            placeholder_text_color=T.MUTED, corner_radius=10, height=36,
-            font=font(13))
-        gamescope_entry.pack(fill="x", pady=(0, 4), padx=4)
-        saved_gamescope = load_settings().get("gamescope") or ""
-        if saved_gamescope:
-            gamescope_entry.insert(0, saved_gamescope)
-        gamescope_entry.bind("<KeyRelease>", save_gamescope)
-        gamescope_entry.bind("<FocusOut>", save_gamescope)
-        gamescope_entry.bind("<Return>", lambda _event: "break")
-
-        def fmt_size(bytes_val):
-            for unit in ['B', 'KB', 'MB', 'GB']:
-                if bytes_val < 1024.0:
-                    return f"{bytes_val:.1f} {unit}"
-                bytes_val /= 1024.0
-            return f"{bytes_val:.1f} TB"
-
-        ctk.CTkLabel(tab_advanced, text="Game files location",
-                     text_color=T.SUB, font=font(11, "bold"),
-                     anchor="w").pack(anchor="w", pady=(12, 2), padx=4)
-
-        ctk.CTkLabel(tab_advanced,
-                     text="Moves where the engine, downloaded Minecraft "
-                          "versions, saves and settings are stored — handy "
-                          "if your home drive is low on space. Changing this "
-                          "requires a restart.",
-                     text_color=T.MUTED, font=font(10), anchor="w",
-                     justify="left", wraplength=340
-                     ).pack(anchor="w", pady=(0, 6), padx=4)
-
-        loc_var = tk.StringVar(value=get_install_location())
-
-        path_row = ctk.CTkFrame(tab_advanced, fg_color="transparent")
-        path_row.pack(fill="x", padx=4, pady=(0, 2))
-
-        loc_field = ctk.CTkLabel(
-            path_row,
-            textvariable=loc_var,
-            text_color=T.FG,
-            font=font(12, family="monospace"),
-            fg_color=T.CARD_3,
-            corner_radius=8,
-            anchor="w",
-            height=36,
-            padx=12,
+        self.auto_switch = self._switch(
+            "Auto-inject client DLL on launch",
+            self.settings.get("injector_auto_enable", False),
+            "Automatically inject a DLL when Minecraft starts."
         )
-        loc_field.pack(side="left", fill="x", expand=True, padx=(0, 4))
-        loc_tip = Tooltip(loc_field, "Full path")
+        self.auto_switch.toggled.connect(lambda on: self._save_setting("injector_auto_enable", on))
+        injector_sec.addWidget(self.auto_switch)
 
-        def _copy_path():
-            root.clipboard_clear()
-            root.clipboard_append(loc_var.get())
-            copy_btn.configure(text="✓")
-            root.after(1400, lambda: copy_btn.configure(text="⧉"))
+        mode_layout = QHBoxLayout()
+        mode_label = QLabel("DLL load mode:")
+        mode_label.setToolTip("Choose whether to inject a local DLL or download one from a URL.")
+        mode_layout.addWidget(mode_label)
 
-        copy_btn = mkbtn(path_row, "⧉", _copy_path, kind="flat",
-                         width=28, height=28, font=font(14))
-        copy_btn.pack(side="right", padx=(0, 2))
-        Tooltip(copy_btn, "Copy path")
+        self.dll_mode_combo = SettingComboBox()
+        self.dll_mode_combo.addItem("File", "file")
+        self.dll_mode_combo.addItem("Download", "url")
+        current_mode = self.settings.get("injector_dll_type", "file")
+        self.dll_mode_combo.setCurrentIndex(1 if current_mode == "url" else 0)
+        self.dll_mode_combo.currentIndexChanged.connect(
+            lambda idx: self._on_injector_dll_type_toggled(self.dll_mode_combo.itemData(idx))
+        )
+        mode_layout.addWidget(self.dll_mode_combo)
+        mode_layout.addStretch(1)
+        injector_sec.addLayout(mode_layout)
 
-        def _open_folder():
-            try:
-                subprocess.Popen(["xdg-open", loc_var.get()],
-                                  stdout=subprocess.DEVNULL,
-                                  stderr=subprocess.DEVNULL)
-            except Exception:
-                pass
+        dll_layout = QHBoxLayout()
+        is_url = self.settings.get("injector_dll_type") == "url"
+        self.dll_input = QLineEdit(
+            self.settings.get("injector_dll_url" if is_url else "injector_dll_path") or ""
+        )
+        self.dll_input.textChanged.connect(self._on_injector_dll_text_changed)
+        dll_layout.addWidget(self.dll_input)
 
-        open_btn = mkbtn(path_row, "⤢", _open_folder, kind="flat",
-                         width=28, height=28, font=font(14))
-        open_btn.pack(side="right", padx=(0, 2))
-        Tooltip(open_btn, "Open in file manager")
+        self.dll_browse_btn = btn("Browse…", self._do_browse_dll, kind="ghost", w=84, h=32,
+                                  tip="Select a DLL file from your computer.")
+        dll_layout.addWidget(self.dll_browse_btn)
+        injector_sec.addLayout(dll_layout)
 
-        loc_free_var = tk.StringVar(value="")
-        free_lbl = ctk.CTkLabel(tab_advanced, textvariable=loc_free_var,
-                                text_color=T.MUTED, font=font(10), anchor="w")
-        free_lbl.pack(anchor="w", padx=4, pady=(2, 6))
+        delay_layout = QHBoxLayout()
+        delay_label = QLabel("Injection delay (seconds):")
+        delay_label.setToolTip(
+            "Wait at least this long after the game starts before injecting. "
+            "Injection also waits for the game's window, so a DLL never loads "
+            "into a game that has not opened yet.")
+        delay_layout.addWidget(delay_label)
 
-        def _refresh_free_space():
-            try:
-                p = Path(loc_var.get())
-                check_p = p if p.exists() else p.parent
-                loc_free_var.set(
-                    f"{fmt_size(shutil.disk_usage(check_p).free)} free "
-                    "on this drive")
-                loc_tip.text = loc_var.get()
-            except Exception:
-                loc_free_var.set("")
+        self.delay_spin = SettingSpinBox()
+        self.delay_spin.setRange(0, 60)
+        self.delay_spin.setValue(int(self.settings.get("injector_delay", 5)))
+        self.delay_spin.valueChanged.connect(lambda val: self._save_setting("injector_delay", val))
+        self.delay_spin.setFixedWidth(80)
+        self.delay_spin.setFixedHeight(30)
+        delay_layout.addWidget(self.delay_spin)
+        delay_layout.addStretch(1)
+        injector_sec.addLayout(delay_layout)
 
-        def _update_loc_display():
-            _refresh_free_space()
+        self._update_injector_settings_ui()
 
-        _refresh_free_space()
+        editor = card_section(
+            v, "Bedrock Editor",
+            "Mojang's world-building tool, part of the game you already have: "
+            "projects, brushes and scripted extensions instead of survival.")
+        editor.addWidget(tool_row("Open Bedrock Editor",
+                                  self._do_open_editor,
+                                  tip="Start the selected Minecraft version in "
+                                      "Editor mode instead of the game."))
 
-        loc_row = ctk.CTkFrame(tab_advanced, fg_color="transparent")
-        loc_row.pack(fill="x", pady=(4, 2), padx=4)
+        brtx = card_section(
+            v, "BetterRTX",
+            "Community ray tracing shaders, installed into the selected "
+            "Minecraft version. Only presets made for that version are "
+            "installed; the original shaders are kept and can be restored.")
+        brtx.addWidget(tool_row("Install a BetterRTX preset…",
+                                self._do_betterrtx_install,
+                                tip="Pick a preset published on "
+                                    "bedrock.graphics."))
+        brtx.addWidget(tool_row("Install a .rtpack file…",
+                                self._do_betterrtx_rtpack,
+                                tip="Install a BetterRTX pack you downloaded."))
+        brtx.addWidget(tool_row("Restore Minecraft's own ray tracing shaders",
+                                self._do_betterrtx_restore,
+                                tip="Remove BetterRTX from the selected "
+                                    "Minecraft version."))
 
-        loc_status = tk.StringVar(value="")
+        shortcuts = card_section(v, "Shortcuts")
+        shortcuts.addWidget(tool_row("Create direct launch shortcut (skips this window)…",
+                                 self._do_play_shortcut,
+                                 tip="Make a desktop/Steam shortcut that starts Minecraft "
+                                     "straight away."))
+        shortcuts.addWidget(tool_row("Create isolated Xbox account shortcut…",
+                                 self._do_create_profile_shortcut,
+                                 tip="Make a new profile with its own Xbox login, Wine "
+                                     "prefix and worlds."))
 
-        def _relocate_blocked():
-            if ui.get("launch_active"):
-                messagebox.showwarning(
-                    "Minecraft is running",
-                    "Close Minecraft first before changing the game files "
-                    "location.", parent=d)
-                return True
-            if ui.get("busy"):
-                messagebox.showwarning(
-                    "Operation in progress",
-                    "Wait for the current preparation task to finish before "
-                    "changing the game files location.", parent=d)
-                return True
-            if _mc_running():
-                messagebox.showwarning(
-                    "Minecraft is running",
-                    "Close Minecraft first before changing the game files "
-                    "location.", parent=d)
-                return True
-            return False
-
-        def do_browse():
-            if _relocate_blocked():
-                return
-
-            if not is_relocation_allowed():
-                messagebox.showerror(
-                    "Relocation disabled",
-                    "BOL_HOME is set in the environment. The location cannot be changed via the GUI.",
-                    parent=d
-                )
-                return
-
-            chosen = None
-            try:
-                result = subprocess.run(
-                    ["zenity", "--file-selection", "--directory",
-                     "--title=Choose a folder for BedrockOnLinux's files"],
-                    capture_output=True, text=True, check=False
-                )
-                if result.returncode == 0 and result.stdout.strip():
-                    chosen = result.stdout.strip()
-                else:
-                    return
-            except FileNotFoundError:
-                from tkinter import filedialog
-                chosen = filedialog.askdirectory(
-                    parent=d, title="Choose a folder for BedrockOnLinux's files",
-                    mustexist=False
-                )
-            except subprocess.SubprocessError:
-                from tkinter import filedialog
-                chosen = filedialog.askdirectory(
-                    parent=d, title="Choose a folder for BedrockOnLinux's files",
-                    mustexist=False
-                )
-
-            if not chosen:
-                return
-                
-            old_dir = Path(get_install_location())
-            new_dir = Path(chosen).expanduser()
-            if paths_overlap(old_dir, new_dir):
-                if old_dir.resolve() == new_dir.resolve():
-                    return
-                messagebox.showerror(
-                    "Invalid location",
-                    "The new location can't be inside the current location "
-                    "(or the other way around). Choose a separate folder.",
-                    parent=d
-                )
-                return
-
-            warning_msg = (
-                f"🔧 Game Location Change\n\n"
-                f"Current location: {old_dir}\n"
-                f"New location:     {new_dir}\n\n"
-                f"✅ Your worlds, saves, settings, and login tokens will be **moved** to the new location.\n\n"
-                f"⚠️ The game engine will be **re‑downloaded** to ensure compatibility with the current launcher version.\n\n"
-                f"💡 This preserves your progress and prevents hash‑mismatch errors.\n\n"
-                f"Proceed with relocation?"
-            )
-
-            if not messagebox.askyesno(
-                    "Confirm Relocation", warning_msg, parent=d, icon="info"):
-                return
-
-            existing_data = False
-            for item in DIRS_TO_MOVE + FILES_TO_MOVE:
-                if (new_dir / item).exists():
-                    existing_data = True
-                    break
-            if existing_data:
-                if not messagebox.askyesno(
-                    "Existing data detected",
-                    "The new location already contains some user data folders or files.\n\n"
-                    "Proceeding will move your current data there, overwriting any existing\n"
-                    "folders with the same name (they will be backed up with a .old suffix).\n\n"
-                    "Do you want to continue?",
-                    parent=d,
-                    icon='warning'
-                ):
-                    return
-
-            total_size = 0
-            for sub in DIRS_TO_MOVE:
-                src = old_dir / sub
-                if src.exists() and not src.is_symlink():
-                    for f in src.rglob('*'):
-                        if f.is_file():
-                            total_size += f.stat().st_size
-            for fname in FILES_TO_MOVE:
-                settings_src = old_dir / fname
-                if settings_src.exists() and settings_src.is_file():
-                    total_size += settings_src.stat().st_size
-
-            new_path = new_dir if new_dir.exists() else new_dir.parent
-            try:
-                free_space = shutil.disk_usage(new_path).free
-            except Exception as e:
-                messagebox.showerror(
-                    "Could not check free space",
-                    f"Unable to determine free space on {new_path}:\n{e}",
-                    parent=d
-                )
-                return
-
-            if total_size > free_space:
-                messagebox.showerror(
-                    "Not enough free space",
-                    f"The new location has {fmt_size(free_space)} free, "
-                    f"but you need {fmt_size(total_size)} to move your user data.\n\n"
-                    "Please free up space or choose a different location.",
-                    parent=d
-                )
-                return
-
-            ui["busy"] = True
-            loc_status.set("Moving user data…")
-
-            def work():
-                try:
-                    migrate_data(old_dir, new_dir)
-                    msg = (
-                        "✅ User data moved successfully.\n\n"
-                        "The game engine will be re‑downloaded on the next start.\n"
-                        "Your worlds, settings, and login are preserved.\n\n"
-                        "The launcher will now restart."
-                    )
-                    ok_flag = True
-                except RelocationError as e:
-                    msg = f"❌ Could not relocate user data:\n{e}"
-                    ok_flag = False
-                except Exception as e:
-                    msg = f"❌ Could not relocate user data:\n{e}"
-                    ok_flag = False
-                finally:
-                    ui["busy"] = False
-                    def finish():
-                        loc_status.set("")
-                        if ok_flag:
-                            loc_var.set(str(new_dir))
-                            _update_loc_display()
-                            messagebox.showinfo(
-                                "Relocation Successful", msg, parent=d)
-                            relaunch_app()
-                        else:
-                            messagebox.showerror(
-                                "Relocation Error", msg, parent=d)
-                    d.after(0, finish)
-
-            # A lock failure occurs before work() can clear the busy state.
-            def locked_work():
-                try:
-                    with prefix_operation_lock("relocate user data"):
-                        work()
-                except Exception as e:
-                    err_msg = str(e)
-                    if ui.get("busy"):
-                        ui["busy"] = False
-                        def fail():
-                            loc_status.set("")
-                            messagebox.showerror(
-                                "Relocation Error",
-                                f"Could not start relocation:\n{err_msg}",
-                                parent=d)
-                        d.after(0, fail)
-                        
-            threading.Thread(target=locked_work, daemon=False).start()
-            
-        def do_reset():
-            if _relocate_blocked():
-                return
-            if not is_relocation_allowed():
-                messagebox.showerror(
-                    "Relocation disabled",
-                    "BOL_HOME is set in the environment. The location cannot be reset via the GUI.",
-                    parent=d
-                )
-                return
-            if get_install_location() == default_install_location():
-                return
-            if not messagebox.askyesno(
-                    "Reset location",
-                    "Reset to the default location "
-                    f"({default_install_location()})?\n\nThis only clears "
-                    "the saved preference — it does not move or delete any "
-                    "files. Restart required.", parent=d):
-                return
-            clear_install_location()
-            loc_var.set(default_install_location())
-            _update_loc_display()
-            messagebox.showinfo(
-                "Reset Complete",
-                "Location reset to default. The launcher will now restart.")
-            relaunch_app()
-
-        loc_btns = ctk.CTkFrame(loc_row, fg_color="transparent")
-        loc_btns.pack(side="right")
-        mkbtn(loc_btns, "Browse…", do_browse, kind="ghost", width=84,
-              height=36, font=font(12)).pack(side="left", padx=(0, 4))
-        mkbtn(loc_btns, "Reset", do_reset, kind="flat", width=64,
-              height=36, font=font(12)).pack(side="left")
-
-        ctk.CTkLabel(tab_advanced, textvariable=loc_status,
-                     text_color=T.GOLD, font=font(11)
-                     ).pack(anchor="w", pady=(4, 8), padx=4)
-        
-        imp_status = tk.StringVar(value="")
-
-        def do_import():
-            from tkinter import filedialog
-            files = filedialog.askopenfilenames(
-                parent=d, title="Import Minecraft content",
-                filetypes=[("Minecraft content",
-                            "*.mcpack *.mcaddon *.mcworld *.mctemplate *.mcskin"),
-                           ("All files", "*.*")])
-            if not files:
-                return
-            imp_status.set("Importing…")
-
-            def work():
-                done, errs = [], []
-                for f in files:
-                    try:
-                        done += import_content(f)
-                    except BolError as e:
-                        errs.append(str(e))
-                    except Exception as e:
-                        errs.append(f"{Path(f).name}: {e}")
-                msg = (f"Imported {len(done)} item(s)."
-                       if done else "Nothing imported.")
-                if errs:
-                    msg += "\n\nProblems:\n• " + "\n• ".join(errs)
-                if _mc_running():
-                    msg += ("\n\nMinecraft is running — restart it to see the "
-                            "new content.")
-                d.after(0, lambda: (imp_status.set(""),
-                                    messagebox.showinfo(
-                                        "Import", msg, parent=d)))
-            threading.Thread(target=work, daemon=True).start()
-
-        def do_inject():
-            from tkinter import filedialog
-            if not _mc_running():
-                messagebox.showwarning(
-                    "DLL injector",
-                    "Start Minecraft first and wait for the main menu, then "
-                    "inject.", parent=d)
-                return
-            last = load_settings().get("injector_dll") or ""
-            dll = filedialog.askopenfilename(
-                parent=d, title="Choose a client .dll to inject",
-                initialdir=(str(Path(last).parent) if last else None),
-                initialfile=(Path(last).name if last else None),
-                filetypes=[("Client DLL", "*.dll"), ("All files", "*.*")])
-            if not dll:
-                return
-            imp_status.set("Injecting…")
-
-            def work():
-                try:
-                    name = run_injector(dll)
-                    s2 = load_settings()
-                    s2["injector_dll"] = dll
-                    save_settings(s2)
-                    msg = (f"Injected {name} into Minecraft. ✓\n\n"
-                           "(Native / AppImage only — not inside the Flatpak "
-                           "sandbox.)")
-                except Exception as e:
-                    msg = f"Couldn't inject:\n{e}"
-                d.after(0, lambda: (imp_status.set(""),
-                                    messagebox.showinfo("DLL injector", msg,
-                                                parent=d)))
-            threading.Thread(target=work, daemon=True).start()
-
-        def do_create_profile():
-            from tkinter import simpledialog
-            name = simpledialog.askstring(
-                "Create account profile",
-                "Profile name (each profile has its own Xbox login, prefix "
-                "and worlds):",
-                parent=d,
-            )
-            if not name:
-                return
-            try:
-                require_profile_shortcuts_supported()
-                profile = create_profile(name)
-                shortcut = write_profile_shortcut(
-                    name, profile_dir=profile,
-                )
-                command = profile_launch_command(profile)
-            except Exception as exc:
-                messagebox.showerror(
-                    "Account profile", str(exc), parent=d)
-                return
-            messagebox.showinfo(
-                "Account profile created",
-                f"Created:\n{profile}\n\nDesktop shortcut:\n{shortcut}\n\n"
-                "Add that shortcut as a non-Steam game for the matching "
-                f"Steam user.\n\nDirect command:\n{command}",
-                parent=d,
-            )
-
-        def do_play_shortcut():
-            try:
-                require_shortcuts_supported()
-                shortcut = write_play_shortcut()
-                command = play_launch_command()
-                pending = direct_launch_readiness()
-            except Exception as exc:
-                messagebox.showerror(
-                    "Direct launch shortcut", str(exc), parent=d)
-                return
-            message = (
-                f"Created:\n{shortcut}\n\n"
-                "It starts Minecraft straight away, with no launcher window. "
-                "Add it to Steam with 'Add a Non-Steam Game' to play it from "
-                "the library, including Steam Deck Game Mode.\n\n"
-                f"Direct command:\n{command}"
-            )
-            if pending:
-                message += ("\n\nStill to do in the launcher:\n• "
-                            + "\n• ".join(pending))
-            messagebox.showinfo(
-                "Direct launch shortcut", message, parent=d)
-
-        tool_actions = [
-            ("Import content (.mcpack / .mcworld / .mcaddon / .mcskin)…",
-             do_import, "ghost"),
-            ("Inject a client DLL…", do_inject, "ghost"),
-            ("Create direct launch shortcut (skips this window)…",
-             do_play_shortcut, "ghost"),
-            ("Create isolated Xbox account shortcut…",
-             do_create_profile, "ghost"),
-            ("Open Minecraft folder", lambda: subprocess.Popen(
-                ["xdg-open", str(_mojang_dir())], stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL), "ghost"),
-            ("Open logs folder", lambda: subprocess.Popen(
-                ["xdg-open", str(LOGS)], stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL), "ghost"),
-            ("Repair (reset Wine prefix)", lambda: threading.Thread(
-                target=reset_prefix, daemon=True).start(), "ghost"),
-            ("Force stop Minecraft", kill_wine, "danger"),
-        ]
-
+        maintenance = card_section(v, "Maintenance")
         try:
             ack_status = gpu_crash_acknowledgement_status()
         except Exception:
             ack_status = None
         if ack_status and ack_status.can_acknowledge:
-            def do_ack_gpu():
-                if ack_status.previous_boot_fault:
-                    safety_instruction = (
-                        "Continue only after repairing/updating the graphics "
-                        "driver and rebooting."
-                    )
-                else:
-                    safety_instruction = (
-                        "No fatal driver event was detected for this marker. "
-                        "Continue only after checking why the previous session "
-                        "or machine stopped."
-                    )
-                if not messagebox.askyesno(
-                        "Acknowledge previous GPU incident",
-                        ack_status.message
-                        + "\n\n" + safety_instruction
-                        + " Acknowledge now?",
-                        parent=d):
-                    return
-                if acknowledge_gpu_crash():
-                    messagebox.showinfo(
-                        "GPU safety",
-                        "The previous-boot incident was acknowledged. PLAY "
-                        "will still run all current graphics safety checks.",
-                        parent=d,
-                    )
-                    gpu_ack_btn.pack_forget()
-                else:
-                    current = gpu_crash_acknowledgement_status()
-                    messagebox.showerror(
-                        "GPU safety", current.message, parent=d)
+            self.gpu_ack_btn = tool_row("Acknowledge previous GPU incident…",
+                lambda: self._offer_gpu_ack(ack_status) and self.gpu_ack_btn.hide(),
+                danger=True,
+                tip="Confirm the previous graphics-driver incident has been "
+                    "checked, so PLAY is unblocked again.")
+            maintenance.addWidget(self.gpu_ack_btn)
+        maintenance.addWidget(tool_row(
+            "Report a problem…", self.open_report,
+            tip="Send the launcher's developers what they need to diagnose "
+                "a problem: your description, system information and logs, "
+                "with everything personal removed. You see all of it "
+                "before anything is sent."))
+        maintenance.addWidget(tool_row("Open logs folder",
+                                   lambda: subprocess.Popen(["xdg-open", str(LOGS)],
+                                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
+                                   tip="Open the folder with launch and activity logs, "
+                                       "useful for bug reports."))
+        maintenance.addWidget(tool_row("Repair (reset Wine prefix)",
+                                   lambda: threading.Thread(target=reset_prefix, daemon=True).start(),
+                                   tip="Reset the Wine prefix Minecraft runs in. Fixes most "
+                                       "'won't start' problems; worlds and settings are kept."))
+        maintenance.addWidget(tool_row("Force stop Minecraft", kill_wine, danger=True,
+                                   tip="Immediately terminate Minecraft and any Wine "
+                                       "processes for this profile."))
 
-            tool_actions.insert(
-                0,
-                ("Acknowledge previous GPU incident…", do_ack_gpu, "danger"),
-            )
+        self.tools_status_label = QLabel("")
+        self.tools_status_label.setStyleSheet(f"color:{self.theme.gold};")
+        v.addWidget(self.tools_status_label)
+        v.addStretch(1)
+        return w
 
-        gpu_ack_btn = None
-        for label, fn, kind in tool_actions:
-            button = mkbtn(tab_tools, label, fn, kind=kind, anchor="w",
-                           height=38)
-            button.pack(fill="x", pady=3, padx=4)
-            if label.startswith("Acknowledge previous GPU"):
-                gpu_ack_btn = button
+    def _do_open_editor(self):
+        if self.stack.currentWidget() is self.settings_page:
+            self.toggle_settings()
+        self.do_play(editor=True)
 
-        ctk.CTkLabel(tab_tools, textvariable=imp_status, text_color=T.GOLD,
-                     font=font(11)).pack(anchor="w", pady=(6, 0), padx=4)
+    def _betterrtx_job(self, name, work, finished):
+        """Run one BetterRTX step off the UI thread, errors in a dialog."""
+        self.tools_status_label.setText("BetterRTX…")
 
-        for _sf in (tab_general, tab_advanced, tab_tools):
-            _enable_scrollable_frame_wheel(_sf)
+        def done(result):
+            self.tools_status_label.setText("")
+            finished(result)
 
-    _build_settings()
+        def failed(message):
+            self.tools_status_label.setText("")
+            self.error_box("BetterRTX", message[:2000])
 
-    changelog_view = ctk.CTkFrame(view_area, fg_color=T.CARD, corner_radius=18,
-                                   border_width=1, border_color=T.BORDER)
+        w = Worker(work)
+        w.done.connect(done)
+        w.failed.connect(failed)
+        self._start_worker(name, w)
 
-    def _insert_inline_formatted(widget, text, base_tag, extra_tags=None):
-        tokens = RE_MD_TOKENS.split(text)
-        is_bold = False
-        is_code = False
-        for i, token in enumerate(tokens):
-            if not token:
-                continue
-            if token in ("**", "__"):
-                is_bold = not is_bold
-                continue
-            elif token == "`":
-                is_code = not is_code
-                continue
+    def _do_betterrtx_install(self):
+        def listed():
+            return (betterrtx.list_presets(),
+                    betterrtx.game_material_version(), betterrtx.status())
 
-            link_match = RE_MD_LINK.match(token)
-            if link_match:
-                link_text = link_match.group(1)
-                url = link_match.group(2)
-                tags = ["link", f"url:{url}", base_tag] + list(extra_tags or [])
-                if is_bold:
-                    tags.append("bold")
-                if is_code:
-                    tags.append("code")
-                widget.insert("end", link_text, tuple(tags))
-                next_tok = tokens[i + 1] if i + 1 < len(tokens) else ""
-                if next_tok and not next_tok[0].isspace():
-                    widget.insert("end", " ", (base_tag,))
-            else:
-                tags = [base_tag] + list(extra_tags or [])
-                if is_bold:
-                    tags.append("bold")
-                if is_code:
-                    tags.append("code")
-                widget.insert("end", token, tuple(tags))
+        self._betterrtx_job("betterrtx-list", listed, self._pick_betterrtx)
 
-    def render_markdown_to_text(widget, md):
-        lines = md.split("\n")
-        in_code_block = False
-        code_content = []
+    def _pick_betterrtx(self, result):
+        presets, version, current = result
+        # A preset that names another format is left out; one that names
+        # none is checked against the downloaded files instead.
+        usable = [p for p in presets
+                  if p["material_version"] in (None, version)]
+        if not usable:
+            self.info_box(
+                "BetterRTX",
+                "No BetterRTX preset is made for this Minecraft version yet "
+                f"(its shaders are format {version}; the newest presets are "
+                "made for an older version). Try again after BetterRTX "
+                "updates, or play a Minecraft version a preset was made for.")
+            return
+        labels = [p["name"] + ("" if p["material_version"] is not None
+                               else "  (older preset)") for p in usable]
+        header = (f"Installed now: {current['installed']}\n\n"
+                  if current.get("installed") else "")
+        label, chosen = QInputDialog.getItem(
+            self, "BetterRTX", header + "Preset to install:", labels, 0, False)
+        if not chosen:
+            return
+        preset = usable[labels.index(label)]
+        self._betterrtx_job(
+            "betterrtx-install", lambda: betterrtx.install_preset(preset),
+            lambda _game: self.info_box(
+                "BetterRTX", f"{preset['name']} is installed. Use the Ray "
+                "Traced graphics mode in a ray tracing world to see it."))
 
-        for line in lines:
+    def _do_betterrtx_rtpack(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Install a BetterRTX pack", "",
+            "BetterRTX pack (*.rtpack *.zip);;All files (*.*)")
+        if not path:
+            return
+        self._betterrtx_job(
+            "betterrtx-install", lambda: betterrtx.install_rtpack(path),
+            lambda _game: self.info_box(
+                "BetterRTX", f"{Path(path).stem} is installed."))
+
+    def _do_betterrtx_restore(self):
+        self._betterrtx_job(
+            "betterrtx-restore", betterrtx.restore,
+            lambda changed: self.info_box(
+                "BetterRTX",
+                "Minecraft's own ray tracing shaders are back." if changed
+                else "BetterRTX is not installed in this Minecraft version."))
+
+    def _do_import(self):
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "Import Minecraft content", "",
+            "Minecraft content (*.mcpack *.mcaddon *.mcworld *.mctemplate *.mcskin);;All files (*.*)")
+        if not files:
+            return
+        self.tools_status_label.setText("Importing…")
+
+        def work():
+            done, errs = [], []
+            for f in files:
+                try:
+                    done.extend(import_content(f))
+                except Exception as e:
+                    errs.append(f"{Path(f).name}: {e}")
+            return done, errs
+
+        def finished(result):
+            done, errs = result
+            self.tools_status_label.setText("")
+            msg = f"Imported {len(done)} item(s)." if done else "Nothing imported."
+            if errs:
+                msg += "\n\nProblems:\n• " + "\n• ".join(errs)
+            if _mc_running():
+                msg += "\n\nMinecraft is running — restart it to see the new content."
+            self.info_box("Import", msg)
+
+        def failed(message):
+            self.tools_status_label.setText("")
+            self.error_box("Import", f"Could not import:\n{message}")
+
+        w = Worker(work)
+        w.done.connect(finished)
+        w.failed.connect(failed)
+        self._start_worker("import", w)
+
+    def _do_inject(self):
+        if not _mc_running():
+            self.warn_box("DLL injector",
+                "Start Minecraft first and wait for the main menu, then inject.")
+            return
+        last = self.settings.get("injector_dll") or ""
+        dll, _ = QFileDialog.getOpenFileName(self, "Choose a client .dll to inject",
+                                              str(Path(last).parent) if last else "",
+                                              "Client DLL (*.dll);;All files (*.*)")
+        if not dll:
+            return
+        self.tools_status_label.setText("Injecting…")
+
+        def work():
+            return run_injector(dll)
+
+        def finished(name):
+            # Written here rather than in work(): _save_setting reloads and
+            # reassigns self.settings, which the GUI thread reads.
+            self._save_setting("injector_dll", dll)
+            self.tools_status_label.setText("")
+            self.info_box("DLL injector", f"Injected {name} into Minecraft. ✓\n\n"
+                           "(Native / AppImage only — not inside the Flatpak sandbox.)")
+
+        def failed(msg):
+            self.tools_status_label.setText("")
+            self.error_box("DLL injector", f"Couldn't inject:\n{msg}")
+
+        w = Worker(work)
+        w.done.connect(finished)
+        w.failed.connect(failed)
+        self._start_worker("inject", w)
+
+    def _on_injector_dll_type_toggled(self, dll_type):
+        dll_type = dll_type if dll_type in ("file", "url") else ("url" if dll_type else "file")
+        self._save_setting("injector_dll_type", dll_type)
+        last_val = self.settings.get("injector_dll_url" if dll_type == "url" else "injector_dll_path") or ""
+        self.dll_input.setText(last_val)
+        self._update_injector_settings_ui()
+
+    def _on_injector_dll_text_changed(self, text):
+        on = self.dll_mode_combo.currentData() == "url"
+        key = "injector_dll_url" if on else "injector_dll_path"
+        self._save_setting(key, text)
+
+    def _do_browse_dll(self):
+        last = self.settings.get("injector_dll_path") or ""
+        dll, _ = QFileDialog.getOpenFileName(self, "Choose a client .dll to inject",
+                                              str(Path(last).parent) if last else "",
+                                              "Client DLL (*.dll);;All files (*.*)")
+        if dll:
+            self.dll_input.setText(dll)
+            self._save_setting("injector_dll_path", dll)
+
+    def _update_injector_settings_ui(self):
+        is_url = self.dll_mode_combo.currentData() == "url"
+        self.dll_browse_btn.setVisible(not is_url)
+        if is_url:
+            self.dll_input.setPlaceholderText("https://example.com/client.dll")
+        else:
+            self.dll_input.setPlaceholderText("Path to client.dll")
+
+    def _do_create_profile_shortcut(self):
+        name, ok = QInputDialog.getText(self, "Create account profile",
+            "Profile name (each profile has its own Xbox login, prefix and worlds):")
+        if not ok or not name:
+            return
+        try:
+            require_profile_shortcuts_supported()
+            profile = create_profile(name)
+            shortcut = write_profile_shortcut(name, profile_dir=profile)
+            command = profile_launch_command(profile)
+        except Exception as exc:
+            self.error_box("Account profile", str(exc))
+            return
+        self.info_box("Account profile created",
+            f"Created:\n{profile}\n\nDesktop shortcut:\n{shortcut}\n\n"
+            "Add that shortcut as a non-Steam game for the matching Steam "
+            f"user.\n\nDirect command:\n{command}")
+
+    def _do_play_shortcut(self):
+        try:
+            require_shortcuts_supported()
+            shortcut = write_play_shortcut()
+            command = play_launch_command()
+            pending = direct_launch_readiness()
+        except Exception as exc:
+            self.error_box("Direct launch shortcut", str(exc))
+            return
+        message = (f"Created:\n{shortcut}\n\nIt starts Minecraft straight away, with "
+                   "no launcher window. Add it to Steam with 'Add a Non-Steam Game'.\n\n"
+                   f"Direct command:\n{command}")
+        if pending:
+            message += "\n\nStill to do in the launcher:\n• " + "\n• ".join(pending)
+        self.info_box("Direct launch shortcut", message)
+
+    # ------------------------------------------------------------ changelog page
+    def _build_changelog(self) -> QWidget:
+        page = QFrame(); page.setObjectName("Page")
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        self.changelog_tabs = QTabWidget()
+        outer.addWidget(self.changelog_tabs, 1)
+        self.game_changelog_view = _guard_links(QTextBrowser())
+        self.launcher_changelog_view = _guard_links(QTextBrowser())
+        self.changelog_tabs.addTab(self.game_changelog_view, "Game")
+        self.changelog_tabs.addTab(self.launcher_changelog_view, "Launcher")
+        return page
+
+    # ------------------------------------------------------------ profiles page
+    def _build_profiles_page(self) -> QWidget:
+        return ProfilesPage(self)
+
+    def toggle_mods(self):
+        if self.mods_page is not None and \
+                self.stack.currentWidget() is self.mods_page:
+            self.stack.setCurrentWidget(self.hero_page)
+            self._nav_follow_page()
+        else:
+            if self.mods_page is None:
+                from .gui_mods import ModsPage
+                self.mods_page = ModsPage(self)
+                self.stack.addWidget(self.mods_page)
+            self.stack.setCurrentWidget(self.mods_page)
+            self.mods_page.opened()
+            self._nav_follow_page(self.mods_page)
+
+    def select_build(self, version, beta, edition=None):
+        """Make the picker next to PLAY point at an installed build, as if it
+        was picked there. False when the picker does not list it."""
+        edition = edition or ("preview" if beta else "release")
+        for label, entry in zip(self.ui_state.get("labels") or [],
+                                self.ui_state.get("versions") or []):
+            if entry.get("tag") == version and \
+                    _version_edition_id(entry) == edition:
+                self.select_edition(edition)
+                self.set_version(label)
+                return True
+        return False
+
+    def toggle_profiles(self):
+        if self.stack.currentWidget() is self.profiles_page:
+            self.stack.setCurrentWidget(self.hero_page)
+            self._nav_follow_page()
+        else:
+            self.refresh_profiles()
+            self.stack.setCurrentWidget(self.profiles_page)
+            self._nav_follow_page(self.profiles_page)
+
+    def refresh_profiles(self):
+        self.profiles_page.refresh()
+
+    def _switch_profile_row(self, path):
+        if self._switch_profile_target(path):
+            self.toggle_profiles()
+
+    def _rename_profile_row(self, name, is_active):
+        if is_active and (self.ui_state.get("launch_active") or self.ui_state.get("busy")):
+            self.warn_box("Rename Profile",
+                "Cannot rename the active profile while Minecraft or a task "
+                "is running in this window.")
+            return
+        new_name, ok = QInputDialog.getText(self, "Rename Profile", f"New name for '{name}':")
+        if not ok or not new_name.strip() or new_name.strip() == name:
+            return
+        try:
+            new_dir = rename_profile(name, new_name.strip())
+            active_path = current_profile_info().get("path")
+            if is_active and active_path is not None and Path(new_dir).resolve() != Path(active_path).resolve():
+                self._switch_profile_row(new_dir)
+                return
+            self.refresh_profiles()
+        except Exception as exc:
+            self.error_box("Rename Profile", str(exc))
+
+    def _delete_profile_row(self, name, is_active):
+        if is_active:
+            self.warn_box("Delete Profile", "Cannot delete the currently active profile.")
+            return
+        if not self.question_box("Delete Profile",
+                f"Are you sure you want to delete profile '{name}'?\n\n"
+                "This will permanently remove its worlds, settings, and player data."):
+            return
+        try:
+            delete_profile(name)
+            self.refresh_profiles()
+        except Exception as exc:
+            self.error_box("Delete Profile", str(exc))
+
+    def load_changelogs(self, force=False):
+        if self._changelog_loaded and not force:
+            return
+        self._changelog_loaded = True
+
+        from .config import SELF_REPO
+        loading = self._wrap_changelog_html("<i class='empty'>Loading…</i>")
+        self.game_changelog_view.setHtml(loading)
+        self.launcher_changelog_view.setHtml(loading)
+
+        def error_html(e):
+            return self._wrap_changelog_html(
+                f"<b>Could not load changelog.</b><div class='release-date' "
+                f"style='text-transform:none;margin-top:6px;'>{html.escape(e)}</div>")
+
+        gw = Worker(lambda: mc_releases(fetch_all=False))
+        gw.done.connect(lambda data: _alive(self) and _alive(self.game_changelog_view)
+                         and self.game_changelog_view.setHtml(self._render_game_changelog_html(data)))
+        gw.failed.connect(lambda e: _alive(self) and _alive(self.game_changelog_view)
+                           and self.game_changelog_view.setHtml(error_html(e)))
+        self._start_worker("changelog-game", gw)
+
+        lw = Worker(lambda: gh_releases(SELF_REPO))
+        lw.done.connect(lambda data: _alive(self) and _alive(self.launcher_changelog_view)
+                         and self.launcher_changelog_view.setHtml(self._render_launcher_changelog_html(data)))
+        lw.failed.connect(lambda e: _alive(self) and _alive(self.launcher_changelog_view)
+                           and self.launcher_changelog_view.setHtml(error_html(e)))
+        self._start_worker("changelog-launcher", lw)
+
+    def _changelog_css(self) -> str:
+        """Shared typography for both changelog tabs."""
+        t = self.theme
+        return f"""
+        body {{
+            font-family: -apple-system, "Segoe UI", "Inter", sans-serif;
+            font-size: 13.5px;
+            line-height: 1.55;
+            color: {t.fg};
+        }}
+        h2.release-title {{
+            font-size: 17px;
+            font-weight: 700;
+            color: {t.accent};
+            margin: 0 0 2px 0;
+        }}
+        h2.release-title a {{ color: {t.accent}; text-decoration: none; }}
+        div.release-date {{
+            font-size: 11.5px;
+            font-weight: 600;
+            letter-spacing: 0.02em;
+            text-transform: uppercase;
+            color: {t.sub};
+            margin: 0 0 10px 0;
+        }}
+        div.release-body p {{ margin: 0 0 8px 0; }}
+        div.release-body h1, div.release-body h2, div.release-body h3 {{
+            font-size: 14px; font-weight: 700; margin: 12px 0 4px 0; color: {t.fg};
+        }}
+        div.release-body li {{ margin: 0 0 4px 18px; }}
+        div.release-body code {{
+            background: {t.card2}; color: {t.accent};
+            padding: 1px 5px; border-radius: 4px; font-family: monospace;
+        }}
+        div.release-body blockquote {{
+            margin: 6px 0; padding: 4px 12px;
+            border-left: 3px solid {t.accent};
+            color: {t.sub}; background: {t.card2};
+        }}
+        div.release-body a {{ color: {t.accent}; }}
+        hr {{
+            border: none; border-top: 1px solid {t.border};
+            margin: 18px 0;
+        }}
+        i.empty {{ color: {t.sub}; }}
+        """
+
+    def _wrap_changelog_html(self, body_html: str) -> str:
+        return f"<html><head><style>{self._changelog_css()}</style></head><body>{body_html}</body></html>"
+
+    def _md_to_html(self, text: str) -> str:
+        """Small, dependency-free Markdown → HTML used for release bodies."""
+        text = html.escape(text or "")
+        text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+        text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
+        # Only web links become live; anything else keeps its text. The URL
+        # is already escaped with the rest of the text above.
+        text = re.sub(
+            r"\[([^\]]+)\]\(([^)]+)\)",
+            lambda m: (f'<a href="{m.group(2)}">{m.group(1)}</a>'
+                       if _web_link(html.unescape(m.group(2))) else m.group(1)),
+            text)
+        lines = []
+        in_list = False
+        for line in text.split("\n"):
             stripped = line.strip()
-            is_quote = stripped.startswith(">")
-
-            if is_quote:
-                content_line = stripped[1:].strip()
+            if stripped.startswith("#"):
+                if in_list:
+                    lines.append("</ul>"); in_list = False
+                n = min(3, len(stripped) - len(stripped.lstrip("#")))
+                lines.append(f"<h{n+1}>{stripped.lstrip('#').strip()}</h{n+1}>")
+            elif stripped.startswith(("* ", "- ", "+ ")):
+                if not in_list:
+                    lines.append("<ul>"); in_list = True
+                lines.append(f"<li>{stripped[2:]}</li>")
+            elif stripped.startswith(">"):
+                if in_list:
+                    lines.append("</ul>"); in_list = False
+                lines.append(f"<blockquote>{stripped[1:].strip()}</blockquote>")
+            elif stripped == "":
+                if in_list:
+                    lines.append("</ul>"); in_list = False
             else:
-                content_line = line
+                if in_list:
+                    lines.append("</ul>"); in_list = False
+                lines.append(f"<p>{stripped}</p>")
+        if in_list:
+            lines.append("</ul>")
+        return "\n".join(lines)
 
-            if content_line.startswith("```"):
-                if in_code_block:
-                    for cl in code_content:
-                        widget.insert("end", cl + "\n", "code_block")
-                    in_code_block = False
-                    code_content = []
-                else:
-                    in_code_block = True
-                continue
-
-            if in_code_block:
-                code_content.append(content_line)
-                continue
-
-            if content_line.startswith("#"):
-                hashes = len(content_line) - len(content_line.lstrip("#"))
-                content = content_line.lstrip("#").strip()
-                tag = f"h{min(hashes, 3)}"
-                widget.insert("end", content + "\n", (tag, "quote") if is_quote else tag)
-                continue
-
-            if is_quote:
-                if content_line:
-                    _insert_inline_formatted(widget, content_line + "\n", "quote")
-                else:
-                    widget.insert("end", "\n", "quote")
-                continue
-
-            if stripped.startswith(("* ", "- ", "+ ", "\u2022 ")):
-                bullet_char = "\u2022 "
-                content = line.replace(stripped[:2], "", 1).strip()
-                widget.insert("end", bullet_char, "bullet")
-                _insert_inline_formatted(widget, content + "\n", "bullet")
-                continue
-
-            if stripped == "":
-                widget.insert("end", "\n", "normal")
-            else:
-                _insert_inline_formatted(widget, line + "\n", "normal")
-
-    def render_launcher_changelog(widget, rels, dividers):
-        for i, rel in enumerate(rels):
-            tag_name = rel.get("tag_name", "Unknown")
+    def _render_launcher_changelog_html(self, rels) -> str:
+        if not rels:
+            return self._wrap_changelog_html("<i class='empty'>No releases found.</i>")
+        parts = []
+        for rel in rels:
+            tag = rel.get("tag_name", "Unknown")
             name = rel.get("name")
             date = (rel.get("published_at") or "").split("T")[0]
             body = (rel.get("body") or "").strip()
-
-            title_text = tag_name
-            if name and name != tag_name:
-                title_text += f" \u2014 {name}"
-
-            url = rel.get("html_url")
-            tags = ("release_title", "link", f"url:{url}") if url else ("release_title",)
-            widget.insert("end", title_text + "\n", tags)
-            widget.insert("end", date + "\n", "release_date")
-
+            url = _href(rel.get("html_url"))
+            title = f"{tag} — {name}" if name and name != tag else tag
+            title_html = f'<a href="{url}">{html.escape(title)}</a>' if url else html.escape(title)
+            parts.append(f"<h2 class='release-title'>{title_html}</h2>")
+            parts.append(f"<div class='release-date'>{date}</div>")
             if body:
-                render_markdown_to_text(widget, body)
+                parts.append(f"<div class='release-body'>{self._md_to_html(body)}</div>")
+            parts.append("<hr>")
+        return self._wrap_changelog_html("".join(parts))
 
-            if i < len(rels) - 1:
-                div_frame = ctk.CTkFrame(widget, fg_color=T.MUTED, height=2, width=1, corner_radius=0)
-                div_frame.pack_propagate(False)
-                widget.insert("end", "\n", "divider_tag")
-                widget.window_create("end", window=div_frame)
-                widget.insert("end", "\n\n", "divider_tag")
-                dividers.append(div_frame)
-
-    def render_game_changelog(widget, data, dividers):
-        from .util import format_display_version
-        ui_sel = mc_var.get()
-        ui_wants_beta = "BETA" in ui_sel if ui_sel else False
-        target_version = ui_sel.split('  ')[0].strip() if ui_sel else None
-        target_index = None
-        
-        filtered = []
+    def _render_game_changelog_html(self, data) -> str:
+        if not _alive(self) or not _alive(self.ver_label):
+            return ""
+        lab = self.ver_label.text()
+        ui_wants_beta = "BETA" in lab if lab else False
+        articles = []
         for art in data.get("articles", []):
             title = art.get("title", "Unknown Release")
             if not ("bedrock" in title.lower() or "beta" in title.lower() or "preview" in title.lower()):
                 continue
             is_beta = "beta" in title.lower() or "preview" in title.lower()
             if is_beta == ui_wants_beta:
-                filtered.append(art)
-                
-        articles = filtered[:40]
-        for i, art in enumerate(articles):
+                articles.append(art)
+        articles = articles[:40]
+
+        if not articles:
+            return self._wrap_changelog_html("<i class='empty'>No releases found.</i>")
+
+        parts = []
+        for art in articles:
             title = art.get("title", "Unknown Release")
             is_beta = "beta" in title.lower() or "preview" in title.lower()
             title = format_display_version(title, is_beta)
             date = (art.get("updated_at") or "").split("T")[0]
             body = art.get("body") or ""
-            url = art.get("html_url")
+            url = _href(art.get("html_url"))
+            title_html = f'<a href="{url}">{html.escape(title)}</a>' if url else html.escape(title)
+            parts.append(f"<h2 class='release-title'>{title_html}</h2>")
+            parts.append(f"<div class='release-date'>{date}</div>")
+            parts.append(f"<div class='release-body'>{body}</div>")  # already HTML from the API
+            parts.append("<hr>")
+        return self._wrap_changelog_html("".join(parts))
 
-            if target_version and target_version in title and target_index is None:
-                target_index = widget.index("end-1c")
-
-            tags = ("release_title", "link", f"url:{url}") if url else ("release_title",)
-            widget.insert("end", title + "\n", tags)
-            widget.insert("end", date + "\n", "release_date")
-
-            if body:
-                from html.parser import HTMLParser
-
-                class HTMLToTkinterParser(HTMLParser):
-                    def __init__(self, w):
-                        super().__init__()
-                        self.w = w
-                        self.tags = []
-                        self.current_href = None
-
-                    def _ensure_newlines(self, count):
-                        if self.w.index("end-1c") == "1.0":
-                            return
-                        text = self.w.get(f"end-{count+1}c", "end-1c")
-                        missing = count - text.count("\n")
-                        if missing > 0:
-                            self.w.insert("end", "\n" * missing)
-
-                    def handle_starttag(self, tag, attrs):
-                        attrs_dict = dict(attrs)
-                        if tag in ("strong", "b"):
-                            self.tags.append("bold")
-                        elif tag in ("h1", "h2", "h3"):
-                            self.tags.append(tag)
-                            self._ensure_newlines(2)
-                        elif tag == "a" and "href" in attrs_dict:
-                            self.current_href = attrs_dict["href"]
-                            self.tags.append("link")
-                            self.tags.append(f"url:{self.current_href}")
-                        elif tag == "li":
-                            self._ensure_newlines(1)
-                            self.w.insert("end", "\u2022 ", "bullet")
-                            self.tags.append("bullet")
-                            self.in_li = True
-                            self.li_has_content = False
-                        elif tag == "blockquote":
-                            self.tags.append("quote")
-                            self._ensure_newlines(1)
-                        elif tag == "p":
-                            if not getattr(self, "in_li", False):
-                                self._ensure_newlines(2)
-
-                    def handle_endtag(self, tag):
-                        if tag in ("strong", "b"):
-                            if "bold" in self.tags:
-                                self.tags.remove("bold")
-                        elif tag in ("h1", "h2", "h3"):
-                            if tag in self.tags:
-                                self.tags.remove(tag)
-                            self._ensure_newlines(1)
-                        elif tag == "a":
-                            if "link" in self.tags:
-                                self.tags.remove("link")
-                            if f"url:{self.current_href}" in self.tags:
-                                self.tags.remove(f"url:{self.current_href}")
-                            self.current_href = None
-                        elif tag == "li":
-                            if "bullet" in self.tags:
-                                self.tags.remove("bullet")
-                            self.in_li = False
-                            self.li_has_content = False
-                            self._ensure_newlines(1)
-                        elif tag == "ul":
-                            self._ensure_newlines(2)
-                        elif tag == "blockquote":
-                            if "quote" in self.tags:
-                                self.tags.remove("quote")
-                            self._ensure_newlines(1)
-                        elif tag == "p":
-                            self._ensure_newlines(1)
-
-                    def handle_data(self, d_text):
-                        in_li = getattr(self, "in_li", False)
-                        in_link = self.current_href is not None
-                        
-                        d_text = d_text.replace("\n", " ")
-                        
-                        if not d_text.strip():
-                            if d_text and (in_li or in_link):
-                                if in_li and not getattr(self, "li_has_content", False):
-                                    return
-                                self.w.insert("end", d_text,
-                                              tuple(self.tags or ["normal"]))
-                        else:
-                            if in_li and not getattr(self,
-                                                     "li_has_content", False):
-                                d_text = d_text.lstrip()
-                                self.li_has_content = True
-                            self.w.insert("end", d_text,
-                                          tuple(self.tags or ["normal"]))
-
-                parser = HTMLToTkinterParser(widget)
-                parser.feed(body)
-
-            if i < len(articles) - 1:
-                div_frame = ctk.CTkFrame(widget, fg_color=T.MUTED, height=2, width=1, corner_radius=0)
-                div_frame.pack_propagate(False)
-                widget.insert("end", "\n", "divider_tag")
-                widget.window_create("end", window=div_frame)
-                widget.insert("end", "\n\n", "divider_tag")
-                dividers.append(div_frame)
-
-        if target_index is not None:
-            def _do_scroll():
-                widget.yview(target_index)
-            widget.after(300, _do_scroll)
-
-    def load_tab_changelog(tab, fetch_func, render_func):
-        if getattr(tab, "_is_loading", False):
+    # ------------------------------------------------------------ network
+    def _start_network(self):
+        """Everything the window fetches by itself, once it is allowed to."""
+        if self._network_started:
             return
-        tab._is_loading = True
-        tab.unbind("<Configure>")
-        for child in tab.winfo_children():
-            child.destroy()
+        self._network_started = True
+        QTimer.singleShot(50, self.refresh_versions)
+        QTimer.singleShot(200, self.check_for_update_async)
+        QTimer.singleShot(300, self._load_edition_logos)
+        if self.settings.get("home_featured", True) \
+                and _alive(getattr(self, "featured", None)):
+            QTimer.singleShot(400, self.featured.load)
 
-        bg_color = tab.cget("fg_color")
-        if isinstance(bg_color, tuple):
-            bg_color = tab._apply_appearance_mode(bg_color)
-        elif bg_color == "transparent":
-            bg_color = T.CARD_2
+    def _banner(self, text, color=None):
+        """A strip under the title bar; returns (frame, its button row)."""
+        bar = QFrame(); bar.setObjectName("CardFlat")
+        v = QVBoxLayout(bar)
+        v.setContentsMargins(14, 10, 14, 10)
+        lab = QLabel(text)
+        lab.setWordWrap(True)
+        lab.setTextFormat(Qt.PlainText)
+        if color:
+            lab.setStyleSheet(f"color:{color}; font-weight:700;")
+        v.addWidget(lab)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        v.addLayout(row)
+        self._outer.insertWidget(1, bar)
+        return bar, row
 
-        lab = tk.Label(tab, bg=bg_color, bd=0)
-        lab.place(relx=0.5, rely=0.5, anchor="center")
+    def _show_network_notice(self):
+        """The first-run question: what is contacted, before anything is.
 
-        if icon_img is not None:
-            factors = [10, 9, 8, 7, 6, 7, 8, 9]
-            step_idx = 0
+        A window-modal dialog over the launcher. Until it is answered the
+        launcher fetches nothing by itself; closing it without a choice
+        records nothing, loads only what the window needs to show the
+        versions (as Off does), and asks again at the next start.
+        """
+        if not _alive(self) or self.centralWidget() is None \
+                or _alive(getattr(self, "_network_notice", None)):
+            return
+        dlg = NetworkChoiceDialog(self, self.theme)
+        self._network_notice = dlg
+        dlg.chosen.connect(self._choose_network_mode)
+        dlg.rejected.connect(self._network_notice_dismissed)
+        dlg.open()
 
-            def animate():
-                nonlocal step_idx
-                if not lab.winfo_exists():
-                    return
-                try:
-                    factor = factors[step_idx]
-                    im = icon_img.subsample(factor)
-                    lab.configure(image=im)
-                    lab.image = im
-                except Exception:
-                    pass
-                step_idx = (step_idx + 1) % len(factors)
-                tab.after(125, animate)
+    def _network_notice_dismissed(self):
+        self._network_notice = None
+        if not self._network_started:
+            self._start_network()
 
-            animate()
+    def _choose_network_mode(self, mode):
+        self._save_setting(netpolicy.SETTING, mode)
+        feed.forget()
+        notice = getattr(self, "_network_notice", None)
+        self._network_notice = None
+        if _alive(notice):
+            notice.blockSignals(True)
+            notice.accept()
+            notice.deleteLater()
+        combo = getattr(self, "network_mode_combo", None)
+        if _alive(combo):
+            index = combo.findData(mode)
+            if index >= 0 and index != combo.currentIndex():
+                combo.blockSignals(True)
+                combo.setCurrentIndex(index)
+                combo.blockSignals(False)
+        self._refresh_network_status()
+        if self._network_started:
+            if mode == "auto":
+                self.check_for_update_async()
+        else:
+            self._start_network()
 
-        def show_error(err_msg):
-            for child in tab.winfo_children():
-                child.destroy()
-            err_frame = ctk.CTkFrame(tab, fg_color="transparent")
-            err_frame.place(relx=0.5, rely=0.5, anchor="center")
-            ctk.CTkLabel(err_frame, text="Could not load changelog.",
-                         font=font(14, "bold"), text_color=T.RED).pack(pady=4)
-            ctk.CTkLabel(err_frame, text=err_msg, font=font(11),
-                         text_color=T.SUB).pack(pady=4)
-            mkbtn(err_frame, "Retry",
-                  lambda: load_tab_changelog(tab, fetch_func, render_func),
-                  kind="ghost", width=100, height=32).pack(pady=8)
+    def _show_network_details(self):
+        """Open Settings on the Network tab, where the full list is."""
+        if self.stack.currentWidget() is not self.settings_page:
+            self.stack.setCurrentWidget(self.settings_page)
+        self.settings_tabs.setCurrentIndex(self._network_tab)
 
-        def show_data(data):
-            if not data:
-                show_error("No releases found.")
-                return
+    def _build_network_tab(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
 
-            tb = ctk.CTkTextbox(tab, fg_color=T.CARD_2, corner_radius=12,
-                                text_color=T.FG, font=font(11), wrap="word")
-            tb._x_scrollbar.grid = lambda *_args, **_kwargs: None
-            tb._x_scrollbar.grid_forget()
-            
-            def _tb_check(*_):
-                try:
-                    yv = tb._textbox.yview()
-                    if yv[0] <= 0.0 and yv[1] >= 1.0:
-                        tb._yscrollbar.grid_remove()
-                    else:
-                        tb._yscrollbar.grid()
-                except Exception: pass
-            
-            tb._textbox.bind("<Configure>", _tb_check, add="+")
-            def _poll_tb():
-                if tb.winfo_exists():
-                    _tb_check()
-                    tb.after(500, _poll_tb)
-            tb.after(500, _poll_tb)
+        updates = card_section(
+            v, "Updates and data fixes",
+            "The launcher can look for its own updates and for a small "
+            "signed data file: fixes for new Minecraft builds, replacement "
+            "components and incident notices, without a new release.")
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Check for updates:"))
+        self.network_mode_combo = SettingComboBox()
+        for key in netpolicy.MODES:
+            self.network_mode_combo.addItem(netpolicy.MODE_LABELS[key], key)
+            self.network_mode_combo.setItemData(
+                self.network_mode_combo.count() - 1,
+                netpolicy.MODE_HELP[key], Qt.ToolTipRole)
+        current = netpolicy.mode(self.settings)
+        if current is None:
+            self.network_mode_combo.setPlaceholderText("Not chosen yet")
+            self.network_mode_combo.setCurrentIndex(-1)
+        else:
+            self.network_mode_combo.setCurrentIndex(
+                self.network_mode_combo.findData(current))
+        self.network_mode_combo.currentIndexChanged.connect(
+            lambda i: i >= 0 and self._choose_network_mode(
+                self.network_mode_combo.itemData(i)))
+        row.addWidget(self.network_mode_combo)
+        row.addStretch(1)
+        updates.addLayout(row)
 
-            widget = tb._textbox
-            widget.configure(wrap="word", spacing1=1, spacing2=2,
-                             spacing3=1, padx=16, pady=16)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Release channel:"))
+        self.update_channel_combo = SettingComboBox()
+        self.update_channel_combo.addItem("Stable", "stable")
+        self.update_channel_combo.addItem("Pre-release", "prerelease")
+        self.update_channel_combo.setCurrentIndex(
+            1 if netpolicy.channel(self.settings) == "prerelease" else 0)
+        self.update_channel_combo.setToolTip(
+            "Pre-release also offers versions published for testing before "
+            "they become the stable release.")
+        self.update_channel_combo.currentIndexChanged.connect(
+            lambda i: self._save_setting(
+                netpolicy.CHANNEL_SETTING,
+                self.update_channel_combo.itemData(i)))
+        row.addWidget(self.update_channel_combo)
+        row.addStretch(1)
+        updates.addLayout(row)
 
-            dividers = []
-            f_family = font().cget("family")
-            widget.tag_configure("quote", font=(f_family, 11, "italic"),
-                                 background=T.r(T.CARD_2), foreground=T.r(T.SUB),
-                                 lmargin1=10, rmargin=10,
-                                 spacing1=3, spacing3=3)
-            widget.tag_configure("normal", font=(f_family, 11),
-                                 spacing1=1, spacing3=1)
-            widget.tag_configure("bold", font=(f_family, 11, "bold"))
-            widget.tag_configure("h1", font=(f_family, 15, "bold"),
-                                 spacing1=6, spacing3=2)
-            widget.tag_configure("h2", font=(f_family, 13, "bold"),
-                                 spacing1=5, spacing3=2)
-            widget.tag_configure("h3", font=(f_family, 12, "bold"),
-                                 spacing1=4, spacing3=2)
-            widget.tag_configure("code", font=(MONO, 9),
-                                 background=T.r(T.CARD_2),
-                                 foreground=T.r(T.BROWN))
-            widget.tag_configure("code_block", font=(MONO, 9),
-                                 background=T.r(T.CARD_2), foreground=T.r(T.FG),
-                                 lmargin1=10, rmargin=10,
-                                 spacing1=3, spacing3=3)
-            widget.tag_configure("bullet", font=(f_family, 11),
-                                 lmargin1=14, lmargin2=24)
-            widget.tag_configure("link", foreground=T.r(T.THEME_ACCENT))
-            widget.tag_configure("link_hover", underline=True)
+        updates.addWidget(tool_row(
+            "Check now", lambda: self.check_for_update_async(manual=True),
+            tip="Look for a launcher update and refresh the data file once, "
+                "whatever the setting above."))
+        self.network_status = QLabel()
+        self.network_status.setWordWrap(True)
+        self.network_status.setObjectName("Muted")
+        updates.addWidget(self.network_status)
+        # Filled when the tab is opened: naming the install kind asks the
+        # package database, which is not worth doing for every window.
 
-            def on_link_click(event):
-                idx = widget.index(f"@{event.x},{event.y}")
-                for tag in widget.tag_names(idx):
-                    if tag.startswith("url:"):
-                        _open_web_url(tag[4:])
-                        break
+        hosts = card_section(
+            v, "What the launcher connects to",
+            "The complete list. Only the first group happens by itself, and "
+            "only if you allow it above.")
+        listing = QLabel(netpolicy.disclosure_html())
+        listing.setTextFormat(Qt.RichText)
+        listing.setWordWrap(True)
+        listing.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        hosts.addWidget(listing)
+        v.addStretch(1)
+        return w
 
-            def on_link_enter(event):
-                widget.configure(cursor="hand2")
-                idx = widget.index(f"@{event.x},{event.y}")
-                for tag in widget.tag_names(idx):
-                    if tag.startswith("url:"):
-                        ranges = widget.tag_ranges(tag)
-                        if ranges:
-                            for i in range(0, len(ranges), 2):
-                                widget.tag_add("link_hover", ranges[i], ranges[i+1])
-                        break
-                        
-            def on_link_leave(_event):
-                widget.configure(cursor="arrow")
-                widget.tag_remove("link_hover", "1.0", "end")
+    def _refresh_network_status(self):
+        label = getattr(self, "network_status", None)
+        if not _alive(label):
+            return
+        lines = ["This install: " + describe_install()]
+        try:
+            state = feed.status()
+        except Exception:
+            state = {"in_service": False, "serial": None}
+        if not state["in_service"]:
+            lines.append("Data file: not in service in this build.")
+        elif netpolicy.mode(self.settings) == "off":
+            lines.append("Data file: ignored (updates are off).")
+        elif state["serial"]:
+            lines.append(f"Data file: {state['serial']}, signature valid.")
+        else:
+            lines.append("Data file: none fetched yet.")
+        label.setText("\n".join(lines))
 
-            widget.tag_bind("link", "<Enter>", on_link_enter)
-            widget.tag_bind("link", "<Leave>", on_link_leave)
-            widget.tag_bind("link", "<Button-1>", on_link_click)
+    def _report_rollback(self):
+        note = rollback.last_rollback()
+        if note and _alive(self) and self.centralWidget() is not None:
+            bar, row = self._banner(
+                f"The update to v{note.get('from')} did not start on this "
+                f"system, so v{note.get('to')} was put back. Please report "
+                "it.", self.theme.red)
+            row.addWidget(btn("OK", lambda: bar.setParent(None),
+                              kind="flat", w=64, h=30))
 
-            widget.tag_configure("release_title",
-                                 font=(f_family, 15, "bold"),
-                                 foreground=T.r(T.THEME_ACCENT),
-                                 spacing1=8, spacing3=1)
-            widget.tag_configure("release_date", font=(f_family, 11),
-                                 foreground=T.r(T.SUB),
-                                 spacing1=0, spacing3=4)
-            widget.tag_configure("divider_tag", spacing1=4, spacing3=4)
+    def _show_notices(self):
+        """Incident notices from the signed data file, once each."""
+        if not _alive(self) or self.centralWidget() is None:
+            return
+        try:
+            notices = feed.notices(
+                minecraft=self.settings.get("mc_version"),
+                settings=self.settings)
+        except Exception:
+            return
+        dismissed = set(self.settings.get("dismissed_notices") or [])
+        shown = self.__dict__.setdefault("_notices_shown", set())
+        for notice in notices:
+            key = notice["id"]
+            if key in dismissed or key in shown:
+                continue
+            shown.add(key)
+            text = notice["title"]
+            if notice.get("text"):
+                text += "\n" + notice["text"]
+            color = {"critical": self.theme.red,
+                     "warning": self.theme.blue}.get(notice.get("level"))
+            bar, row = self._banner(text, color)
+            url = notice.get("url")
+            if url:
+                row.addWidget(btn(
+                    "Open", lambda _=False, u=url: subprocess.Popen(
+                        ["xdg-open", u], stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL),
+                    kind="flat", w=64, h=30))
+            row.addWidget(btn(
+                "Dismiss", lambda _=False, b=bar, k=key:
+                self._dismiss_notice(b, k), kind="flat", w=80, h=30))
 
-            widget.rendering = False
+    def _dismiss_notice(self, bar, key):
+        bar.setParent(None)
+        self.settings = load_settings()
+        kept = [k for k in (self.settings.get("dismissed_notices") or [])
+                if k != key][-49:]
+        self.settings["dismissed_notices"] = kept + [key]
+        save_settings(self.settings)
 
-            def do_render(container_width):
-                if getattr(widget, "rendering", False):
-                    return
-                widget.rendering = True
-                try:
-                    tb_width = container_width
-                    tb.configure(width=tb_width)
-                    w_width = tb_width - 48
-                    dividers.clear()
-                    widget.configure(state="normal")
-                    widget.delete("1.0", "end")
-                    render_func(widget, data, dividers)
-                    widget.configure(state="disabled")
-                    for div in dividers:
-                        try:
-                            div.configure(width=w_width)
-                        except Exception:
-                            pass
-                finally:
-                    widget.rendering = False
+    # ------------------------------------------------------------ self-update
+    def check_for_update_async(self, manual=False):
+        """Look for a launcher update and fresh data, when that is allowed.
 
-            def on_resize(event):
-                do_render(event.width)
-            tab.bind("<Configure>", on_resize)
-
-            for child in tab.winfo_children():
-                if child != tb:
-                    child.destroy()
-            tb.pack(fill="both", expand=True, padx=4, pady=4)
-            tab.update_idletasks()
-            do_render(tab.winfo_width())
+        "auto" does it at startup. "ask" offers a button instead, and "off"
+        does nothing; `manual` is that button, or Check now in Settings, and
+        is its own permission for one check.
+        """
+        mode = netpolicy.mode(self.settings)
+        if not manual and mode != "auto":
+            self._show_notices()
+            if mode == "ask" and not _alive(getattr(self, "_ask_bar", None)):
+                bar, row = self._banner(
+                    "Check for launcher updates and data fixes?")
+                self._ask_bar = bar
+                row.addWidget(btn("Not now", lambda: bar.setParent(None),
+                                  kind="flat", w=80, h=30))
+                row.addWidget(btn(
+                    "Check now",
+                    lambda: (bar.setParent(None),
+                             self.check_for_update_async(manual=True)),
+                    kind="primary", w=112, h=30))
+            return
 
         def work():
-            try:
-                data = fetch_func()
-                def _done():
-                    tab._is_loading = False
-                    show_data(data)
-                tab.after(0, _done)
-            except Exception as e:
-                err_msg = str(e)
-                if "403" in err_msg:
-                    err_msg += ("\n(Rate limit reached. This is temporary; the "
-                                "last changelog stays cached. Try again later.)")
-                def _err():
-                    tab._is_loading = False
-                    show_error(err_msg)
-                tab.after(0, _err)
+            data = feed.refresh() if manual else feed.refresh_if_due()
+            return data, check_for_update()
 
-        threading.Thread(target=work, daemon=True).start()
+        def done(result):
+            if not _alive(self):
+                return
+            (data_state, _detail), rel = result
+            self._refresh_network_status()
+            self._show_notices()
+            if rel:
+                self._show_update_banner(rel)
+            elif manual:
+                self.set_status(
+                    f"{PRETTY} {VERSION} is up to date."
+                    + (" Data fixes updated." if data_state == "updated"
+                       else ""))
 
-    def load_changelogs(force=False):
-        if ui["changelogs_loaded"] and not force:
+        w = Worker(work)
+        w.done.connect(done)
+        self._start_worker("update-check", w)
+
+    def _show_update_banner(self, rel):
+        if not _alive(self) or self.centralWidget() is None:
             return
-        ui["changelogs_loaded"] = True
+        bar = QFrame(); bar.setObjectName("CardFlat")
+        h = QHBoxLayout(bar)
+        lab = QLabel(f"⟳  Update available — v{rel['version']}  (you have {VERSION})")
+        lab.setStyleSheet(f"color:{self.theme.blue}; font-weight:700;")
+        h.addWidget(lab)
+        h.addStretch(1)
+        h.addWidget(btn("Later", lambda: bar.setParent(None), kind="flat", w=64, h=30))
+        h.addWidget(btn("Update now", lambda: self._run_update(rel, bar), kind="primary", w=112, h=30))
+        self.centralWidget().layout().insertWidget(1, bar)
 
-        from .util import mc_releases, gh_releases
-        from .config import SELF_REPO
+    def _run_update(self, rel, banner):
+        banner.setParent(None)
+        self.set_status(f"Updating to v{rel['version']}…")
+        self._show_bar_busy()
 
-        load_tab_changelog(tab_game, lambda: mc_releases(fetch_all=False), render_game_changelog)
-        load_tab_changelog(tab_launcher,
-                           lambda: gh_releases(SELF_REPO),
-                           render_launcher_changelog)
+        w = Worker(self_update, rel)
+        w.progress.connect(self.set_progress)
 
-    def _build_changelog_view():
-        nonlocal tab_game, tab_launcher
-        outer = ctk.CTkFrame(changelog_view, fg_color="transparent")
-        outer.pack(fill="both", expand=True, padx=20, pady=18)
+        def done(result):
+            state, msg = result
+            self.end_progress()
+            self.set_status(
+                msg, self.theme.green if state == "ok"
+                else (self.theme.red if state == "error" else None))
+            if state == "ok":
+                self._restart_prompt()
 
-        ui["changelog_head"] = ctk.CTkFrame(outer, fg_color="transparent", height=28)
-        ui["changelog_head"].pack(fill="x", pady=(0, 12))
-        ctk.CTkLabel(ui["changelog_head"], text="Changelog", font=font(16, "bold"),
-                     text_color=T.FG).pack(side="left")
-        mkbtn(ui["changelog_head"], "← Back", toggle_changelog, kind="flat", width=76,
-              height=28, font=font(12)).pack(side="right")
+        w.done.connect(done)
+        self._start_worker("update", w)
 
-        tabs = ctk.CTkTabview(
-            outer, fg_color=T.CARD_2,
-            segmented_button_fg_color=T.CARD_2,
-            segmented_button_selected_color=T.THEME_ACCENT,
-            segmented_button_selected_hover_color=T.THEME_HOV,
-            segmented_button_unselected_color=T.CARD_2,
-            text_color=T.FG, corner_radius=12)
-        tabs.pack(fill="both", expand=True)
-        tab_game = tabs.add("Game")
-        tab_launcher = tabs.add("Launcher")
+    def _restart_prompt(self):
+        """Offer the new version, but never while a launch is active.
 
-    _build_changelog_view()
+        The restart is an execv: this process is replaced where it stands, so
+        the launch thread never reaches its teardown and the GPU safety marker
+        stays "running". execv keeps the PID and its start time, which is how
+        a marker names its launcher, so the new launcher took the marker for
+        a launch of its own still running and refused every PLAY until it was
+        started again from scratch. The question waits for the game to close:
+        _offer_pending_restart asks it then.
+        """
+        if not self.ui_state.get("launch_active"):
+            if not self.question_box("Update installed",
+                                     "Restart now to run the new version?"):
+                return
+            # PLAY can start while the question is open: a Store sign-in that
+            # completes in the meantime resumes it by itself.
+            if not self.ui_state.get("launch_active"):
+                self.relaunch_app()
+                return
+        self.ui_state["restart_pending"] = True
 
-    def relaunch_app():
-        na.stop()
+    def _offer_pending_restart(self):
+        """The launch is over: ask what the update held back for it.
+
+        Not yet while PLAY carries on by itself -- the GPU acknowledgement
+        resumes it at once, a Store sign-in once it completes.
+        """
+        if (not self.ui_state.get("restart_pending")
+                or self.ui_state.get("launch_active")
+                or self.ui_state.get("store_login_active")):
+            return
+        del self.ui_state["restart_pending"]
+        self._restart_prompt()
+
+    def relaunch_app(self):
+        self.na.stop()
         try:
             if os.environ.get("APPIMAGE"):
                 os.execv(os.environ["APPIMAGE"], [os.environ["APPIMAGE"], "gui"])
-
-            # Packaged wrappers add their module path in memory, so only
-            # preserve `python -m bol` when that was the original invocation.
+            # Only `python3 -m bol` comes back with -m: a .pyz's __main__
+            # has a spec too, named "__main__", and a new interpreter could
+            # not find bol outside the archive.
             main_spec = getattr(sys.modules.get("__main__"), "__spec__", None)
-            started_via_module = bool(main_spec and main_spec.name)
-
-            if started_via_module:
+            if main_spec and main_spec.name == "bol.__main__":
                 os.execv(sys.executable, [sys.executable, "-m", "bol", "gui"])
-
             tgt = os.path.realpath(sys.argv[0] or __file__)
             os.execv(sys.executable, [sys.executable, tgt, "gui"])
         except Exception:
-            root.destroy()
+            QApplication.instance().quit()
 
-    def update_progress(got, total):
-        def ap():
-            _show_bar()
-            prog.stop()
-            prog.configure(mode="determinate")
-            prog.set(got / max(1, total))
-            status_txt.set(f"Downloading update…  {int(100 * got / max(1, total))}%")
-            status_lbl.configure(text_color=T.FG)
-        root.after(0, ap)
-
-    def restart_prompt():
-        d = dialog("Update installed", 340, 150)
-        ctk.CTkLabel(d, text="Update installed", font=font(14, "bold"),
-                     text_color=T.FG).pack(anchor="w", padx=24, pady=(22, 0))
-        ctk.CTkLabel(d, text="Restart now to run the new version?",
-                     text_color=T.SUB).pack(anchor="w", padx=24, pady=(4, 16))
-        row = ctk.CTkFrame(d, fg_color="transparent")
-        row.pack(fill="x", padx=24, pady=(0, 22))
-        mkbtn(row, "Restart now", relaunch_app, kind="primary", width=130,
-              height=38, font=font(13, "bold")).pack(side="right")
-        mkbtn(row, "Later", d.destroy, kind="ghost", width=90,
-              height=38).pack(side="right", padx=(0, 8))
-
-    def run_update(rel, banner):
-        banner.destroy()
-        set_status(f"Updating to v{rel['version']}…", T.FG)
-        bar_busy()
-
-        def done(state, msg):
-            end_progress()
-            set_status(msg, T.GREEN if state == "ok"
-                       else (T.RED if state == "error" else T.SUB))
-            if state == "ok":
-                restart_prompt()
-
-        def work():
-            state, msg = self_update(rel, progress=update_progress)
-            root.after(0, lambda: done(state, msg))
-        threading.Thread(target=work, daemon=True).start()
-
-    def show_update_banner(rel):
-        bn = ctk.CTkFrame(root, fg_color=T.BLUE_DIM, corner_radius=12,
-                           border_width=1, border_color=T.BLUE)
-        ctk.CTkLabel(bn, text=f"⟳   Update available — v{rel['version']}   "
-                     f"(you have {VERSION})", text_color=T.BLUE_LIGHT,
-                     font=font(12, "bold")).pack(side="left", padx=18, pady=9)
-        mkbtn(bn, "Later", bn.destroy, kind="flat", width=64, height=30,
-              text_color=T.BLUE_MUTED, hover_color=T.BLUE_DARK).pack(
-                  side="right", padx=(0, 14), pady=7)
-        mkbtn(bn, "Update now", lambda: run_update(rel, bn), kind="primary",
-              width=112, height=30, font=font(12, "bold")).pack(
-                  side="right", padx=(0, 6), pady=7)
-        bn.pack(fill="x", padx=22, pady=(0, 6), after=top)
-
-    def update_check():
-        rel = check_for_update()
-        if rel:
-            root.after(0, lambda: show_update_banner(rel))
-
-    acct_state("in" if msa_signed_in() else "out")
-    threading.Thread(target=refresh_versions, daemon=True).start()
-    threading.Thread(target=update_check, daemon=True).start()
-    
-    hero.pack(fill="both", expand=True)
-
-    root.update_idletasks()
-
-    def on_close():
-        if ui.get("launch_active"):
-            messagebox.showwarning(
-                "Minecraft is running",
-                "Close Minecraft first and wait for the launcher to report "
-                "that it closed. To abort it, use Settings → Tools → Force "
-                "stop Minecraft.",
-                parent=root,
-            )
+    # ------------------------------------------------------------ controller
+    def apply_controller_nav(self, enabled):
+        """Start or stop watching for controllers, from the Settings switch."""
+        if not enabled:
+            nav, self.nav = self.nav, None
+            if nav is not None:
+                nav.stop()
+                self._on_nav_devices(())
+            self._refresh_controller_status()
             return
-        if ui.get("busy"):
-            messagebox.showwarning(
-                "Operation in progress",
-                "Wait for the current preparation task to finish before "
-                "closing the launcher.",
-                parent=root,
-            )
+        if self.nav is not None:
             return
-        na.stop()
-        root.destroy()
-    root.protocol("WM_DELETE_WINDOW", on_close)
-    def on_enter_pressed(_event):
-        focus = root.focus_get()
-        if isinstance(focus, (tk.Entry, tk.Text)):
-            return "break"
-        do_play()
+        nav = ControllerNav(
+            self,
+            accent=self.theme.accent,
+            on_back=self._controller_back,
+            # Whatever the big button says right now -- PLAY, or KILL once
+            # the game is running.
+            on_start=self.play_btn.click,
+            on_devices=self._on_nav_devices,
+            primary_item=lambda: self.play_btn,
+            # The pad keeps reporting while Minecraft is in the foreground
+            # and this window is still alive behind it.
+            accepts_input=lambda: not self.ui_state.get("launch_active"))
+        if not nav.start():
+            self._refresh_controller_status()
+            return
+        self.nav = nav
+        self._on_nav_devices(nav.device_names)
 
-    root.bind("<Return>", on_enter_pressed)
-    
-    if load_settings().get("show_changelog_on_startup", False):
-        toggle_changelog()
-        
-    root.mainloop()
+    def _stop_controller_nav(self):
+        """Let go of the controller: the window is closing."""
+        nav, self.nav = self.nav, None
+        if nav is not None:
+            nav.stop()
+
+    def _controller_back(self):
+        """What B does with nothing opened over the window: leave the page
+        the user is in, which is what Escape would do with a keyboard."""
+        if self.stack.currentWidget() is self.settings_page:
+            self.toggle_settings()
+        elif self.stack.currentWidget() is self.changelog_page:
+            self.toggle_changelog()
+        elif self.stack.currentWidget() is self.profiles_page:
+            self.toggle_profiles()
+        elif self.mods_page is not None and \
+                self.stack.currentWidget() is self.mods_page:
+            self.toggle_mods()
+
+    def _on_nav_devices(self, names):
+        """A controller was plugged in or unplugged."""
+        self._nav_devices = tuple(names)
+        legend = getattr(self, "nav_legend", None)
+        if legend is not None:
+            if names and self.nav is not None:
+                accent = self.theme.accent
+                legend.setText("&nbsp;&nbsp;".join(
+                    f'<b style="color:{accent}">{key}</b> {what}'
+                    for key, what in (("A", "Select"), ("B", "Back"),
+                                      ("Start", "Play"))))
+                legend.show()
+            else:
+                legend.hide()
+        self._refresh_controller_status()
+
+    def _refresh_controller_status(self):
+        """Say in Settings what the controller support is currently doing."""
+        label = getattr(self, "controller_status", None)
+        if label is None:
+            return
+        if self.nav is None:
+            label.setText("Controller navigation is off.")
+        elif self._nav_devices:
+            label.setText("Ready — " + ", ".join(self._nav_devices))
+        else:
+            label.setText("Waiting for a controller. One plugged in now is "
+                          "picked up without restarting the launcher.")
+
+    # ------------------------------------------------------------ message boxes
+    def _box(self, icon, title, message) -> QMessageBox:
+        box = QMessageBox(self)
+        box.setIcon(icon)
+        box.setWindowTitle(title)
+        box.setText(message)
+        box.setStyleSheet(self.theme.qss())
+        return box
+
+    def info_box(self, title, message):
+        self._box(QMessageBox.Information, title, message).exec()
+
+    def warn_box(self, title, message):
+        self._box(QMessageBox.Warning, title, message).exec()
+
+    def error_box(self, title, message, report=False):
+        """An error; with `report`, a button that opens "Report a problem"
+        with this error already in the comment, so a player who has no idea
+        what the message means still sends it."""
+        box = self._box(QMessageBox.Critical, title, message)
+        if not report:
+            box.exec()
+            return
+        report_button = box.addButton("Report a problem…",
+                                      QMessageBox.ActionRole)
+        box.setDefaultButton(box.addButton(QMessageBox.Ok))
+        box.exec()
+        if box.clickedButton() is report_button:
+            self.open_report(
+                title=title,
+                comment="The launcher showed this error:\n" + message[:1500])
+
+    def question_box(self, title, message) -> bool:
+        box = self._box(QMessageBox.Question, title, message)
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        return box.exec() == QMessageBox.Yes
+
+    # ------------------------------------------------------------ close handling
+    def closeEvent(self, event):
+        if self._force_close:
+            self._stop_controller_nav()
+            self._release_workers()
+            event.accept()
+            return
+        if self.ui_state.get("launch_active"):
+            self.warn_box("Minecraft is running",
+                "Close Minecraft first and wait for the launcher to report that "
+                "it closed. To abort it, use Settings → Tools → Force stop Minecraft.")
+            event.ignore()
+            return
+        if self.ui_state.get("busy"):
+            self.warn_box("Operation in progress",
+                "Wait for the current preparation task to finish before closing "
+                "the launcher.")
+            event.ignore()
+            return
+        self.na.stop()
+        self._stop_controller_nav()
+        self._release_workers()
+        event.accept()
+        # The app runs with setQuitOnLastWindowClosed(False) so that
+        # "close the launcher when Minecraft starts" can drop the window while
+        # the launch thread keeps supervising the game. That makes quitting an
+        # explicit act: without this the event loop outlives the window and the
+        # process stays resident forever. `_force_close` returns above, so the
+        # close-on-launch path still leaves the loop running for LaunchWorker.
+        QApplication.instance().quit()
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter) and not isinstance(
+                QApplication.focusWidget(), (QLineEdit, QPlainTextEdit, QTextEdit)):
+            self.do_play()
+        else:
+            super().keyPressEvent(event)
+
+
+
+# ======================================================================
+# GPU safety incident acknowledgement (module-level, not a MainWindow method)
+# ======================================================================
+
+def _gpu_incident_safety_instruction(status):
+    """Plain-text instruction that must be shown before an incident marker
+    can be acknowledged. Module-level so it, and the confirmation flow
+    below, are importable/testable without a QApplication."""
+    return (
+        "Continue only after repairing/updating the graphics driver and rebooting."
+        if status.previous_boot_fault else
+        "No fatal driver event was detected for this marker. Continue only "
+        "after checking why the previous session or machine stopped.")
+
+
+def _offer_gpu_incident_acknowledgement(
+        window, status, prefix="",
+        title="Acknowledge previous GPU incident", then=None):
+    """Confirm + acknowledge a GPU safety incident marker.
+
+    `window` only needs question_box/info_box/error_box(title, message). The
+    eligibility decision itself is never made here: acknowledge_gpu_crash()
+    re-checks it under the launch lock, and a refusal is reported from its
+    live status rather than the one passed in, in case it changed in the
+    meantime. `then`, when given, is what the player was doing (PLAY),
+    carried on once the acknowledgement is written instead of a note saying
+    it was.
+    """
+    instruction = _gpu_incident_safety_instruction(status)
+    message = prefix + status.message + "\n\n" + instruction + " Acknowledge now?"
+    if not window.question_box(title, message):
+        return False
+    if acknowledge_gpu_crash():
+        if then is not None:
+            then()
+            return True
+        window.info_box(
+            "GPU safety",
+            "The previous-boot incident was acknowledged. "
+            "PLAY will still run all current graphics safety checks.")
+        return True
+    window.error_box("GPU safety", gpu_crash_acknowledgement_status().message)
+    return False
+
+
+# ======================================================================
+# Entry point
+# ======================================================================
+
+# Keeps the stop-signal notifier and its pipe alive with the application.
+_STOP_SIGNAL_WATCH = []
+
+
+def _watch_stop_signals(app, fds=None):
+    """Let a stop signal reach the launch thread while Qt idles in C++.
+
+    Python runs a signal handler only when the main thread next runs Python,
+    and Qt's event loop can wait in C++ for as long as nothing happens on
+    screen: a SIGTERM was measured waiting 3.5 s. The C-level handler writes
+    to a wakeup pipe, and this notifier wakes the loop, which runs the
+    handler and then holds the main thread until the launch thread has
+    finished its teardown (supervision.hold_until_session_ends). ``fds`` is
+    a (non-blocking read, write) pair to use instead of a new pipe, for
+    tests.
+    """
+    if fds is None:
+        read_fd, write_fd = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+        signal.set_wakeup_fd(write_fd, warn_on_full_buffer=False)
+    else:
+        read_fd, write_fd = fds
+    notifier = QSocketNotifier(read_fd, QSocketNotifier.Type.Read, app)
+
+    def woken():
+        try:
+            while os.read(read_fd, 512):
+                pass
+        except OSError:
+            pass
+        supervision.hold_until_session_ends()
+
+    notifier.activated.connect(woken)
+    _STOP_SIGNAL_WATCH[:] = [notifier, read_fd, write_fd]
+    return notifier
+
+
+def gui():
+    """Launch the PySide6 GUI."""
+    from .deps import ensure_gui_deps
+    ensure_gui_deps()
+    _resolve_gui_display(os.environ)
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    app.setApplicationName(PRETTY)
+    app.setStyle("Fusion")
+    # "Close the launcher when Minecraft starts" closes the window while the
+    # launch thread is still supervising the game; the process itself exits
+    # once that thread finishes (see MainWindow._close_for_game).
+    app.setQuitOnLastWindowClosed(False)
+    # A poweroff, or a stopped scope, with the game running: the launch
+    # thread finishes its teardown before the process goes (bol/supervision.py).
+    if supervision.install():
+        _watch_stop_signals(app)
+
+    try:
+        window = MainWindow()
+    except Exception as e:
+        _desktop_error(f"GUI failed to start ({e}). Use the command line instead.")
+        return
+
+    window.show()
+    app.exec()

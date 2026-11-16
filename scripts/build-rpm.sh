@@ -46,11 +46,11 @@ mkdir -p "$OUT" \
 
 install -m755 "$SRC/bedrock-on-linux" "$PKG/usr/lib/bedrock-on-linux/bedrock-on-linux"
 cp -r "$SRC/bol"                       "$PKG/usr/lib/bedrock-on-linux/bol"
-# Bundle the GUI toolkit (customtkinter + darkdetect + packaging — pure Python,
-# not packaged by Fedora either) next to bol/ so it's on sys.path; a real dir
-# means customtkinter's theme/font assets load fine. cryptography/tkinter stay
-# distribution dependencies. python-xlib (+ six) provides structured RandR
-# monitor geometry; bol.x11 falls back to the xrandr CLI without it.
+# Bundle the GUI toolkit (PySide6-Essentials + shiboken6, and python-xlib —
+# none of these are distribution dependencies) next to bol/ so it's on
+# sys.path. cryptography stays a distribution dependency.
+# python-xlib (+ six) provides structured RandR monitor geometry; bol.x11
+# falls back to the xrandr CLI without it.
 # Hash-pinned, wheels only, no sdist builds. The closure is the same one the
 # .deb installs, so both distribution packages share its SHA-256 list in
 # third_party/requirements-deb.txt (--require-hashes rejects any mismatch).
@@ -61,9 +61,8 @@ python3 -m pip install --quiet --no-cache-dir --no-compile --no-deps \
 rm -rf "$PKG/usr/lib/bedrock-on-linux"/bin 2>/dev/null || true
 find "$PKG/usr/lib/bedrock-on-linux" -name __pycache__ -type d -exec rm -rf {} +
 for metadata in \
-  "$PKG/usr/lib/bedrock-on-linux/customtkinter-5.2.2.dist-info" \
-  "$PKG/usr/lib/bedrock-on-linux/darkdetect-0.8.0.dist-info" \
-  "$PKG/usr/lib/bedrock-on-linux/packaging-26.2.dist-info" \
+  "$PKG/usr/lib/bedrock-on-linux/shiboken6-6.9.3.dist-info" \
+  "$PKG/usr/lib/bedrock-on-linux/pyside6_essentials-6.9.3.dist-info" \
   "$PKG/usr/lib/bedrock-on-linux/python_xlib-0.33.dist-info" \
   "$PKG/usr/lib/bedrock-on-linux/six-1.17.0.dist-info"; do
   [[ -d "$metadata" ]] || {
@@ -73,10 +72,16 @@ for metadata in \
   dependency_license="$(
     find "$metadata" -type f -iname 'LICENSE*' -print -quit
   )"
-  [[ -n "$dependency_license" ]] || {
-    echo "missing dependency licence in $metadata" >&2
-    exit 1
-  }
+  # Some wheels (shiboken6, pyside6-essentials) carry no bundled LICENSE
+  # file at all -- Qt for Python states the license only in METADATA's
+  # License: field. Accept that as proof the license was reviewed and
+  # recorded, rather than requiring a file upstream never ships.
+  if [[ -z "$dependency_license" ]]; then
+    grep -qE '^License(-Expression)?:' "$metadata/METADATA" 2>/dev/null || {
+      echo "missing dependency licence in $metadata" >&2
+      exit 1
+    }
+  fi
 done
 install -m644 "$SRC/data/icon.png"    "$PKG/usr/lib/bedrock-on-linux/data/icon.png"
 # Relative, unlike the .deb's absolute link: rpm flags an absolute symlink as a
@@ -124,7 +129,6 @@ URL:            https://github.com/Wyze3306/BedrockOnLinux
 # distribution packages that do not exist.
 AutoReqProv:    no
 Requires:       python3 >= 3.9
-Requires:       python3-tkinter
 Requires:       python3-cryptography
 Requires:       tar
 Requires:       zstd
@@ -132,6 +136,48 @@ Requires:       xdg-utils
 Requires:       /usr/bin/xrandr
 Requires:       ca-certificates
 Requires:       (curl or wget)
+# The GUI toolkit is a vendored PySide6 wheel, so the Qt libraries themselves
+# ship inside the package -- but Qt's xcb platform plugin dlopen()s against the
+# host's X stack, and every entry below is a hard DT_NEEDED of the bundled
+# libqxcb.so (libEGL comes from libQt6Gui). Missing one does not raise in
+# Python: Qt aborts natively with "could not load the Qt platform plugin xcb"
+# before control returns, so the launcher's own error reporting never runs.
+# Regenerate against the pinned wheel with:
+#   readelf -d --wide .../PySide6/Qt/plugins/platforms/libqxcb.so | grep NEEDED
+# Declared by soname rather than by package name on purpose: with AutoReqProv
+# off these are exactly what rpm's own generator would have produced, and the
+# packages carrying them are named differently on Fedora (xcb-util-wm,
+# xcb-util-cursor, ...) than on openSUSE or Mageia. The soname is the one name
+# every RPM distribution agrees on.
+Requires:       libglib-2.0.so.0()(64bit)
+Requires:       libgthread-2.0.so.0()(64bit)
+Requires:       libdbus-1.so.3()(64bit)
+Requires:       libfontconfig.so.1()(64bit)
+Requires:       libfreetype.so.6()(64bit)
+Requires:       libGL.so.1()(64bit)
+Requires:       libEGL.so.1()(64bit)
+Requires:       libX11.so.6()(64bit)
+Requires:       libX11-xcb.so.1()(64bit)
+Requires:       libxkbcommon.so.0()(64bit)
+Requires:       libxkbcommon-x11.so.0()(64bit)
+Requires:       libxcb.so.1()(64bit)
+Requires:       libxcb-cursor.so.0()(64bit)
+Requires:       libxcb-icccm.so.4()(64bit)
+Requires:       libxcb-image.so.0()(64bit)
+Requires:       libxcb-keysyms.so.1()(64bit)
+Requires:       libxcb-randr.so.0()(64bit)
+Requires:       libxcb-render.so.0()(64bit)
+Requires:       libxcb-render-util.so.0()(64bit)
+Requires:       libxcb-shape.so.0()(64bit)
+Requires:       libxcb-shm.so.0()(64bit)
+Requires:       libxcb-sync.so.1()(64bit)
+Requires:       libxcb-util.so.1()(64bit)
+Requires:       libxcb-xfixes.so.0()(64bit)
+Requires:       libxcb-xkb.so.1()(64bit)
+# xodus-cli opens the Microsoft Store sign-in in an embedded webview. By
+# soname like the rest: "webkit2gtk4.1" is Fedora's package name, and
+# openSUSE, which calls it libwebkit2gtk-4_1-0, refused the whole package.
+Requires:       libwebkit2gtk-4.1.so.0()(64bit)
 Recommends:     mesa-vulkan-drivers
 
 %description

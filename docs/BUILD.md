@@ -38,6 +38,8 @@ SHA-256 yourself.
 | vkd3d-proton | `build-vkd3d.yml` | `HansKristian-Work/vkd3d-proton`, pinned Debian 13 (Trixie) mingw toolchain | `third_party/vkd3d-proton-universal/OUTPUT-SHA256SUMS` |
 | WineGDK | `build-winegdk.yml` | `Weather-OS/WineGDK` (pinned commit), Debian 11 (Bullseye) container | packed-prefix hash |
 | Managed engine | `build-engine.yml` | public base + WineGDK + vkd3d | `WINEGDK_ARCHIVE_SHA256` |
+| xodus-cli | `build-xodus.yml` | `xodus-gaming/xodus` (pinned commit), Debian 13 (Trixie) container | `XODUS_ARCHIVE_SHA256` |
+| WebKitGTK runtime | `build-xodus.yml` | the WebKitGTK/GTK closure of that binary, Trixie at `XODUS_WEBVIEW_SNAPSHOT` | `XODUS_WEBVIEW_SHA256` |
 | App (4 formats) | `build-app.yml` | the launcher + attested engine/xcurl | per-artifact attestation |
 
 Notes:
@@ -75,7 +77,9 @@ Notes:
   aliases, and validates the result against `bol/vkd3d.py`'s manifest pins.
 - **App** builds all four formats via `scripts/build-release.sh`. The AppImage's
   Tcl/Tk is compiled in a `debian:bullseye` container to meet the glibc-2.31
-  baseline, then cached for the host build.
+  baseline, then cached for the host build. The AppImage also gets update
+  information and a `.zsync` sidecar for delta updates; the sidecar describes
+  one exact AppImage, so it is published, checksummed and attested with it.
 
 ## Bootstrap order
 
@@ -101,6 +105,20 @@ not to loosen the check:
   `third_party/xcurl-msys2.lock` if msys2 rotated a package off the mirror).
 - WineGDK prefix → `WINEGDK_PREFIX_SHA256` (the reuse path and `build-winegdk.yml` both assert it).
 - engine → `WINEGDK_ARCHIVE_SHA256` and the `bol/vkd3d.py` manifest pins.
+- xodus-cli → `XODUS_SOURCE_COMMIT` + `XODUS_REV` + `XODUS_ARCHIVE_SHA256`.
+  `XODUS_REV` is the commit's first 12 characters, plus `-p<n>` for the
+  `n` patches in `third_party/xodus/patches/` that the build applies —
+  a patched binary is not the upstream commit's binary and must not
+  answer to its name.
+- WebKitGTK runtime → `XODUS_WEBVIEW_REV` + `XODUS_WEBVIEW_SNAPSHOT` +
+  `XODUS_WEBVIEW_SHA256`. It is the only pin that may legitimately be empty:
+  the launcher then refuses to install it and asks for the host package
+  instead, which is what a first publish looks like. Its packages come from
+  their own, later snapshot (`XODUS_WEBVIEW_SNAPSHOT`): the container moves on
+  to it once xodus-cli is built, because Debian updates WebKitGTK within a
+  stable release and the sign-in depends on it (2.54 draws without an EGL
+  display, #273). Bump the rev with that snapshot — the `PACKAGES` file inside
+  the archive records what went in.
 
 ## Divergence from the upstream engine
 

@@ -97,7 +97,7 @@ if [[ -n "$WINEGDK_PREFIX" ]]; then
   WINEGDK_PREFIX="$(cd "$WINEGDK_PREFIX" && pwd -P)"
 fi
 
-for tool in cmp cp find flock grep gzip install objdump python3 readelf readlink \
+for tool in cmp cp dd find flock grep gzip install objdump python3 readelf readlink \
   sha256sum strings tar; do
   command -v "$tool" >/dev/null 2>&1 || {
     echo "!! required packaging tool is missing: $tool" >&2
@@ -199,12 +199,62 @@ rm -rf "$STAGED_ENGINE/files/lib/wine/i386-unix"
 }
 echo "   removed stale Wine 10 i386 Unix runtime"
 
+# The overlay above only replaces the modules the WineGDK build produced, so a
+# module Wine's configure dropped does not leave a hole here: the GE-Proton
+# base's own module survives in its place, a Wine major version behind
+# everything around it. That is how the base's Wine 10 winewayland.drv shipped
+# beside our Wine 11 win32u.so, importing entry points Wine has since removed
+# and failing to load on every host (issue #180). Ask the same question the
+# launcher asks before it honours BOL_INPUT=wayland, so a candidate cannot
+# disagree with the check that has to defend users from it.
+PYTHONPATH="$SRC" python3 - "$STAGED_ENGINE" <<'PY'
+import sys
+from pathlib import Path
+
+from bol.waylanddrv import engine_wayland_driver_problem
+
+problem = engine_wayland_driver_problem(Path(sys.argv[1]))
+if problem:
+    raise SystemExit("!! " + problem)
+print("   Wayland driver belongs to the staged Wine build")
+PY
+
 # Wine's installed headers are build-time material, not part of the Proton
 # runtime. Besides adding about 75 MiB, generated headers embed the builder's
 # absolute source path. Remove them from the locked snapshot so the candidate
 # is relocatable and does not leak maintainer-specific paths. With a hard-link
 # snapshot this only unlinks staging entries; ENGINE_DIR remains untouched.
 rm -rf "$STAGED_ENGINE/files/include"
+
+# Neither is read by anything the engine runs. Wine Mono is the .NET runtime:
+# none of the supported titles is managed code, and the launcher starts Wine
+# with mscoree disabled, so its 257 MiB only ever travelled. Gecko stays: it
+# is what mshtml draws Minecraft Education's sign-in with. The import
+# libraries (*.a, 111 MiB) are for linking Windows programs against Wine.
+rm -rf "$STAGED_ENGINE/files/share/wine/mono"
+find "$STAGED_ENGINE/files/lib/wine" -type f -name '*.a' -delete
+
+# The WineGDK overlay is installed stripped (build-winegdk-*.sh). Refuse a
+# prefix that still carries its debugging sections, or one whose strip lost
+# the mark Wine recognises its own modules by: without it every builtin DLL
+# would load as a native one.
+for module in ntdll.dll kernelbase.dll user32.dll xgameruntime.dll; do
+  for arch in x86_64-windows i386-windows; do
+    candidate="$STAGED_ENGINE/files/lib/wine/$arch/$module"
+    [[ -f "$candidate" ]] || continue
+    if objdump -h "$candidate" | grep -q '\.debug_info'; then
+      echo "!! $arch/$module still carries debugging sections;" \
+        "build the WineGDK prefix with INSTALL_PROGRAM_FLAGS=-s" >&2
+      exit 1
+    fi
+    [[ "$(dd if="$candidate" bs=1 skip=64 count=16 status=none)" \
+       == "Wine builtin DLL" ]] || {
+      echo "!! $arch/$module lost its Wine builtin mark when stripped" >&2
+      exit 1
+    }
+  done
+done
+echo "   stripped WineGDK modules verified; Wine Mono and import libraries removed"
 
 # GE-Proton release archives may carry maintainer bytecode caches (including
 # embedded build paths). They are neither runtime inputs nor reproducible
@@ -285,6 +335,7 @@ PROVENANCE_FILES=(
   OUTPUT-SHA256SUMS
   restore-nv-dgc.patch
   fix-occluded-frame-latency.patch
+  fix-frame-limiter-busy-wait.patch
 )
 WINEGDK_R12_PROVENANCE_FILES=(
   README.md
@@ -300,6 +351,20 @@ WINEGDK_NATIVE_PROVENANCE_FILES=(
   0004-combase-implement-context-callback.patch
   0005-winex11-use-client-surface-origin.patch
   0006-xgameruntime-stop-faking-xstore-answers.patch
+  0007-ntdll-load-main-image-from-a-mapped-fd.patch
+  0008-ntdll-accept-a-path-in-the-image-map.patch
+  0009-xgameruntime-support-IXSystemImpl2-5-and-stub-XSystemHandleTrack.patch
+  0010-windows.storage-implement-the-file-save-picker.patch
+  0011-winewayland-bind-wl_seat-no-newer-than-the-pointer-listener.patch
+  0012-xgameruntime-run-titles-that-target-a-newer-gaming-services.patch
+  0013-kernelbase-report-PrivateUsage-from-GetProcessMemoryInfo.patch
+  0014-ntdll-server-fall-back-to-fsync-without-ntsync.patch
+  0015-ntdll-reread-proc-self-status-through-a-kept-descriptor.patch
+  0016-ntdll-check-the-time-zone-at-most-once-a-second.patch
+  0017-xgameruntime-record-the-title-s-XGameEventWrite-calls.patch
+  0018-jscript-add-the-Intl-object-Internet-Explorer-11-has.patch
+  0019-jscript-call-not-get-when-METHOD-PROPERTYGET-carries-arguments.patch
+  0020-ieframe-serve-SID_SShellBrowser-from-the-WebBrowser-control.patch
 )
 
 verify_sha256() {
@@ -321,13 +386,13 @@ verify_reviewed_provenance() {
     "dc626520dcd53a22f727af3ee42c770e56c97a64fe3adb063799d8ab032fe551" \
     "vkd3d-proton LGPL notice"
   verify_sha256 "$root/provenance.env" \
-    "f46ed5078a90958968ff40c2c9b5caf1c79fb5adaa34ac2a1f5c1c47f5e36e58" \
+    "87549af36ef94dca229915e2c4479b58d75c58f47e7897b36f0390dfef2773b2" \
     "vkd3d-proton provenance lock"
   verify_sha256 "$root/submodules.lock" \
     "19ae5e28d0828ebf911fe99569e4de56328ea39e1a076a11506a78d98c76f3aa" \
     "vkd3d-proton submodule lock"
   verify_sha256 "$root/OUTPUT-SHA256SUMS" \
-    "09d22ca93ae4b0a2f99294a43cec6a89a2bd92b96dffb14f2fcc5cf66685b3df" \
+    "32d230b6254d2a07a63423957a025bbe422ae69fd39246a76d3c17866c93290a" \
     "vkd3d-proton output hash lock"
   verify_sha256 "$root/restore-nv-dgc.patch" \
     "91878d389dc0e315f770fa6c7fffea8f78f410a04796c38e2a6410ff0b9b4a33" \
@@ -335,6 +400,9 @@ verify_reviewed_provenance() {
   verify_sha256 "$root/fix-occluded-frame-latency.patch" \
     "aac04d2bf777345272dec90f48b715d3eaebac7b2890f2b1ece4aa8daffc3465" \
     "vkd3d-proton occluded frame-latency fix"
+  verify_sha256 "$root/fix-frame-limiter-busy-wait.patch" \
+    "509609ba06eb5b6805fcc0d6a260cc16506c2564a9f78a8b26dca3afde4ca202" \
+    "vkd3d-proton frame-limiter busy-wait fix"
 }
 
 verify_winegdk_source_provenance() {
@@ -349,10 +417,10 @@ verify_winegdk_source_provenance() {
     "ee0543f11737a11f5edec389967bb41482c7f5eda3807c24d171dd6bf6301274" \
     "WineGDK r12 source delta"
   verify_sha256 "$native_root/README.md" \
-    "04bbe7412e66e61dac3be4f1ec2eeda1590d9bfb184bece8575eca4c5d9377b6" \
+    "4413fceb6f16fbb2c6b75fee9ca6a393cbcebe67de200e7e81602ce0559f743c" \
     "WineGDK native5 source-delta README"
   verify_sha256 "$native_root/SOURCE-SHA256SUMS" \
-    "642486a98b1985395e0a704bca76fbfa2124ee1de97d1d8c671213790b9bbd29" \
+    "e57757381892620d207d5228a098e4fabfc813851801067648c3c6651a6834ba" \
     "WineGDK native5 source hash lock"
   verify_sha256 \
     "$native_root/0001-winegdk-native5-Xbox-and-file-picker-runtime.patch" \
@@ -378,6 +446,62 @@ verify_winegdk_source_provenance() {
     "$native_root/0006-xgameruntime-stop-faking-xstore-answers.patch" \
     "0ae38358531a81af9b20a997d73f07b383db68afcd14cf89107dd9442f101fd1" \
     "WineGDK XStore honest-failure fix"
+  verify_sha256 \
+    "$native_root/0007-ntdll-load-main-image-from-a-mapped-fd.patch" \
+    "0ebb25f67183b0bb052b9cbb76f6a0aca02be89fc7be448ff94702b178e9ffc6" \
+    "WineGDK ntdll mapped-fd main-image loader"
+  verify_sha256 \
+    "$native_root/0008-ntdll-accept-a-path-in-the-image-map.patch" \
+    "7510e707abf9869d40b855754d58c025e1bd98cec455bef3dbec79e9d14461a3" \
+    "WineGDK ntdll image-map path support"
+  verify_sha256 \
+    "$native_root/0009-xgameruntime-support-IXSystemImpl2-5-and-stub-XSystemHandleTrack.patch" \
+    "c0a8e35717368fdc31f5ba6374ecb64aacb84cbd1dc22958077cff9ab5e2c301" \
+    "WineGDK XSystem interface revisions"
+  verify_sha256 \
+    "$native_root/0010-windows.storage-implement-the-file-save-picker.patch" \
+    "6ec2431cd854c2ae9f47ca6936dff19b0309c82ad3f3bc3fdcd0a9361ecd511c" \
+    "WineGDK Windows.Storage file save picker"
+  verify_sha256 \
+    "$native_root/0011-winewayland-bind-wl_seat-no-newer-than-the-pointer-listener.patch" \
+    "ed550ec1c78d581fbd21d25da429b9b37fb137e19df7128056cb2ec5340a5c59" \
+    "WineGDK Wayland seat version"
+  verify_sha256 \
+    "$native_root/0012-xgameruntime-run-titles-that-target-a-newer-gaming-services.patch" \
+    "d43c0f2cf32b624bb12d6db890d6f9a3a45e72523837310d868bec78318f59ce" \
+    "WineGDK Gaming Services version"
+  verify_sha256 \
+    "$native_root/0013-kernelbase-report-PrivateUsage-from-GetProcessMemoryInfo.patch" \
+    "850b8f80a23e1b9a5b25ab2b647125c7affe6650fe8f9c632678bba9dacae35e" \
+    "WineGDK GetProcessMemoryInfo PrivateUsage"
+  verify_sha256 \
+    "$native_root/0014-ntdll-server-fall-back-to-fsync-without-ntsync.patch" \
+    "57a7cf41297df589e369f9e059a3e3d8925de785ed588a24134ffa26b5f7f81a" \
+    "WineGDK fsync fallback without ntsync"
+  verify_sha256 \
+    "$native_root/0015-ntdll-reread-proc-self-status-through-a-kept-descriptor.patch" \
+    "9fa03ed50b2a5bfb68a60f55aa4b1ce4b7d842010c6b3f2c176177528a722db6" \
+    "WineGDK process memory counters"
+  verify_sha256 \
+    "$native_root/0016-ntdll-check-the-time-zone-at-most-once-a-second.patch" \
+    "6054f33a5a95c5beaf12039dca8b303fdfa66c4e01fb95b75479659f0aebc2d9" \
+    "WineGDK time zone check"
+  verify_sha256 \
+    "$native_root/0017-xgameruntime-record-the-title-s-XGameEventWrite-calls.patch" \
+    "c791f7bcab535204649c27ade0d328f669134f6044a1130362aeb5df964b28ad" \
+    "WineGDK XGameEvent runtime class"
+  verify_sha256 \
+    "$native_root/0018-jscript-add-the-Intl-object-Internet-Explorer-11-has.patch" \
+    "154f48790e2a8eecd970438cda3caf3bfea5e0b72f5012f2dd0379d3e49de61a" \
+    "WineGDK jscript Intl object"
+  verify_sha256 \
+    "$native_root/0019-jscript-call-not-get-when-METHOD-PROPERTYGET-carries-arguments.patch" \
+    "8e5c60b1eb3e9494abab7ff61f3e4cc8eed1f1d73a31623d76d07f24a35086fb" \
+    "WineGDK jscript call flags"
+  verify_sha256 \
+    "$native_root/0020-ieframe-serve-SID_SShellBrowser-from-the-WebBrowser-control.patch" \
+    "b53e95a2d11125744c5abd25ad60c53d32b35adae0c451b4ff85b47b94e4c215" \
+    "WineGDK ieframe shell browser window"
 }
 
 has_marker() {
@@ -667,6 +791,12 @@ for arch in "${ARCHES[@]}"; do
     echo "!! WineGDK native XUser request path missing for $arch" >&2; exit 1; }
   has_text "$xgdk" "unsupported GDK QueryApiImpl class" || {
     echo "!! WineGDK native interface diagnostics missing for $arch" >&2; exit 1; }
+  has_text "$xgdk" "short write of an event record" || {
+    echo "!! WineGDK XGameEvent runtime class (0017) missing for $arch" >&2; exit 1; }
+  # Its names are wide strings, which strings(1) only lists with -el.
+  jscript="$STAGED_ENGINE/files/lib/wine/$arch/jscript.dll"
+  LC_ALL=C strings -a -el "$jscript" | grep -Fx getCanonicalLocales >/dev/null || {
+    echo "!! WineGDK jscript Intl object (0018) missing for $arch" >&2; exit 1; }
   storage="$STAGED_ENGINE/files/lib/wine/$arch/windows.storage.dll"
   [[ -f "$storage" ]] || {
     echo "!! WineGDK windows.storage.dll missing for $arch" >&2; exit 1; }
@@ -675,9 +805,12 @@ for arch in "${ARCHES[@]}"; do
     echo "!! WineGDK StorageFile runtime missing for $arch" >&2; exit 1; }
   has_text "$storage" "Microsoft.Windows.Storage.Pickers.FileOpenPicker" || {
     echo "!! WineGDK native FileOpenPicker class missing for $arch" >&2; exit 1; }
-  has_text "$storage" "PickSingleFileAsync" || {
+  # The two pick operations, by the name each gives its lock: a string of the
+  # code itself. The method names were only ever symbols, which a stripped
+  # module (native24) no longer carries.
+  has_text "$storage" ": file_picker_operation.cs" || {
     echo "!! WineGDK native single-file picker method missing for $arch" >&2; exit 1; }
-  has_text "$storage" "PickMultipleFilesAsync" || {
+  has_text "$storage" ": multi_file_picker_operation.cs" || {
     echo "!! WineGDK native multi-file picker method missing for $arch" >&2; exit 1; }
   has_file_picker_registration "$storage" || {
     echo "!! WineGDK native FileOpenPicker registration missing for $arch" >&2
@@ -860,6 +993,20 @@ for relative_root, names in (
         "native5/0004-combase-implement-context-callback.patch",
         "native5/0005-winex11-use-client-surface-origin.patch",
         "native5/0006-xgameruntime-stop-faking-xstore-answers.patch",
+        "native5/0007-ntdll-load-main-image-from-a-mapped-fd.patch",
+        "native5/0008-ntdll-accept-a-path-in-the-image-map.patch",
+        "native5/0009-xgameruntime-support-IXSystemImpl2-5-and-stub-XSystemHandleTrack.patch",
+        "native5/0010-windows.storage-implement-the-file-save-picker.patch",
+        "native5/0011-winewayland-bind-wl_seat-no-newer-than-the-pointer-listener.patch",
+        "native5/0012-xgameruntime-run-titles-that-target-a-newer-gaming-services.patch",
+        "native5/0013-kernelbase-report-PrivateUsage-from-GetProcessMemoryInfo.patch",
+        "native5/0014-ntdll-server-fall-back-to-fsync-without-ntsync.patch",
+        "native5/0015-ntdll-reread-proc-self-status-through-a-kept-descriptor.patch",
+        "native5/0016-ntdll-check-the-time-zone-at-most-once-a-second.patch",
+        "native5/0017-xgameruntime-record-the-title-s-XGameEventWrite-calls.patch",
+        "native5/0018-jscript-add-the-Intl-object-Internet-Explorer-11-has.patch",
+        "native5/0019-jscript-call-not-get-when-METHOD-PROPERTYGET-carries-arguments.patch",
+        "native5/0020-ieframe-serve-SID_SShellBrowser-from-the-WebBrowser-control.patch",
     )),
     (gdk_proton_provenance_root, ("provenance.env",)),
 ):

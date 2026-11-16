@@ -1,15 +1,17 @@
 """Offline command-line dispatch regressions."""
 # SPDX-License-Identifier: MIT
 
+import builtins
 import contextlib
 import io
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from bol import cli
+from bol import cli, deps
 from bol.log import BolError
 from bol.network import NetworkCheck
 
@@ -39,7 +41,37 @@ class CliTests(unittest.TestCase):
                 mock.patch.object(cli, "ok"):
             cli.main()
 
-        setup.assert_called_once_with(mc_ver=None, force=True)
+        setup.assert_called_once_with(
+            mc_edition=None, mc_version=None, force=True)
+
+    def test_play_says_when_nothing_is_signed_in_for_online_play(self):
+        # The launcher window warns before starting the game (#240); a
+        # terminal that just launches leaves the same absence to be found
+        # in-game, as Realms and servers quietly missing.
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", ["bedrock-on-linux", "play"]), \
+                mock.patch.object(cli, "msa_signed_in", return_value=False), \
+                mock.patch.object(cli, "_plays_xbox_live", return_value=True), \
+                mock.patch.object(cli, "launch") as launch, \
+                contextlib.redirect_stdout(output):
+            cli.main()
+
+        # A warning, not a refusal: offline is a real way to play.
+        self.assertTrue(launch.called)
+        printed = output.getvalue()
+        self.assertIn("Not signed in for online play", printed)
+        self.assertIn("login", printed)
+
+    def test_play_says_nothing_when_the_account_is_there(self):
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", ["bedrock-on-linux", "play"]), \
+                mock.patch.object(cli, "msa_signed_in", return_value=True), \
+                mock.patch.object(cli, "launch") as launch, \
+                contextlib.redirect_stdout(output):
+            cli.main()
+
+        self.assertTrue(launch.called)
+        self.assertNotIn("Not signed in", output.getvalue())
 
     def test_profile_create_prints_profile_shortcut_and_command(self):
         profile = Path("/tmp/bol-profiles/family")
@@ -262,14 +294,78 @@ class CliTests(unittest.TestCase):
         self.assertEqual(exited.exception.code, 1)
 
 
+class ChromeOsWindowTests(unittest.TestCase):
+    """Qt's Wayland backend crashed the window in ChromeOS's container (#302)."""
+
+    def _root(self, tmp, marker=True):
+        root = Path(tmp)
+        if marker:
+            (root / "dev").mkdir()
+            (root / "dev" / ".cros_milestone").write_text("128\n")
+        return root
+
+    def test_the_container_gets_xwayland(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"DISPLAY": ":0", "WAYLAND_DISPLAY": "wayland-0"}
+            self.assertTrue(cli._prefer_x11_on_chromeos(env, self._root(tmp)))
+        self.assertEqual(env["QT_QPA_PLATFORM"], "xcb")
+
+    def test_the_compositor_alone_is_enough_to_tell(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"DISPLAY": ":0", "SOMMELIER_VERSION": "0.20"}
+            self.assertTrue(cli._prefer_x11_on_chromeos(
+                env, self._root(tmp, marker=False)))
+        self.assertEqual(env["QT_QPA_PLATFORM"], "xcb")
+
+    def test_a_platform_someone_chose_is_kept(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"DISPLAY": ":0", "QT_QPA_PLATFORM": "wayland"}
+            self.assertFalse(cli._prefer_x11_on_chromeos(env, self._root(tmp)))
+        self.assertEqual(env["QT_QPA_PLATFORM"], "wayland")
+
+    def test_nothing_changes_without_xwayland_or_off_chromeos(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            no_x = {"WAYLAND_DISPLAY": "wayland-0"}
+            self.assertFalse(cli._prefer_x11_on_chromeos(no_x, self._root(tmp)))
+            desktop = {"DISPLAY": ":0", "WAYLAND_DISPLAY": "wayland-0"}
+            self.assertFalse(cli._prefer_x11_on_chromeos(
+                desktop, self._root(tmp + "-none", marker=False)))
+        self.assertNotIn("QT_QPA_PLATFORM", no_x)
+        self.assertNotIn("QT_QPA_PLATFORM", desktop)
+
+
+class SudoRefusalTests(unittest.TestCase):
+    def test_nothing_runs_as_root_for_someone_else(self):
+        # `sudo ... doctor --acknowledge-gpu-crash` looked at root's data
+        # and found no incident to acknowledge (#299).
+        output = io.StringIO()
+        with mock.patch.object(
+                sys, "argv",
+                ["bedrock-on-linux", "doctor", "--acknowledge-gpu-crash"]), \
+                mock.patch.dict(os.environ, {"SUDO_USER": "bilal"}), \
+                mock.patch.object(os, "geteuid", return_value=0), \
+                mock.patch("bol.util._ensure_xdg_storage") as storage, \
+                mock.patch.object(cli, "doctor") as doctor, \
+                contextlib.redirect_stdout(output), \
+                self.assertRaises(SystemExit) as exited:
+            cli.main()
+
+        self.assertEqual(exited.exception.code, 1)
+        self.assertIn("without sudo", output.getvalue())
+        storage.assert_not_called()
+        doctor.assert_not_called()
+
+
 class LauncherStartTests(unittest.TestCase):
     """Starting the launcher opens the launcher — in Game Mode too."""
 
     def _run(self, argv, gamescope):
+        # Qt is imported where it is used, so the window is patched on
+        # bol.gui itself rather than on a name bol.cli holds.
         with mock.patch.object(sys, "argv", argv), \
                 mock.patch.dict(os.environ, {"DISPLAY": ":0"}), \
                 mock.patch.object(cli, "launch") as launched, \
-                mock.patch.object(cli, "gui") as window, \
+                mock.patch("bol.gui.gui") as window, \
                 mock.patch.object(cli, "info"), \
                 mock.patch("bol.gpu_safety.in_gamescope_session",
                            return_value=gamescope):
@@ -288,7 +384,32 @@ class LauncherStartTests(unittest.TestCase):
 
     def test_play_stays_the_launcher_free_path(self):
         launched, window = self._run(["bedrock-on-linux", "play"], True)
-        launched.assert_called_once_with()
+        launched.assert_called_once_with(editor=False)
+        window.assert_not_called()
+
+    def test_betterrtx_commands_reach_the_manager(self):
+        for argv, expected in (
+                (["betterrtx", "list"], ("list", None)),
+                (["betterrtx", "install", "default"], ("install", "default")),
+                (["betterrtx", "restore"], ("restore", None))):
+            with self.subTest(argv=argv), \
+                    mock.patch.object(sys, "argv", ["bedrock-on-linux"] + argv), \
+                    mock.patch("bol.betterrtx.cli") as manager:
+                cli.main()
+            manager.assert_called_once_with(*expected)
+
+    def test_betterrtx_install_needs_something_to_install(self):
+        with mock.patch.object(sys, "argv",
+                               ["bedrock-on-linux", "betterrtx", "install"]), \
+                mock.patch("bol.betterrtx.cli") as manager, \
+                self.assertRaises(SystemExit):
+            cli.main()
+        manager.assert_not_called()
+
+    def test_play_editor_opens_bedrock_editor(self):
+        launched, window = self._run(
+            ["bedrock-on-linux", "play", "--editor"], True)
+        launched.assert_called_once_with(editor=True)
         window.assert_not_called()
 
     def test_shortcut_launch_failure_reaches_the_desktop(self):
@@ -311,14 +432,181 @@ class LauncherStartTests(unittest.TestCase):
         with mock.patch.object(sys, "argv", ["bedrock-on-linux", "gui"]), \
                 mock.patch.dict(os.environ, {"DISPLAY": ":0"}), \
                 mock.patch.object(cli, "IS_TTY", False), \
-                mock.patch.object(cli, "gui",
-                                  side_effect=BolError("Tk is missing")), \
+                mock.patch("bol.gui.gui",
+                           side_effect=BolError("Qt is missing")), \
                 mock.patch.object(cli, "desktop_notify") as notified, \
                 mock.patch.object(cli, "err"), \
                 self.assertRaises(SystemExit):
             cli.main()
 
         notified.assert_not_called()
+
+    def test_a_toolkit_that_is_not_installed_yet_is_installed_first(self):
+        # bol.cli imported bol.gui -- and with it the whole Qt stack -- while
+        # it was still being imported itself, so the pip bootstrap that is
+        # supposed to install the toolkit on a portable .pyz or a bare
+        # checkout could never run: the import had already failed.
+        with mock.patch.object(sys, "argv", ["bedrock-on-linux", "gui"]), \
+                mock.patch.dict(os.environ, {"DISPLAY": ":0"}), \
+                mock.patch.object(deps, "have", return_value=False), \
+                mock.patch.object(deps, "ensure_gui_deps",
+                                  return_value=[]) as bootstrap, \
+                mock.patch("bol.gui.gui") as window:
+            cli.main()
+
+        bootstrap.assert_called_once_with()
+        window.assert_called_once_with()
+
+    def test_an_installed_toolkit_is_not_reinstalled_on_every_launch(self):
+        # pip must not be reached for a toolkit that is already there.
+        with mock.patch.object(sys, "argv", ["bedrock-on-linux", "gui"]), \
+                mock.patch.dict(os.environ, {"DISPLAY": ":0"}), \
+                mock.patch.object(deps, "have", return_value=True), \
+                mock.patch.object(deps, "ensure_gui_deps") as bootstrap, \
+                mock.patch("bol.gui.gui") as window:
+            cli.main()
+
+        bootstrap.assert_not_called()
+        window.assert_called_once_with()
+
+    def test_a_toolkit_that_cannot_be_installed_is_reported_plainly(self):
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", ["bedrock-on-linux", "gui"]), \
+                mock.patch.dict(os.environ, {"DISPLAY": ":0"}), \
+                mock.patch.object(deps, "have", return_value=False), \
+                mock.patch.object(deps, "ensure_gui_deps",
+                                  return_value=["PySide6"]), \
+                contextlib.redirect_stdout(output), \
+                self.assertRaises(SystemExit) as exited:
+            cli.main()
+
+        self.assertEqual(exited.exception.code, 1)
+        self.assertIn("PySide6", output.getvalue())
+
+    def test_a_qt_library_the_host_lacks_is_named_rather_than_raised(self):
+        # Issue #205: the AppImage on NixOS reported the launcher as a
+        # traceback out of `from PySide6.QtCore import ...`. The loader says
+        # exactly which library it could not open; say it back.
+        refused = ImportError("libzstd.so.1: cannot open shared object file: "
+                              "No such file or directory")
+        real_import = builtins.__import__
+
+        def without_qt(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "gui" or name.endswith("bol.gui"):
+                raise refused
+            return real_import(name, globals, locals, fromlist, level)
+
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", ["bedrock-on-linux", "gui"]), \
+                mock.patch.dict(os.environ, {"DISPLAY": ":0"}), \
+                mock.patch.object(deps, "ensure_gui_deps", return_value=[]), \
+                mock.patch.object(builtins, "__import__", without_qt), \
+                contextlib.redirect_stdout(output), \
+                self.assertRaises(SystemExit) as exited:
+            cli.main()
+
+        self.assertEqual(exited.exception.code, 1)
+        self.assertIn("libzstd.so.1", output.getvalue())
+        self.assertNotIn("Traceback", output.getvalue())
+
+    def test_a_library_qt_core_links_is_named_with_its_package(self):
+        # A stock openSUSE has no libgthread-2_0-0: a PyPI PySide6 then fails
+        # its very first import, and from a menu nobody saw why.
+        refused = ImportError("libgthread-2.0.so.0: cannot open shared object "
+                              "file: No such file or directory")
+        real_import = builtins.__import__
+
+        def without_qt(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "gui" or name.endswith("bol.gui"):
+                raise refused
+            return real_import(name, globals, locals, fromlist, level)
+
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", ["bedrock-on-linux", "gui"]), \
+                mock.patch.dict(os.environ, {"WAYLAND_DISPLAY": "wayland-0",
+                                             "XDG_SESSION_TYPE": "wayland",
+                                             "QT_QPA_PLATFORM": ""}), \
+                mock.patch.object(deps, "have", return_value=True), \
+                mock.patch.object(deps, "fill_qt_library_gaps",
+                                  return_value=[]) as filled, \
+                mock.patch.object(deps, "missing_qt_libraries",
+                                  return_value=["libgthread-2.0.so.0",
+                                                "libxcb-shape.so.0"]), \
+                mock.patch("shutil.which",
+                           side_effect=lambda name: "/usr/bin/zypper"
+                           if name == "zypper" else None), \
+                mock.patch.object(builtins, "__import__", without_qt), \
+                mock.patch.object(cli, "IS_TTY", False), \
+                mock.patch.object(cli, "desktop_notify") as notified, \
+                contextlib.redirect_stdout(output), \
+                self.assertRaises(SystemExit) as exited:
+            cli.main()
+        self.assertEqual(exited.exception.code, 1)
+        filled.assert_called_once_with()
+        # Both at once: the loader only ever names the first.
+        self.assertIn("libgthread-2.0.so.0 and libxcb-shape.so.0",
+                      output.getvalue())
+        self.assertIn("sudo zypper install libgthread-2_0-0 libxcb-shape0",
+                      output.getvalue())
+        self.assertIn("libgthread-2.0.so.0", notified.call_args[0][0])
+
+    def test_an_x11_plugin_qt_would_abort_on_is_named_first(self):
+        # Stock Ubuntu and Mint have no libxcb-cursor0: Qt's xcb plugin then
+        # aborts the process, with nothing on screen from a menu launch.
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", ["bedrock-on-linux", "gui"]), \
+                mock.patch.dict(os.environ, {"DISPLAY": ":0",
+                                             "XDG_SESSION_TYPE": "x11",
+                                             "QT_QPA_PLATFORM": ""}), \
+                mock.patch.object(deps, "ensure_gui_deps", return_value=[]), \
+                mock.patch.object(deps, "have", return_value=True), \
+                mock.patch.object(deps, "xcb_plugin_missing_library",
+                                  return_value="libxcb-cursor.so.0"), \
+                mock.patch.object(deps, "install_hint",
+                                  return_value="sudo apt install libxcb-cursor0"), \
+                mock.patch.object(deps, "missing_qt_libraries",
+                                  return_value=["libxcb-cursor.so.0"]), \
+                mock.patch.object(cli, "IS_TTY", False), \
+                mock.patch.object(cli, "desktop_notify") as notified, \
+                mock.patch("bol.gui.gui") as window, \
+                contextlib.redirect_stdout(output), \
+                self.assertRaises(SystemExit) as exited:
+            cli.main()
+        self.assertEqual(exited.exception.code, 1)
+        self.assertIn("sudo apt install libxcb-cursor0", output.getvalue())
+        self.assertIn("libxcb-cursor.so.0", notified.call_args[0][0])
+        window.assert_not_called()
+
+    def test_a_wayland_session_is_not_held_back_by_the_x11_plugin(self):
+        with mock.patch.object(sys, "argv", ["bedrock-on-linux", "gui"]), \
+                mock.patch.dict(os.environ, {"WAYLAND_DISPLAY": "wayland-0",
+                                             "XDG_SESSION_TYPE": "wayland"}), \
+                mock.patch.object(deps, "have", return_value=True), \
+                mock.patch.object(deps, "xcb_plugin_missing_library",
+                                  return_value="libxcb-cursor.so.0") as probe, \
+                mock.patch("bol.gui.gui") as window:
+            os.environ.pop("QT_QPA_PLATFORM", None)
+            cli.main()
+        probe.assert_not_called()
+        window.assert_called_once_with()
+
+    def test_a_gui_import_failure_of_our_own_making_still_raises(self):
+        # Only the loader's "cannot open shared object file" is answered with
+        # a system library to install; a broken import inside bol.gui is a bug
+        # here and must keep its traceback.
+        real_import = builtins.__import__
+
+        def broken_gui(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "gui" or name.endswith("bol.gui"):
+                raise ImportError("cannot import name 'QToolButton'")
+            return real_import(name, globals, locals, fromlist, level)
+
+        with mock.patch.object(sys, "argv", ["bedrock-on-linux", "gui"]), \
+                mock.patch.dict(os.environ, {"DISPLAY": ":0"}), \
+                mock.patch.object(deps, "ensure_gui_deps", return_value=[]), \
+                mock.patch.object(builtins, "__import__", broken_gui), \
+                self.assertRaises(ImportError):
+            cli.main()
 
 
 if __name__ == "__main__":

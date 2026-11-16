@@ -4,15 +4,36 @@
 import re
 from pathlib import Path
 
+from . import hostarch, selinux
 from .auth import msa_signed_in
 from .config import LOGS
 from .deps import ensure_login_deps
-from .fixups import fix_curl_ssl, hide_signin_button, install_gdk_xbox_dlls
+from .fixups import (
+    fix_curl_ssl,
+    hide_signin_button,
+    install_ca_bundle,
+    install_gdk_xbox_dlls,
+)
 from .gameinput import install_gameinput
-from .games import _auto_mc_version, _game_root, download_game, use_game_dir
-from .log import BolError, info, ok, warn
+from .config import GAMES
+from .games import (
+    _auto_selection,
+    _game_root,
+    edition_exe,
+    edition_for_dir,
+    install_game,
+    is_bedrock,
+    list_versions,
+    selected_edition,
+    prune_legacy_game_archives,
+    use_game_dir,
+    uses_xbox_live,
+    version_dir,
+)
+from .log import BolError, desktop_notify, info, ok, warn
 from .prefix import (
     active_prefix,
+    boot_failure_message,
     boot_prefix,
     ensure_umu,
     prefix_operation_lock,
@@ -22,44 +43,264 @@ from .proton import ensure_proton
 from .util import launcher_owned_overrides, load_settings, mkdirs
 from .winegdk import ensure_winegdk
 
-def do_setup(game_dir=None, mc_ver=None, proton_tag=None, force=False,
-             progress=None):
+def do_setup(game_dir=None, mc_edition=None, mc_version=None, proton_tag=None,
+             force=False, progress=None):
     """Install/update shared game, engine and prefix state exclusively."""
     with shared_assets_lock(
             "install or update BedrockOnLinux", exclusive=True), \
             prefix_operation_lock("install or update BedrockOnLinux"):
-        return _do_setup(game_dir, mc_ver, proton_tag, force, progress)
+        return _do_setup(game_dir, mc_edition, mc_version, proton_tag,
+                         force, progress)
 
 
-def _do_setup(game_dir=None, mc_ver=None, proton_tag=None, force=False,
-              progress=None):
+def setup_or_join(edition, version, progress=None, busy=None):
+    """Prepare the build PLAY asked for, with other games possibly running.
+
+    With no other game, this is :func:`do_setup`. While other profiles play,
+    the shared game and engine files cannot be written, and do not need to
+    be when the build asked for is already complete on disk: it is selected
+    for this profile and the launch joins the running games, as a profile
+    started from the Profiles page or a shortcut does. A build that still
+    has to be downloaded waits until the other games are closed, and says
+    so.
+    """
+    from .prefix import shared_assets_busy
+    if not (busy or shared_assets_busy)():
+        return do_setup(mc_edition=edition, mc_version=version,
+                        progress=progress)
+    edition_id = (edition or {}).get("id")
+    folder = version_dir(edition_id, version) if edition_id and version \
+        else None
+    if folder is not None and _game_root(
+            folder, edition_exe(edition)) is not None:
+        info("Other games are running: starting the installed "
+             f"{version} beside them.")
+        return use_game_dir(folder)
+    name = (edition or {}).get("name") or "Minecraft"
+    raise BolError(
+        f"{name} {version or ''} is not installed yet, and installing it "
+        "needs the shared game files that the games already running are "
+        "using. Pick a version that is already installed to play it beside "
+        "them, or close the other games first.".replace("  ", " "))
+
+
+# Off unless asked for: a server that has not updated yet refuses a newer
+# client, so moving to a new build stays the player's decision by default.
+AUTO_UPDATE_SETTING = "auto_update_game"
+
+
+def update_game_before_play(always=False, setup=None, versions=None):
+    """Move to the newest build of the edition being played (#328).
+
+    For a start with no launcher window -- a desktop or Steam shortcut --
+    where nobody is shown that a new build is out. Does nothing unless the
+    setting is on or ``always`` is. Returns the build switched to, or None
+    when the installed one is kept: it is already the newest, it is a copy
+    from outside the managed folder, or the update could not be made. Never
+    raises: whatever stops the update, the build already installed still
+    starts.
+    """
+    settings = load_settings()
+    if not (always or settings.get(AUTO_UPDATE_SETTING, False)):
+        return None
+    game_dir = settings.get("game_dir")
+    try:
+        managed = bool(game_dir) and Path(game_dir).resolve().is_relative_to(
+            GAMES.resolve())
+    except OSError:
+        managed = False
+    if not managed:
+        return None
+    try:
+        edition, current = _auto_selection(settings)
+        listed = (versions or list_versions)(edition["id"], offline_ok=False)
+        newest = listed[0]["version"] if listed else None
+        if not newest or newest == current:
+            return None
+        message = (f"Updating {edition['name']} from {current or '?'} to "
+                   f"{newest} before it starts …")
+        info(message)
+        desktop_notify(message)
+        (setup or do_setup)(mc_edition=edition, mc_version=newest)
+    except Exception as exc:
+        warn(f"Could not update Minecraft ({exc}); starting the build "
+             "already installed.")
+        return None
+    return newest
+
+
+def _build_root(folder):
+    """The complete build in ``folder``, for whichever title it holds."""
+    folder = Path(folder).expanduser()
+    return _game_root(folder, edition_exe(edition_for_dir(folder)))
+
+
+def _do_setup(game_dir=None, mc_edition=None, mc_version=None, proton_tag=None,
+              force=False, progress=None):
+    # Everything setup downloads is x86-64; say so before the first of them
+    # fails to start with "Exec format error" (#250).
+    arch_problem = hostarch.problem()
+    if arch_problem:
+        raise BolError(arch_problem)
     mkdirs()
+    prune_legacy_game_archives()
     s = load_settings()
     ensure_login_deps()
-    if mc_ver:
-        use_game_dir(download_game(mc_ver, progress, force=force))
-    elif game_dir and _game_root(Path(game_dir).expanduser()):
+    if mc_edition:
+        use_game_dir(install_game(mc_edition, mc_version, progress,
+                                  force=force))
+    elif game_dir and _build_root(game_dir):
         use_game_dir(game_dir)
     cur = load_settings().get("game_dir")
-    if not cur or not _game_root(Path(cur)):
-        use_game_dir(download_game(_auto_mc_version(s), progress, force=force))
+    if not cur or not _build_root(cur):
+        edition, version = _auto_selection(s)
+        use_game_dir(install_game(edition, version, progress, force=force))
     gd = Path(load_settings()["game_dir"])
+    # The DLLs the game folder gets are Bedrock's own fixes -- its XCurl and
+    # libHttpClient, its sign-in button. Another title keeps what it shipped
+    # with: those replacements were never tried on it, and Minecraft
+    # Education has neither XCurl nor Xbox Live to fix (#351).
+    bedrock = is_bedrock(edition_for_dir(gd))
+    xbox_live = uses_xbox_live(gd)
     if load_settings().get("proton_source") == "winegdk":
         ensure_winegdk(force, progress)
-        install_gdk_xbox_dlls(gd)
+        if bedrock:
+            install_gdk_xbox_dlls(gd)
     else:
         ensure_proton(proton_tag, force, progress)
     ensure_umu(force)
-    fix_curl_ssl(gd)
+    if bedrock:
+        fix_curl_ssl(gd)
+    elif xbox_live:
+        install_ca_bundle(gd)
     if not boot_prefix():
-        raise BolError(
-            "Could not initialise the Wine prefix, so setup stopped before "
-            "installing GameInput. Check "
-            f"{LOGS / 'native-login.log'} and re-run 'Install / Update'."
-        )
+        raise BolError(boot_failure_message(
+            "setup stopped before installing GameInput"))
     install_gameinput(active_prefix(), gd)
-    hide_signin_button(gd)
-    ok("Setup complete — click PLAY, then sign in to Microsoft in-game.")
+    if not xbox_live:
+        ok("Setup complete — click PLAY, then sign in to Minecraft Education "
+           "with your school or work account.")
+        return
+    if bedrock:
+        hide_signin_button(gd)
+    # Not "sign in in-game": that button reaches a sign-in the engine does
+    # not implement, and telling people to use it is how #227/#228 were
+    # filed. The account is linked here, and PLAY carries it into the
+    # prefix for the game to pick up.
+    ok("Setup complete — sign in from the launcher, then click PLAY.")
+
+
+# Unlike every other cause below, this one means the game never started, so
+# the launch reports it as its failure rather than only listing it (#280).
+LICENCE_REFUSED = (
+    "Microsoft refused the game licence: this account has reached its limit "
+    "of ten Microsoft Store download devices. Remove the ones you no longer "
+    "use at https://account.microsoft.com/devices/content, then click PLAY "
+    "again.")
+
+
+# The same kind of failure, reached without a network. A Store build stays
+# encrypted on disk and xodus-cli fetches the key that decrypts it from
+# Microsoft at every launch, so with no connection the game never starts --
+# and all xodus-cli says is a Rust panic on login.live.com (#308):
+#   thread 'main' panicked at crates/xodus-cli/src/license.rs:51:6:
+#   called `Result::unwrap()` on an `Err` value: Request(reqwest::Error {
+#   kind: Request, url: "https://login.live.com/RST2.srf", source: … dns error
+LICENCE_UNREACHABLE = (
+    "Minecraft could not start because its licence could not be fetched: no "
+    "connection to Microsoft. A game downloaded from the Microsoft Store "
+    "stays encrypted on disk, and Microsoft hands out the key that decrypts "
+    "it each time it starts, so it needs an internet connection to start, "
+    "single-player included. Connect to the internet and click PLAY again.")
+# From 64d39eb87a56-p9 on, the exchange that needs the network first reports
+# it instead of panicking:
+#   could not exchange this device's Microsoft session: Error making a request
+#   reqwest::Error { kind: Request, url: "https://login.live.com/RST2.srf",
+#   source: … ConnectError("dns error", …
+_LICENCE_UNREACHABLE = (
+    r"(?:panicked at [^\n]*license\.rs[^\n]*\n|"
+    r"could not exchange this device's Microsoft session: |"
+    r"Microsoft session was refused again after signing it in afresh: )"
+    r"[^\n]*"
+    r"(?:dns error|failed to lookup address|ConnectError|Connect,|"
+    r"timed out|Connection refused|Network is unreachable|"
+    r"error sending request)")
+
+
+# The licence request is signed with two Microsoft sessions the Store sign-in
+# left in xodus-cli's keyring: this computer's, which Microsoft issues for 60
+# days, and the account's, for 90. xodus-cli up to 64d39eb87a56-p8 renewed
+# neither, and a refused device session ended in a panic before the game
+# started (#367), which read "No known cause":
+#   thread 'main' panicked at crates/xodus/src/api/live/mod.rs:79:14:
+#   not implemented: Exchange token supports only singular token right now
+#   Fault(Fault)
+# Patches 0009 and 0010 renew both. What is left is a device session Microsoft
+# refuses even freshly signed in, or an account session that ran out before
+# the game was played in its last week, and the Store sign-in replaces both.
+# Signing out keeps the device, so it does not cost one of the account's ten.
+STORE_SESSION_REFUSED = (
+    "Minecraft could not start because Microsoft no longer accepts the "
+    "Microsoft Store sign-in the game's licence is fetched with at every "
+    "start. Open the account menu, sign out of the Microsoft Store account "
+    "(Download Minecraft), sign in again, then click PLAY.")
+_STORE_SESSION_REFUSED = (
+    r"Exchange token supports only singular token[^\n]*Fault|"
+    r"Microsoft session was refused again after signing it in afresh|"
+    r"not logged in: [^\n]*(?:in the keyring has expired|"
+    r"is missing from the keyring)")
+
+
+# The licensing service answered, and the answer was not a licence (#345).
+# xodus-cli up to -p5 printed only that it could not decode the body; -p7
+# names the HTTP status and Microsoft's reason. Either way the game never
+# started, and the launcher came back as if PLAY had done nothing.
+LICENCE_SERVICE_REFUSED = (
+    "Microsoft's licensing service refused the licence Minecraft needs to "
+    "start, so the game never opened")
+_LICENCE_SERVICE_REFUSAL = re.compile(
+    r"the licensing service refused the request \(([^)\n]{1,40})\):?[ \t]*"
+    r"([^\n]{0,160})|"
+    r"error decoding response body for url \(https://licensing\.mp\."
+    r"microsoft\.com", re.I)
+
+
+def _licence_service_refusal(text):
+    """The hit for a licence the service refused, or None."""
+    match = _LICENCE_SERVICE_REFUSAL.search(text)
+    if not match:
+        return None
+    status, reason = match.group(1), (match.group(2) or "").strip()
+    detail = f" ({status}{': ' + reason if reason else ''})" if status else ""
+    return (f"{LICENCE_SERVICE_REFUSED}{detail}. In Settings ▸ Accounts, "
+            "unlink the Store account and link it again with the account "
+            "that owns Minecraft, then click PLAY. If the licence is refused "
+            "again, update the launcher and attach minecraft.log to a bug "
+            "report.")
+
+
+# DRM devices, for telling a virtual GPU from a real one (#302).
+DRM_SYSFS = Path("/sys/class/drm")
+
+
+def _virtio_gpu(text=""):
+    """Whether the game drew through a virtio-gpu device.
+
+    That is what ChromeOS's Linux container and most virtual machines hand
+    a guest: Mesa's Venus driver forwards Vulkan to the host through it.
+    The log names it when vkd3d-proton or Mesa did; sysfs says so for every
+    virtio-gpu device (PCI vendor 0x1af4) either way.
+    """
+    if re.search(r"\bVenus\b|virtio[-_ ]?gpu|\b1af4:10[0-9a-f]{2}\b",
+                 text, re.I):
+        return True
+    for vendor in DRM_SYSFS.glob("card*/device/vendor"):
+        try:
+            if vendor.read_text().strip().lower() == "0x1af4":
+                return True
+        except OSError:
+            continue
+    return False
 
 
 _DIAG_RULES = [
@@ -106,6 +347,12 @@ _DIAG_RULES = [
     (r"Authentication failed|invalid_grant|login.*failed",
      "Microsoft sign-in failed in-game — sign in again "
      "(open the link, enter the code)."),
+    # An encrypted build is licensed to a device at every launch, so this is
+    # a launch failure and not only a download one. The account is out of
+    # Store devices, and where they are given back is not in the message.
+    (r"Device group is full", LICENCE_REFUSED),
+    (_LICENCE_UNREACHABLE, LICENCE_UNREACHABLE),
+    (_STORE_SESSION_REFUSED, STORE_SESSION_REFUSED),
     (r"\bInitialConnection[-_: ]*13(?!\d)",
      "LAN InitialConnection-13 — check that the host firewall allows "
      "Minecraft's inbound RakNet UDP 19132 and, on Windows, that the host "
@@ -152,8 +399,12 @@ _DIAG_RULES = [
 ]
 
 
-def diagnose():
-    """Scan game logs and surface a likely cause."""
+def diagnose(quiet=False):
+    """Scan game logs and surface a likely cause.
+
+    ``quiet`` returns the causes without printing them, for a problem report
+    (bol.report) that carries them rather than shows them.
+    """
     blobs = []
     for p in (LOGS / "proton.log", LOGS / "minecraft.log",
               LOGS / "winegdk-build.log"):
@@ -178,6 +429,21 @@ def diagnose():
                 pass
     text = "\n".join(blobs)
     hits = [msg for pat, msg in _DIAG_RULES if re.search(pat, text, re.I)]
+    # The game never ran: xodus-cli died fetching the licence, and its panic
+    # names login.live.com right before "failed to lookup address", which
+    # the in-game sign-in rule reads as a failed sign-in (#308).
+    if LICENCE_UNREACHABLE in hits or STORE_SESSION_REFUSED in hits:
+        hits = [h for h in hits if not h.startswith(
+            "Microsoft sign-in failed in-game")]
+    # No answer at all is not a refusal: signing in again needs the network
+    # that is missing.
+    if LICENCE_UNREACHABLE in hits:
+        hits = [h for h in hits if h != STORE_SESSION_REFUSED]
+    # A full device group is refused through the same service, and that
+    # message already says what to do about it.
+    refusal = _licence_service_refusal(text)
+    if refusal and LICENCE_REFUSED not in hits:
+        hits.append(refusal)
     # Positive evidence wins: if the engine logged its XUser patches or a
     # successful pre-auth, WineGDK XUser IS present — drop any "no XUser" hit so
     # a benign HRESULT elsewhere can't tell the user to reinstall a working
@@ -211,6 +477,18 @@ def diagnose():
         text,
         re.I,
     )
+    # A Chromebook got from "Game closed (exit 84)", the access violation
+    # above, to a world by turning the legacy renderer on (#302): Venus
+    # forwards Vulkan to the host, and Minecraft's Direct3D 12 path through
+    # vkd3d-proton did not survive it.
+    crashed = any("memory access violation" in hit for hit in hits)
+    if crashed and _virtio_gpu(text):
+        hits.append("This system draws through a virtual GPU (virtio-gpu, as "
+                    "in ChromeOS's Linux container or a virtual machine), "
+                    "which Minecraft's Direct3D 12 renderer can crash on. "
+                    "Turn on Settings ▸ Advanced ▸ Legacy compatibility "
+                    "renderer: on a Chromebook, that is what got the game "
+                    "running. It costs visual quality and ray tracing.")
     if lacks_vulkan_13 and no_dxvk_adapter and not software_only:
         hits.append("DXVK found no usable Vulkan 1.3 adapter — choose the "
                     "Legacy compatibility renderer (renderer=opengl) in "
@@ -220,6 +498,14 @@ def diagnose():
                     "DXVK and vkd3d-proton are dropped. Minecraft renders "
                     "exclusively through D3D12, so expect visual artifacts "
                     "and no ray tracing.")
+    # Proton's first process dies on SELinux's execmod rule without a line
+    # in any log (#380), so this is checked on the system, not the log: always
+    # when the boolean is known to be off, and on an openSUSE Flatpak, which
+    # cannot read it, when nothing else explains the failure.
+    selinux_problem = selinux.problem()
+    if selinux_problem and (
+            not hits or selinux.execmod_state() == selinux.DENIED):
+        hits.insert(0, selinux_problem)
     # Check the field itself, not the log: an override that breaks the launch
     # can leave nothing in the log to match on, which is how issue #134 ended
     # in three full reinstalls.
@@ -231,11 +517,21 @@ def diagnose():
                     "PROTON_USE_WINED3D forces the legacy renderer, which "
                     "Minecraft's menu can crash on. Use the Renderer setting "
                     "instead." % ", ".join(overrides))
-    if not msa_signed_in():
-        hits.append("No Microsoft account linked — the game runs, but in "
-                    "offline mode: single-player worlds and LAN play only. "
-                    "Click 'Sign in' before PLAY for Realms, servers, the "
-                    "Marketplace and Xbox friends.")
+    played = selected_edition(load_settings())
+    # Minecraft Education signs in with a school or work account of its own:
+    # no Xbox account to miss (#351).
+    if not msa_signed_in() and (played or {}).get("xbox_live", True):
+        if is_bedrock(played):
+            hits.append("No Microsoft account linked — the game runs, but in "
+                        "offline mode: single-player worlds and LAN play "
+                        "only. Click 'Sign in' before PLAY for Realms, "
+                        "servers, the Marketplace and Xbox friends.")
+        else:
+            hits.append(f"No Microsoft account linked — {played['name']} "
+                        "cannot sign in to Xbox Live. Click 'Sign in' "
+                        "before PLAY.")
+    if quiet:
+        return hits
     if hits:
         warn("Likely cause:")
         for h in dict.fromkeys(hits):

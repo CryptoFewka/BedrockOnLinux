@@ -1,0 +1,53 @@
+From: Justin Dubs <jtdubs@gmail.com>
+Subject: [PATCH] xgameruntime: support IXSystemImpl2-5 in QueryInterface and stub XSystemHandleTrack with S_OK
+
+Minecraft Bedrock 1.26.50+ links against Microsoft.Xbox.Services.GDK.C.Thunks.dll
+compiled with newer GDK headers (GDK 240600+), which queries XSystem for
+IXSystemImpl3 ({67ce4bfc-b1d1-4ac7-bc3a-cb9219a97a85}) and calls
+XSystemHandleTrack.
+
+Add the GUIDs for IXSystemImpl2 through IXSystemImpl5 to x_system_QueryInterface,
+and stub x_system_XSystemHandleTrack to return S_OK.
+---
+ dlls/xgameruntime/GDKComponent/System/XSystem.c | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/xgameruntime/GDKComponent/System/XSystem.c b/dlls/xgameruntime/GDKComponent/System/XSystem.c
+index 400868a8856..92e63ff7e9c 100644
+--- a/dlls/xgameruntime/GDKComponent/System/XSystem.c
++++ b/dlls/xgameruntime/GDKComponent/System/XSystem.c
+@@ -23,6 +23,11 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
+ 
++static const GUID IID_IXSystemImpl2 = {0x6fd71f09, 0x7513, 0x49f0, {0x89, 0xbc, 0xbf, 0xaf, 0x5d, 0xf6, 0xf8, 0x52}};
++static const GUID IID_IXSystemImpl3 = {0x67ce4bfc, 0xb1d1, 0x4ac7, {0xbc, 0x3a, 0xcb, 0x92, 0x19, 0xa9, 0x7a, 0x85}};
++static const GUID IID_IXSystemImpl4 = {0xdadc2895, 0x34b0, 0x4ef5, {0xa8, 0x3e, 0x45, 0x11, 0x4d, 0x62, 0x9b, 0x80}};
++static const GUID IID_IXSystemImpl5 = {0x1861cf2e, 0xe18b, 0x4834, {0xa9, 0xf5, 0xb4, 0xa4, 0xe6, 0xef, 0xb4, 0xcf}};
++
+ static inline struct x_system *impl_from_IXSystemImpl( IXSystemImpl *iface )
+ {
+     return CONTAINING_RECORD( iface, struct x_system, IXSystemImpl_iface );
+@@ -35,7 +40,11 @@ static HRESULT WINAPI x_system_QueryInterface( IXSystemImpl *iface, REFIID iid,
+     TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
+ 
+     if (IsEqualGUID( iid, &IID_IUnknown ) ||
+-        IsEqualGUID( iid, &IID_IXSystemImpl ))
++        IsEqualGUID( iid, &IID_IXSystemImpl ) ||
++        IsEqualGUID( iid, &IID_IXSystemImpl2 ) ||
++        IsEqualGUID( iid, &IID_IXSystemImpl3 ) ||
++        IsEqualGUID( iid, &IID_IXSystemImpl4 ) ||
++        IsEqualGUID( iid, &IID_IXSystemImpl5 ))
+     {
+         *out = &impl->IXSystemImpl_iface;
+         impl->IXSystemImpl_iface.lpVtbl->AddRef( *out );
+@@ -131,7 +140,7 @@ static HRESULT WINAPI x_system_XSystemGetAppSpecificDeviceId( IXSystemImpl *ifac
+ static HRESULT WINAPI x_system_XSystemHandleTrack( IXSystemImpl *iface )
+ {
+     FIXME( "iface %p stub!\n", iface );
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static BOOLEAN WINAPI x_system_XSystemIsHandleValid( IXSystemImpl *iface )
+-- 

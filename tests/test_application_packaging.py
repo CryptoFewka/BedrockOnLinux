@@ -3,12 +3,12 @@
 
 from __future__ import annotations
 
-import os
+import ast
+import re
 import unittest
 from pathlib import Path
-from unittest import mock
 
-from bol import deps, gui
+from bol import deps
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,8 +20,9 @@ class ApplicationPackagingPolicyTests(unittest.TestCase):
             encoding="utf-8")
         self.assertIn("BOL_APPIMAGE_BUILD_CACHE", script)
         self.assertNotIn('CACHE="$OUT/.cache"', script)
-        self.assertIn("--set-rpath '$ORIGIN'        \"$PYLIB/libtcl8.6.so\"",
-                      script)
+        # The Tcl/Tk graft is gone; the bundle is now the PySide6-Essentials
+        # wheel closure, dropped in by pip rather than compiled + rpath-fixed.
+        self.assertIn('rm -f "$DYN"/_tkinter.*.so', script)
         self.assertIn("usr/share/licenses/bedrock-on-linux/LICENSE", script)
         self.assertIn("cat > \"$APPDIR/AppRun\" <<'EOF'\n#!/bin/sh\n", script)
         self.assertIn('/bin/sh -n "$APPDIR/AppRun"', script)
@@ -36,10 +37,96 @@ class ApplicationPackagingPolicyTests(unittest.TestCase):
             encoding="utf-8")
         for requirement in (
                 "cryptography==43.0.3", "cffi==2.0.0", "pycparser==3.0",
-                "customtkinter==5.2.2", "darkdetect==0.8.0",
-                "packaging==26.2", "python-xlib==0.33"):
+                "shiboken6==6.9.3", "pyside6-essentials==6.9.3",
+                "python-xlib==0.33"):
             self.assertIn(requirement, reqs)
         self.assertIn("--hash=sha256:", reqs)
+
+    def test_appimage_tools_come_from_tagged_releases(self):
+        # appimagetool and type2-runtime rebuild their "continuous" release in
+        # place, which swaps the bytes under the pinned SHA-256 and stops the
+        # release build: the runtime's did on 2026-09-29, appimagetool's on
+        # 2026-10-05. Each tool has to come from a release that keeps its
+        # bytes, and through the hash-checked download.
+        script = (ROOT / "scripts/build-appimage.sh").read_text(
+            encoding="utf-8")
+        pinned = dict(re.findall(
+            r'download_verified \\\n\s+'
+            r'"https://github\.com/AppImage/([\w.-]+)/releases/download/'
+            r'([^/"]+)/[^"]+" \\\n\s+"\$\w+" \\\n\s+"[0-9a-f]{64}" \\\n',
+            script))
+        self.assertEqual(
+            pinned, {"appimagetool": "1.9.1", "type2-runtime": "20251108"})
+        self.assertNotIn("/releases/download/continuous/", script)
+
+    def test_appimage_bundle_verification_checks_pyside6_not_tk(self):
+        script = (ROOT / "scripts/build-appimage.sh").read_text(
+            encoding="utf-8")
+        self.assertIn("import shiboken6", script)
+        self.assertIn("from PySide6 import __version__ as pyside6_version",
+                      script)
+        self.assertIn("from PySide6.QtCore import QLibraryInfo", script)
+        self.assertIn(
+            'plugins_path = QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath)',
+            script)
+        self.assertIn('"shiboken6": "6.9.3"', script)
+        self.assertIn('"pyside6_essentials": "6.9.3"', script)
+        # A real QApplication construction, gated on DISPLAY like the Tk
+        # check it replaced, proves the xcb platform plugin actually loads.
+        self.assertIn("from PySide6.QtWidgets import QApplication", script)
+        self.assertIn('app = QApplication(["bedrock-on-linux-appimage-verify"])',
+                      script)
+        self.assertNotIn("customtkinter", script)
+        # tkinter itself is still mentioned, but only where the script drops
+        # the interpreter's bundled copy -- it is never installed or imported.
+        self.assertNotIn("import tkinter", script)
+
+    def test_appimage_advertises_zsync_delta_updates(self):
+        # Issue #191: AppImageUpdate, AppImageLauncher and AM read update
+        # information out of the runtime's .upd_info section and then transfer
+        # only the changed blocks through the .zsync sidecar, instead of
+        # ~200 MB of unchanged bundle.
+        script = (ROOT / "scripts/build-appimage.sh").read_text(
+            encoding="utf-8")
+        self.assertIn(
+            "gh-releases-zsync|${SELF_REPO%/*}|${SELF_REPO#*/}|${UPDATE_TAG}"
+            "|BedrockOnLinux-*-x86_64.AppImage.zsync", script)
+        # The repository is the one the launcher's own updater asks, so a fork
+        # points at its own releases rather than at this one.
+        self.assertIn("grep -m1 '^WINEGDK_PREBUILT_REPO = '", script)
+        # A nightly follows the rolling prerelease; anything else follows the
+        # newest stable release.
+        self.assertIn('nightly)    UPDATE_TAG="nightly" ;;', script)
+        self.assertIn('*)          UPDATE_TAG="latest" ;;', script)
+        # A versioned pre-release follows its own tag: "latest" is the
+        # previous stable release, which AppImageUpdate would install over it.
+        self.assertIn('prerelease) UPDATE_TAG="v$(grep -m1 \'^VERSION = \' '
+                      '"$SRC/bol/config.py" | cut -d\'"\' -f2)" ;;', script)
+        self.assertIn('UPDATE_ARGS=(-u "$UPDATE_INFO")', script)
+
+        # appimagetool names the sidecar after the destination but writes it
+        # into the working directory, so the build has to run from dist/ or the
+        # sidecar is left wherever the caller happened to be standing.
+        packaging = script.index('ZSYNC="$APPIMG.zsync"')
+        run = script.index('ARCH=x86_64 "$TOOL"', packaging)
+        self.assertIn('cd "$OUT"', script[packaging:run])
+        self.assertIn('"${APPIMG##*/}"', script[run:run + 200])
+
+        # appimagetool only warns when zsyncmake is missing, which would ship
+        # an AppImage advertising a delta file nobody can fetch.
+        self.assertIn(
+            "update information was embedded but no $ZSYNC was written",
+            script)
+        # What the updaters actually read is the runtime section, so that is
+        # what the build verifies, along with the sidecar describing these
+        # exact bytes and a timestamp pinned like every other one here.
+        for check in ('readelf", "--section-headers"',
+                      "no .upd_info section",
+                      "embedded update information is",
+                      "does not match the pattern the ",
+                      'for key in ("Filename", "URL"):',
+                      'rb"(?m)^MTime: .*$"'):
+            self.assertIn(check, script)
 
     def test_deb_preserves_dependency_licenses_and_normalizes_modes(self):
         script = (ROOT / "scripts/build-deb.sh").read_text(encoding="utf-8")
@@ -48,8 +135,8 @@ class ApplicationPackagingPolicyTests(unittest.TestCase):
         reqs = (ROOT / "third_party/requirements-deb.txt").read_text(
             encoding="utf-8")
         for requirement in (
-                "customtkinter==5.2.2", "darkdetect==0.8.0",
-                "packaging==26.2", "python-xlib==0.33"):
+                "shiboken6==6.9.3", "pyside6-essentials==6.9.3",
+                "python-xlib==0.33"):
             self.assertIn(requirement, reqs)
         self.assertIn("--hash=sha256:", reqs)
         self.assertNotIn('*.dist-info', script)
@@ -80,13 +167,14 @@ class ApplicationPackagingPolicyTests(unittest.TestCase):
         # Generated requires would be satisfied by nothing on the target
         # distributions, so the spec declares every dependency by hand.
         self.assertIn("AutoReqProv:    no", script)
-        for requirement in ("python3-tkinter", "python3-cryptography",
-                            "/usr/bin/xrandr", "(curl or wget)"):
+        for requirement in ("python3-cryptography",
+                            "/usr/bin/xrandr", "(curl or wget)",
+                            "libxcb", "libxkbcommon-x11", "fontconfig"):
             self.assertIn(requirement, script)
+        self.assertNotIn("python3-tkinter", script)
         deb = (ROOT / "scripts/build-deb.sh").read_text(encoding="utf-8")
-        for metadata in ("customtkinter-5.2.2.dist-info",
-                         "darkdetect-0.8.0.dist-info",
-                         "packaging-26.2.dist-info",
+        for metadata in ("shiboken6-6.9.3.dist-info",
+                         "pyside6_essentials-6.9.3.dist-info",
                          "python_xlib-0.33.dist-info",
                          "six-1.17.0.dist-info"):
             self.assertIn(metadata, deb)
@@ -116,21 +204,83 @@ class ApplicationPackagingPolicyTests(unittest.TestCase):
         self.assertEqual(
             deps.GUI_INSTALL_REQUIREMENTS,
             (
-                "customtkinter==5.2.2",
-                "darkdetect==0.8.0",
-                "packaging==26.2",
+                "PySide6-Essentials==" + deps.pyside6_line(),
                 "python-xlib==0.33",
-                "six==1.17.0",
             ),
         )
+        self.assertEqual(deps.pyside6_line((3, 12)), "6.9.3")
+
+    def test_every_module_bol_deps_installs_is_one_bol_imports(self):
+        # A missing GUI_DEPS module makes ensure_gui_deps() pip-install the
+        # whole pinned stack, so an entry nothing imports any more costs a
+        # pip run on hosts that lack it. `packaging` did from 2.2.2 to
+        # 2.2.8: CustomTkinter needed it, and nothing did after PySide6.
+        imported = set()
+        for source in (ROOT / "bol").rglob("*.py"):
+            tree = ast.parse(source.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imported.update(a.name.split(".")[0] for a in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                    imported.add(node.module.split(".")[0])
+        for module in {**deps.GUI_DEPS, **deps.LOGIN_DEPS}:
+            with self.subTest(module=module):
+                self.assertIn(module, imported,
+                              f"nothing under bol/ imports {module}")
 
     def test_flatpak_installs_project_license(self):
         manifest = (ROOT / "flatpak/io.github.wyze3306.BedrockOnLinux.yml").read_text(
             encoding="utf-8")
+        # Flathub wants every module's licence under share/licenses/$FLATPAK_ID.
         self.assertIn(
-            "install -Dm644 LICENSE /app/share/licenses/bedrock-on-linux/LICENSE",
+            "install -Dm644 LICENSE /app/share/licenses/"
+            "io.github.wyze3306.BedrockOnLinux/bedrock-on-linux/LICENSE",
             manifest,
         )
+
+    def test_flatpak_installs_pyside6_with_its_own_python(self):
+        manifest = (
+            ROOT / "flatpak/io.github.wyze3306.BedrockOnLinux.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("name: python3-dependencies", manifest)
+        self.assertIn("--no-index --find-links=", manifest)
+        for wheel in (
+                "shiboken6-6.9.3-cp39-abi3-manylinux_2_28_x86_64.whl",
+                "pyside6_essentials-6.9.3-cp39-abi3-manylinux_2_28_x86_64.whl",
+                "python_xlib-0.33-py2.py3-none-any.whl",
+                "six-1.17.0-py2.py3-none-any.whl"):
+            self.assertIn(wheel, manifest)
+        # PySide6 6.9 refuses the runtime's Python 3.14, so the app keeps its
+        # own 3.12 and installs the wheels with that interpreter's pip.
+        self.assertIn("/Python-3.12.", manifest)
+        self.assertIn("/app/bin/python3 -m pip install", manifest)
+        self.assertIn("/lib/python3.12/tkinter", manifest)  # still cleaned up
+        self.assertNotIn("name: tcl", manifest)
+        self.assertNotIn("name: tk", manifest)
+        self.assertNotIn("customtkinter", manifest)
+
+    def test_flatpak_game_container_uses_the_portal_not_the_flatpak_service(self):
+        manifest = (
+            ROOT / "flatpak/io.github.wyze3306.BedrockOnLinux.yml"
+        ).read_text(encoding="utf-8")
+        # pressure-vessel asks org.freedesktop.portal.Flatpak for its
+        # sub-sandbox; the Flatpak service itself is a sandbox escape (#157).
+        finish_args = re.findall(r"^  - (--\S+)$", manifest, re.MULTILINE)
+        self.assertIn("--allow=per-app-dev-shm", finish_args)
+        self.assertFalse([arg for arg in finish_args
+                          if arg.startswith("--talk-name=org.freedesktop.Flatpak")])
+        self.assertIn("runtime-version: '51'", manifest)
+
+    def test_release_flatpak_build_can_strip_like_flathub(self):
+        manifest = (
+            ROOT / "flatpak/io.github.wyze3306.BedrockOnLinux.yml"
+        ).read_text(encoding="utf-8")
+        workflow = (ROOT / ".github/workflows/build-app.yml").read_text(
+            encoding="utf-8")
+        # The published manifest strips and splits debug info as Flathub
+        # does; the host flatpak-builder runs eu-strip and debugedit for that.
+        self.assertNotIn("strip: false", manifest)
+        self.assertIn(" flatpak flatpak-builder elfutils debugedit\n", workflow)
 
     def test_flatpak_keeps_game_controller_device_access(self):
         manifest = (
@@ -176,12 +326,23 @@ class ApplicationPackagingPolicyTests(unittest.TestCase):
                 "data/bedrock-on-linux.desktop",
                 "flatpak/io.github.wyze3306.BedrockOnLinux.desktop"):
             entry = (ROOT / relative).read_text(encoding="utf-8")
-            self.assertIn("Actions=Play;\n", entry)
+            self.assertIn("Actions=Play;Editor;\n", entry)
             self.assertIn("[Desktop Action Play]\n", entry)
             self.assertIn("Exec=bedrock-on-linux play\n", entry)
             # The action group must follow the main group it belongs to.
             self.assertLess(entry.index("[Desktop Entry]"),
                             entry.index("[Desktop Action Play]"))
+
+    def test_desktop_entries_offer_bedrock_editor(self):
+        # Bedrock Editor is the same game asked for its Editor (#286).
+        for relative in (
+                "data/bedrock-on-linux.desktop",
+                "flatpak/io.github.wyze3306.BedrockOnLinux.desktop"):
+            entry = (ROOT / relative).read_text(encoding="utf-8")
+            self.assertIn("[Desktop Action Editor]\n", entry)
+            self.assertIn("Exec=bedrock-on-linux play --editor\n", entry)
+            self.assertLess(entry.index("[Desktop Action Play]"),
+                            entry.index("[Desktop Action Editor]"))
 
     def test_packagers_rewrite_the_launcher_exec_without_the_play_action(self):
         # Both scripts rewrote every Exec= line, which would have redirected
@@ -196,16 +357,209 @@ class ApplicationPackagingPolicyTests(unittest.TestCase):
             "sed '0,/^Exec=/s|^Exec=.*|Exec=bedrock-on-linux gui|'", appimage)
 
 
-class GuiStartupPolicyTests(unittest.TestCase):
-    def test_pure_wayland_double_click_reports_xwayland_requirement(self):
-        with mock.patch.dict(
-                os.environ, {"WAYLAND_DISPLAY": "wayland-0"}, clear=True), \
-                mock.patch.object(
-                    gui, "_owned_x11_socket_displays", return_value=()), \
-                mock.patch.object(gui, "_desktop_error") as error:
-            gui.gui()
-        error.assert_called_once()
-        self.assertIn("XWayland", error.call_args.args[0])
+# Every hard DT_NEEDED of the bundled Qt xcb platform plugin that the host has
+# to provide, mapped to the name each packaging format declares it under.
+# Regenerate against the pinned PySide6 wheel with:
+#   readelf -d --wide .../PySide6/Qt/plugins/platforms/libqxcb.so | grep NEEDED
+# libEGL is not in that list: it comes from libQt6Gui. zlib1g/libzstd1 are
+# left out on purpose -- zlib is priority:required and libzstd1 arrives with
+# the zstd dependency the launcher already declares for game downloads.
+QT_HOST_LIBRARIES = {
+    # soname:                  (Debian package,        RPM soname requires)
+    "libX11.so.6":             ("libx11-6",            "libX11.so.6"),
+    "libX11-xcb.so.1":         ("libx11-xcb1",         "libX11-xcb.so.1"),
+    "libxkbcommon.so.0":       ("libxkbcommon0",       "libxkbcommon.so.0"),
+    "libxkbcommon-x11.so.0":   ("libxkbcommon-x11-0",  "libxkbcommon-x11.so.0"),
+    "libxcb.so.1":             ("libxcb1",             "libxcb.so.1"),
+    "libxcb-cursor.so.0":      ("libxcb-cursor0",      "libxcb-cursor.so.0"),
+    "libxcb-icccm.so.4":       ("libxcb-icccm4",       "libxcb-icccm.so.4"),
+    "libxcb-image.so.0":       ("libxcb-image0",       "libxcb-image.so.0"),
+    "libxcb-keysyms.so.1":     ("libxcb-keysyms1",     "libxcb-keysyms.so.1"),
+    "libxcb-randr.so.0":       ("libxcb-randr0",       "libxcb-randr.so.0"),
+    "libxcb-render.so.0":      ("libxcb-render0",      "libxcb-render.so.0"),
+    "libxcb-render-util.so.0": ("libxcb-render-util0", "libxcb-render-util.so.0"),
+    "libxcb-shape.so.0":       ("libxcb-shape0",       "libxcb-shape.so.0"),
+    "libxcb-shm.so.0":         ("libxcb-shm0",         "libxcb-shm.so.0"),
+    "libxcb-sync.so.1":        ("libxcb-sync1",        "libxcb-sync.so.1"),
+    "libxcb-util.so.1":        ("libxcb-util1",        "libxcb-util.so.1"),
+    "libxcb-xfixes.so.0":      ("libxcb-xfixes0",      "libxcb-xfixes.so.0"),
+    "libxcb-xkb.so.1":         ("libxcb-xkb1",         "libxcb-xkb.so.1"),
+    "libGL.so.1":              ("libgl1",              "libGL.so.1"),
+    "libEGL.so.1":             ("libegl1",             "libEGL.so.1"),
+}
+
+# What the AppImage carries of Qt's host libraries itself, from the pinned
+# Debian 11 snapshot: soname -> (pool file, file inside the package, SHA-256
+# of the package as Debian's own signed Packages index gives it).
+APPIMAGE_BUNDLED_LIBRARIES = {
+    "libxcb-util.so.1": (
+        "libxcb-util1_0.4.0-1+b1_amd64.deb", "libxcb-util.so.1.0.0",
+        "4c48af51fb2ac1be0490067e7450aeda27bf6c6c395165de02199eee4835336f"),
+    "libxcb-cursor.so.0": (
+        "libxcb-cursor0_0.1.1-4_amd64.deb", "libxcb-cursor.so.0.0.0",
+        "bab731cd0143303f77461dd0a03ad20807bd3d767d5d6af6a11ff99c3b7aeac3"),
+    "libxcb-image.so.0": (
+        "libxcb-image0_0.4.0-1+b3_amd64.deb", "libxcb-image.so.0.0.0",
+        "36a381bb18c9f349a53457c66b3d1825631f3e50c4f6c12326cf05257302172d"),
+    "libxcb-keysyms.so.1": (
+        "libxcb-keysyms1_0.4.0-1+b2_amd64.deb", "libxcb-keysyms.so.1.0.0",
+        "aed1436db9a3e63b10d00c4ed16248b5c82b5dd2963a83a761f406af65eb4b49"),
+    "libxcb-render-util.so.0": (
+        "libxcb-render-util0_0.3.9-1+b1_amd64.deb",
+        "libxcb-render-util.so.0.0.0",
+        "be4b38a63e65c84e2f1322f044d05a9baa677e0f3dc68b742a0a109a3ff40ae9"),
+    "libxcb-icccm.so.4": (
+        "libxcb-icccm4_0.4.1-1.1_amd64.deb", "libxcb-icccm.so.4.0.0",
+        "f323194cb04cd4e5ae064fafec39db6dcf8a431cbd65a0bc53fa6c359862d8ff"),
+    "libxcb-shape.so.0": (
+        "libxcb-shape0_1.14-3_amd64.deb", "libxcb-shape.so.0.0.0",
+        "d0f942240fc5c1b11514c726a1cba1bad80506a15c837ce2a9f11c9b313c4851"),
+    # Not an xcb plugin dependency: libQt6Core's.
+    "libgthread-2.0.so.0": (
+        "libglib2.0-0_2.66.8-1+deb11u4_amd64.deb",
+        "libgthread-2.0.so.0.6600.8",
+        "7aff8c1338b58a6fa2b3a914724040a2b7f6e8dc2333f30c98834f7948f1884f"),
+}
+
+
+class QtRuntimeDependencyTests(unittest.TestCase):
+    """Qt aborts the process natively when its platform plugin cannot load --
+    "could not load the Qt platform plugin xcb", raised by the C++ side before
+    control ever returns to Python. bol.gui's own _desktop_error() therefore
+    never runs, and the user is left with a launcher that exits silently. The
+    only defence is declaring the libraries up front, so these are pinned."""
+
+    def _declared_deb(self):
+        script = (ROOT / "scripts/build-deb.sh").read_text(encoding="utf-8")
+        start = script.index("Depends:")
+        end = script.index("Recommends:", start)
+        return script[start:end]
+
+    def _declared_rpm(self):
+        return (ROOT / "scripts/build-rpm.sh").read_text(encoding="utf-8")
+
+    def test_the_deb_declares_every_library_the_xcb_plugin_loads(self):
+        declared = self._declared_deb()
+        missing = sorted(
+            package for _soname, (package, _rpm) in QT_HOST_LIBRARIES.items()
+            if package not in declared)
+        self.assertEqual(
+            missing, [],
+            "build-deb.sh does not declare these, so the launcher aborts "
+            f"before it can report anything: {missing}")
+
+    def test_the_rpm_requires_nothing_by_a_single_distributions_name(self):
+        # "webkit2gtk4.1" is Fedora's name: openSUSE calls the same library
+        # libwebkit2gtk-4_1-0, and zypper refused the whole package ("nothing
+        # provides 'webkit2gtk4.1'"). A soname, a file path, or a name every
+        # RPM distribution shares is what a Requires may say.
+        shared = {"python3", "python3-cryptography", "tar", "zstd",
+                  "xdg-utils", "ca-certificates"}
+        for line in self._declared_rpm().splitlines():
+            if not line.startswith("Requires:"):
+                continue
+            wanted = line.split(":", 1)[1].strip()
+            with self.subTest(requires=wanted):
+                self.assertTrue(
+                    wanted.endswith("()(64bit)") or wanted.startswith("/")
+                    or wanted.startswith("(")
+                    or wanted.split()[0] in shared, wanted)
+        self.assertIn("Requires:       libwebkit2gtk-4.1.so.0()(64bit)",
+                      self._declared_rpm())
+
+    def test_the_rpm_declares_every_library_the_xcb_plugin_loads(self):
+        script = self._declared_rpm()
+        missing = sorted(
+            soname for _s, (_deb, soname) in QT_HOST_LIBRARIES.items()
+            if f"Requires:       {soname}()(64bit)" not in script)
+        self.assertEqual(
+            missing, [],
+            f"build-rpm.sh does not declare these sonames: {missing}")
+
+    def test_the_appimage_documents_that_these_stay_host_dependencies(self):
+        # An AppImage cannot declare dependencies, so the one thing it can do
+        # is say so where a packager will read it.
+        script = (ROOT / "scripts/build-appimage.sh").read_text(
+            encoding="utf-8")
+        self.assertIn("could not load the Qt platform plugin xcb", script)
+        self.assertIn("QT_HOST_LIBRARIES", script)
+
+
+class AppImageBundledLibraryTests(unittest.TestCase):
+    """What the AppImage carries itself, and what it still asks the host for.
+
+    Not every library Qt links is a host GUI library. libQt6Core links
+    libzstd.so.1, which is plain compression, absent from the AppImage
+    excludelist, and absent from NixOS' appimage-run environment: the launcher
+    died on `import PySide6.QtCore` with "libzstd.so.1: cannot open shared
+    object file" before it could report anything at all (issue #205)."""
+
+    def _script(self):
+        return (ROOT / "scripts/build-appimage.sh").read_text(encoding="utf-8")
+
+    def _declared_host_libraries(self):
+        block = re.search(r"host_libraries = \{(.*?)\n\}", self._script(),
+                          re.DOTALL)
+        self.assertIsNotNone(
+            block, "the AppImage host dependency audit lost its library list")
+        return set(re.findall(r'"([^"]+)"', block.group(1)))
+
+    def test_the_appimage_bundles_the_zstd_runtime_qt_core_links(self):
+        script = self._script()
+        # Pinned bytes, from the same Debian 11 snapshot the containerised
+        # builds use: identical on every build host, and old enough for the
+        # glibc baseline the audit enforces.
+        self.assertIn("snapshot.debian.org/archive/debian/20260701T000000Z",
+                      script)
+        self.assertIn("libzstd1_1.4.8+dfsg-2.1_amd64.deb", script)
+        self.assertIn(
+            "5dcadfbb743bfa1c1c773bff91c018f835e8e8c821d423d3836f3ab84773507b",
+            script)
+        # Beside the wheel's own Qt libraries, where libQt6Core's $ORIGIN
+        # RUNPATH finds it, with the package's licence kept alongside ours.
+        self.assertIn('"$QT_LIB/$soname"', script)
+        self.assertIn('"libzstd.so.1.4.8" "libzstd.so.1"', script)
+        self.assertIn('${package%%_*}.copyright', script)
+        self.assertNotIn("libzstd.so.1", self._declared_host_libraries())
+
+    def test_the_appimage_bundles_what_stock_desktops_lack(self):
+        # Stock Ubuntu 22.04/24.04 desktops, and Mint with them, install no
+        # libxcb-cursor0: Qt then refuses its xcb plugin and aborts the
+        # launcher on every X11 session, before Python can say anything. A
+        # stock openSUSE Tumbleweed has neither libgthread-2_0-0, without
+        # which PySide6.QtCore does not even import, nor libxcb-shape0.
+        script = self._script()
+        rpm = (ROOT / "scripts/build-rpm.sh").read_text(encoding="utf-8")
+        for soname, (package, member, sha256) in \
+                APPIMAGE_BUNDLED_LIBRARIES.items():
+            self.assertIn(f"/{package}", script, soname)
+            self.assertIn(sha256, script, soname)
+            self.assertIn(f'"{member}" "{soname}"', script, soname)
+            self.assertNotIn(soname, self._declared_host_libraries())
+            # The .rpm keeps declaring them: its PySide6 is the same wheel,
+            # without the bundled copies.
+            self.assertIn(f"Requires:       {soname}()(64bit)", rpm, soname)
+
+    def test_the_appimage_audit_and_the_packages_name_the_same_host_stack(self):
+        declared = self._declared_host_libraries()
+        missing = sorted(soname for soname in QT_HOST_LIBRARIES
+                         if soname not in declared
+                         and soname not in APPIMAGE_BUNDLED_LIBRARIES)
+        self.assertEqual(
+            missing, [],
+            "the AppImage audit would accept these silently even though the "
+            f".deb and .rpm treat them as host libraries: {missing}")
+
+    def test_the_appimage_audits_the_launcher_qt_import_path(self):
+        # The audit walks what bol.gui imports and what Qt loads behind it, so
+        # a PySide6 bump that adds a host library fails the build instead of a
+        # user's first launch.
+        script = self._script()
+        for dependant in ("PySide6/QtCore.abi3.so", "PySide6/QtGui.abi3.so",
+                          "PySide6/QtWidgets.abi3.so",
+                          "PySide6/Qt/plugins/platforms/libqxcb.so"):
+            self.assertIn(dependant, script)
+        self.assertIn("bundled here nor declared host dependencies", script)
 
 
 if __name__ == "__main__":

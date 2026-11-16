@@ -19,6 +19,8 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
+from . import presence
+
 
 NETWORK_ENDPOINTS = (
     ("Xbox Live", "user.auth.xboxlive.com", 443),
@@ -346,17 +348,63 @@ def _route_check(host_ip, runner, timeout):
     )
 
 
+def _social_checks(snapshot):
+    """Turn a social snapshot into the three lines a "can't join" report needs.
+
+    "I can't join my friend's world" (#243, #244) has three separate answers
+    and no way to tell them apart from the outside: the account is invisible,
+    the social graph does not load, or the friend is simply not in a session
+    anyone could join.  Reachability alone answers none of them -- the hosts
+    resolve and handshake perfectly while all three are true.
+
+    None of these fail the report.  An account nobody can see is a real
+    problem, but it is not a broken host, and a quiet evening with no friend
+    in a world is not a fault at all.
+    """
+
+    if snapshot.error:
+        return [NetworkCheck("xbox social", "peoplehub", None,
+                             "Not measured: " + snapshot.error + ".")]
+    checks = []
+    if snapshot.state is None:
+        checks.append(NetworkCheck(
+            "xbox presence", "userpresence", None,
+            "Xbox Live did not say whether this account looks online."))
+    else:
+        online = snapshot.state == "Online"
+        checks.append(NetworkCheck(
+            "xbox presence", "userpresence", None,
+            "Xbox Live sees this account as %s.%s"
+            % (snapshot.state,
+               "" if online else
+               " Friends see the same, so nobody can join or invite it. "
+               "Expected while Minecraft is not running; reported during a "
+               "game, it is the fault.")))
+    checks.append(NetworkCheck(
+        "xbox friends", "peoplehub", True,
+        "%d friends readable." % snapshot.friends))
+    checks.append(NetworkCheck(
+        "xbox sessions", "peoplehub", None,
+        "%d of %d friends are in a Minecraft world Xbox Live lists as "
+        "joinable right now. A friend who is not in one has no world to "
+        "join, whatever the game shows."
+        % (snapshot.in_session, snapshot.friends)))
+    return checks
+
+
 def diagnose_network(host_ip=None, *, endpoints=NETWORK_ENDPOINTS,
-                     timeout=3.0, resolver=None, tls_probe=None, runner=None):
+                     timeout=3.0, resolver=None, tls_probe=None, runner=None,
+                     social=None):
     """Return ``(ok, results)`` for read-only network diagnostics.
 
     Endpoint DNS resolution and certificate-verified TLS handshakes run in
     parallel.  ``host_ip`` is optional; when present, it must be a literal IP
     and is passed to ``ip route get`` only after validation.  ``resolver``,
-    ``tls_probe`` and ``runner`` are injectable to keep tests offline.
-    Unavailable RTC/NTP information and VPN-interface observations use
-    ``ok=None``.  A positively reported unsynchronized clock is actionable and
-    fails the report because it can invalidate Xbox/TLS authentication.
+    ``tls_probe``, ``runner`` and ``social`` are injectable to keep tests
+    offline.  Unavailable RTC/NTP information, VPN-interface observations and
+    the Xbox social lines use ``ok=None``.  A positively reported
+    unsynchronized clock is actionable and fails the report because it can
+    invalidate Xbox/TLS authentication.
     """
 
     resolver = resolver or _resolved_addresses
@@ -411,5 +459,15 @@ def diagnose_network(host_ip=None, *, endpoints=NETWORK_ENDPOINTS,
     checks.append(_virtual_interface_check(runner, timeout))
     if host_ip is not None:
         checks.append(_route_check(host_ip, runner, timeout))
+    # Asked last: it is the only check that spends a signed-in round-trip,
+    # and it is worth nothing if the hosts above are unreachable anyway.
+    try:
+        snapshot = (social or presence.social_snapshot)()
+    except Exception as exc:  # never let a diagnostic be the thing that fails
+        checks.append(NetworkCheck(
+            "xbox social", "peoplehub", None,
+            "Not measured (%s)." % type(exc).__name__))
+    else:
+        checks.extend(_social_checks(snapshot))
 
     return all(check.ok is not False for check in checks), checks

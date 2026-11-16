@@ -6,7 +6,7 @@ from pathlib import Path
 
 APP = "bedrock-on-linux"
 PRETTY = "BedrockOnLinux"
-VERSION = "2.1.4"
+VERSION = "3.0.0"
 # Published Flatpak identity; used to print a runnable command for that layout.
 FLATPAK_APP_ID = "io.github.wyze3306.BedrockOnLinux"
 
@@ -68,8 +68,9 @@ UMU_ARCHIVE_SHA256 = \
     "3f8fdc033f547afdb3408ea48ad07194769405148dcfa2b2f945b7fb368a33bb"
 UMU_RUN_SHA256 = \
     "577181dbff2eccdaa78b411c0fd1aa7fde574028449c3e0e99f508536a76870e"
-GAME_ARCHIVE_REPO = "bubbles-wow/mcbe-gdk-unpack-archive"
 MINGW_CURL = "https://mirror.msys2.org/mingw/mingw64/mingw-w64-x86_64-curl-8.17.0-1-any.pkg.tar.zst"
+# Its libcurl-4.dll becomes the game's XCurl.dll on the GE-Proton path.
+MINGW_CURL_SHA256 = "928d63a65f2b47c313b2b8b5f34fe5bb5be2f388a00c1d32088d1b05cdb9c564"
 CACERT_URL = "https://curl.se/ca/cacert.pem"
 
 # WineGDK reads the refresh token from this registry key and requires its
@@ -84,6 +85,13 @@ WINEGDK_REG = r"Software\Wine\WineGDK"
 WINEGDK_SOURCE_COMMIT = "75637b674e1f191e65753663c4c0c32bea05ba6e"
 GDK_DEPS_URL = "https://github.com/minecraft-linux/mcpelauncher-gdk-dependencies/releases/download/v0.0.0"
 GDK_DEPS_DLLS = ("libHttpClient.GDK.dll", "XCurl.dll")
+# A third party's release under a tag that can be uploaded to again, and the
+# DLLs run inside the game: only the reviewed bytes are installed. These are
+# the ones every install since June 2026 has used (assets dated 2026-05-03).
+GDK_DEPS_SHA256 = {
+    "libHttpClient.GDK.dll": "718f0c6842c8e35d7cac5c18ec025404c83be03ec035f0d3904e70d6508b9e24",
+    "XCurl.dll": "28443194e9860733f24294219bcb45226677636f9721d4bf145094d977f7161f",
+}
 # This OpenSSL XCurl payload avoids Wine secur32 failures against Azure and is
 # built reproducibly by scripts/build-openssl-xcurl.sh.
 OPENSSL_XCURL_SET = DATA / "xodus-xcurl" / "openssl-set"
@@ -97,16 +105,231 @@ WINEGDK_OUT = PROTON_DIR / "GDK-Proton-xuser"
 # exact bytes pinned here, so the pins match upstream's while the source differs.
 WINEGDK_PREBUILT_REPO = "CryptoFewka/BedrockOnLinux"
 # The commit alone does not identify vendored follow-up patches.
-WINEGDK_SOURCE_MANIFEST_SHA256 = "642486a98b1985395e0a704bca76fbfa2124ee1de97d1d8c671213790b9bbd29"
-WINEGDK_BUILD_REV = "wow64-archs-native15"
-WINEGDK_ARCHIVE_SHA256 = "a75d697a61d79ffd39005e198fe9d10d401562bfc4d27cbdb9ca8bfbf67ec4ca"
+WINEGDK_SOURCE_MANIFEST_SHA256 = "e57757381892620d207d5228a098e4fabfc813851801067648c3c6651a6834ba"
+# How the WineGDK prefix is built from that source, when not the way it first
+# was: it is part of what the bytes are, so it is part of the name of the
+# release that holds them (scripts/winegdk-release-tag.sh). "stripped"
+# installs Wine's modules without their debugging sections.
+WINEGDK_PREFIX_RECIPE = "stripped"
+WINEGDK_BUILD_REV = "wow64-archs-native27"
+# native22 carries the ntdll loader patches the Microsoft Store packages need:
+# 0007 maps the main image from a descriptor, 0008 from a path so it survives
+# the Steam Linux Runtime container. Their game executable stays encrypted on
+# disk, so an engine without them cannot start the game -- which is why an
+# unset pin here makes _verify_engine_archive() refuse every candidate rather
+# than fall back. Produced by the reviewed build-engine.yml run of this branch,
+# which refuses any archive that does not reproduce these bytes.
+#
+# It also carries the first Wayland driver of our own build (issue #180).
+# native16 was published twice: once before that fix and once after, under the
+# same release tag and the same file name, which replaced the bytes 2.2.2 was
+# pinned against and left every fresh install of it rejecting the engine. A
+# revision is a name for one set of bytes -- rebuild under a new one rather
+# than overwrite a published archive.
+#
+# native18 adds the XSystem interface revisions of 0009: Minecraft 1.26.50
+# ships the Xbox Live services thunks built against a newer GDK, which asks
+# XSystem for an interface ID the engine refused, and friends and Realms never
+# came up for a signed-in player (#266).
+#
+# native19 adds the Windows.Storage.Pickers.FileSavePicker of 0010, which every
+# export Minecraft offers asks for -- a structure, a world, the album -- and
+# which no engine had, so each of them stayed on its loading screen (#167).
+#
+# native20 binds the Wayland seat at the version its pointer listener
+# handles (0011). Built against Bullseye's libwayland, the listener has no
+# slot for the wheel event version 8 sends, and under the Wayland driver the
+# first turn of the mouse wheel aborted the game (#296).
+#
+# native21 lets a title built against a newer Gaming Services run (0012).
+# Minecraft Preview 1.26.70 asks for 7849, the runtime reports 6247, and the
+# version check refused it, so it quit before its window opened -- on some
+# launches only, because the switch that skips the check was read through
+# uninitialised variables (#274).
+#
+# native22 makes GetProcessMemoryInfo report PrivateUsage (0013). Wine left
+# the field unwritten, Minecraft read stack leftovers as its own memory use,
+# and when that looked huge it gave players added to the world a default
+# skin instead of theirs (#292).
+#
+# native23 shortens vkd3d-proton's frame-limiter busy-wait under Wine
+# (#202), falls back to fsync on kernels without ntsync (0014), takes two
+# per-frame Wine calls off Minecraft's main thread (0015, 0016) and serves
+# the XGameEvent class achievements are graded from (0017, #152).
+#
+# native24 is native23 without what it never ran: Wine's modules are
+# installed stripped of their debugging sections, and Wine Mono and the
+# import libraries are left out. The code is the same; the engine is not
+# 2.5 GB on disk any more, nor its archive 863 MB.
+#
+# native25 adds the ECMA-402 Intl object to jscript (0018): Minecraft
+# Education signs in through the IE WebBrowser control, and the Microsoft
+# account page it opens stayed an empty card without it (#351).
+#
+# native26 makes jscript call a method on the first use of an mshtml object
+# instead of returning it (0019): the Office sign-in page Education opens
+# first drew no form, because Knockout's first createElement got a function.
+#
+# native27 lets ieframe's WebBrowser control give OneAuth its window through
+# SID_SShellBrowser (0020): Education's sign-in stopped on "Something went
+# wrong [9zj22]" right after the e-mail address.
+WINEGDK_ARCHIVE_SHA256 = "e8db800b19eacdda97538bd969f5ac07d5859139b2b4aea0e755891f7a469935"
 # Build workflows verify this deterministic intermediate before reusing it.
-WINEGDK_PREFIX_SHA256 = "c5760c6275d32fc3c9a1dc31194fe14fb6966a81a51b2461e81970cd74331c81"
+WINEGDK_PREFIX_SHA256 = "a052116ecbb041c219fb30b201a0eead9d1a667e9fb5ef17fb5dacd09b59f000"
 
 # Decoupled from the engine repo: the launcher checks upstream for its own
 # update notifications so this follow-upstream fork still learns about new
 # upstream releases, while the engine above comes from our own CI build.
 SELF_REPO = "Wyze3306/BedrockOnLinux"
+
+# Where the launcher points people who ask where it came from -- the two
+# links Discord shows under a play session, and the ones printed elsewhere.
+SITE_URL = "https://wyze3306.github.io/BedrockOnLinux/"
+DISCORD_INVITE = "https://discord.gg/5YJq54Yhbu"
+
+# Discord Rich Presence. Discord names the *application* in "Playing ...", so
+# the application registered on discord.com/developers must be called exactly
+# like this launcher; the id below is the one it hands out. Empty means the
+# feature is off everywhere, which is what a fork with no application of its
+# own wants -- it must never advertise ours. BOL_DISCORD_APP_ID overrides it.
+DISCORD_APP_ID = ""
+# Rich Presence artwork. Each of these is either an asset key uploaded to the
+# application (Rich Presence > Art Assets) or a full https:// URL, which
+# Discord fetches and proxies itself -- and the URL form is why the image
+# shows up at all here: an application can be configured and working while its
+# Art Assets are still empty, and a key with no artwork behind it silently
+# shows nothing. The default points at the icon this project already publishes
+# on its own site, so the logo works with no developer-portal step. Empty
+# means no image; the whole assets block is dropped when both are empty.
+DISCORD_LARGE_IMAGE = f"{SITE_URL}discord-large.png"
+DISCORD_SMALL_IMAGE = ""
+
+# Minecraft is acquired through Xodus (GPL-3.0), which signs in to the user's
+# own Microsoft account, obtains the title license and streams the MSIXVC
+# package from the official Xbox CDN. It replaced a third-party repository that
+# redistributed a DRM-stripped copy of the game. See third_party/xodus/README.md.
+XODUS_SOURCE_COMMIT = "64d39eb87a56c7d0d7e7fde0b233654ac5477b0f"
+# A patched binary is not the upstream commit's binary, so the rev names the
+# patches too: <commit12>-p<n>, for the n patch files in
+# third_party/xodus/patches. scripts/build-xodus-cli.sh derives it the same
+# way, so adding a patch there and forgetting this makes the build produce an
+# archive the workflow's assert cannot find -- which is the intended failure,
+# not a silent replacement of a published one.
+XODUS_REV = "64d39eb87a56-p14"
+# Integrity pin from the reviewed candidate build of the p14 archive.
+# https://github.com/Wyze3306/BedrockOnLinux/actions/runs/43299041916
+XODUS_ARCHIVE_SHA256 = "4a3cd8888924f419470172a15ca06911b476e68b60203c433cf7d1a3b77db8d2"
+XODUS_DIR = DATA / "xodus"
+XODUS_BIN = XODUS_DIR / "xodus-cli"
+# xodus-cli links wry/tao unconditionally, so libwebkit2gtk-4.1 has to be
+# loadable before main() runs -- not only for the sign-in window, but for the
+# download and for `xodus-cli run`, which starts every encrypted game. Hosts
+# that ship no WebKitGTK and cannot install one (SteamOS and other immutable
+# images, issue #184) get this runtime instead: the closure of that stack,
+# built by build-xodus.yml from the same pinned snapshot as xodus-cli.
+XODUS_WEBVIEW_DIR = DATA / "xodus-webview"
+XODUS_WEBVIEW_REV = "trixie-2"
+# The snapshot.debian.org timestamp the runtime's packages are taken from,
+# later than the one xodus-cli is compiled against (scripts/pin-apt-snapshot.sh)
+# because Debian updates WebKitGTK within a stable release. 2.54, which reached
+# trixie-security on 2026-10-02, is the first to draw a page with no EGL
+# display; 2.52 aborted and left the sign-in window blank (#273). One line:
+# build-xodus.yml reads it with grep + cut.
+XODUS_WEBVIEW_SNAPSHOT = "20261008T000000Z"
+# The first WebKitGTK that draws without an EGL display. An older one on the
+# host hands the sign-in over to the bundled runtime when EGL cannot give it a
+# display, instead of opening a window that stays blank.
+WEBKIT_DRAWS_WITHOUT_EGL = (2, 54)
+# Integrity pin for the CI-built runtime, produced by the reviewed
+# build-xodus.yml run of this branch. Empty means "never published", and the
+# launcher then reports the missing library instead of installing unverified
+# bytes -- publish .github/workflows/build-xodus.yml and pin the SHA-256 it
+# prints. One line, like every pin here: the build and CI checks read it with
+# grep + cut, and a continuation makes them compare the variable name.
+XODUS_WEBVIEW_SHA256 = "9685289ff178beaa74a6e8f1eea78e55c202176eadf25445d2e1670c8220064f"
+# The compiled-in directory WebKitGTK spawns its helper processes from. Modern
+# builds drop the WEBKIT_EXEC_PATH override (it is developer-mode only), so the
+# bundled library carries this literal and the launcher rewrites it in place.
+XODUS_WEBVIEW_EXEC_DIR = "/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1"
+# Xodus keeps its tokens in a file keyring (built with --features
+# key-chain-file) instead of a D-Bus secret service, which does not exist in a
+# Game Mode session or inside a Flatpak sandbox. It puts that file in $HOME,
+# which is why xodus-cli is given a home of its own here: inside the Flatpak
+# $HOME is a tmpfs thrown away with the sandbox, and a lost keyring is not
+# merely a sign-out -- the next command provisions a *new* Microsoft device,
+# and an account may hold ten before the Store refuses to license Minecraft at
+# all ("Device group is full", issue #198). Under DATA the tokens persist
+# wherever the rest of the launcher's state does, Flatpak included.
+XODUS_HOME = DATA / "xodus-home"
+XODUS_KEYRING = XODUS_HOME / ".xodus-keyring.ron"
+# Where sign-ins made before that directory existed left their tokens.
+LEGACY_XODUS_KEYRING = HOME / ".xodus-keyring.ron"
+
+# GetBasePackage only ever answers with the current build, but Microsoft's CDN
+# keeps the older ones reachable, and MinecraftBedrockArchiver/GdkLinks indexes
+# where they live. That index holds no game data: every URL points at
+# assets*.xboxlive.com, and Xodus still reads the package's own content id from
+# the downloaded header and asks Microsoft for that licence, so the account
+# still has to own Minecraft. It only restores the choice of build.
+GDK_LINKS_URL = ("https://raw.githubusercontent.com/"
+                 "MinecraftBedrockArchiver/GdkLinks/master/urls.json")
+# The CDN serves these over plain HTTP only. The payload is AES-XTS encrypted
+# and worthless without the licence, so this costs no confidentiality; the
+# content id below is checked against every indexed URL so a bad or tampered
+# index cannot point the downloader at a different product.
+#
+# Not every entry is Bedrock. "title" names the game an edition installs, and
+# everything the launcher does to Minecraft itself -- its HBUI anchors, its
+# options.txt, LeviLamina, the Editor, the server list, the world backups --
+# is for "bedrock" alone. "catalogue" says where builds come from: "index" is
+# the GdkLinks index above, which only knows Bedrock; "store" is whatever build
+# the Store serves today, installed by product id into one folder that each
+# update is a delta of. "exe" is None when the package's MicrosoftGame.config
+# is what names the executable, which is the only place that knows for sure.
+# An entry without these keys is a Bedrock one (bol.games.edition_title).
+MC_PRODUCTS = (
+    {"id": "release", "product": "9NBLGGH2JHXJ", "channel": "release",
+     "content_id": "7792d9ce-355a-493c-afbd-768f4a77c3b0",
+     "name": "Minecraft for Windows", "beta": False,
+     "title": "bedrock", "catalogue": "index", "short": "Stable",
+     "exe": "Minecraft.Windows.exe"},
+    {"id": "preview", "product": "9P5X4QVLC2XR", "channel": "preview",
+     "content_id": "98bd2335-9b01-4e4c-bd05-ccc01614078b",
+     "name": "Minecraft Preview for Windows", "beta": True,
+     "title": "bedrock", "catalogue": "index", "short": "Preview",
+     "exe": "Minecraft.Windows.exe"},
+    # Unreal Engine 4, Direct3D 11 through DXVK. A 5.9 GB package; the Store
+    # served 1.17.0.0 in November 2026.
+    {"id": "dungeons", "product": "9P8MK4NC0LJB", "channel": None,
+     "content_id": "911f6225-c9c8-4641-a6db-29d4ccafc666",
+     "package_family": "Microsoft.Lovika_8wekyb3d8bbwe",
+     "name": "Minecraft Dungeons", "beta": False,
+     "title": "dungeons", "catalogue": "store", "short": "Dungeons",
+     "exe": None},
+    # Bedrock's engine underneath, but its own game: none of Bedrock's
+    # fixups apply. A 12.5 GB package; the Store served 1.18.19068.0 in
+    # November 2026.
+    {"id": "legends", "product": "9N98Z825TNFW", "channel": None,
+     "content_id": "f8afac2c-44cd-4302-afc3-b6dc979e6656",
+     "package_family": "Microsoft.BadgerWin10_8wekyb3d8bbwe",
+     "name": "Minecraft Legends", "beta": False,
+     "title": "legends", "catalogue": "store", "short": "Legends",
+     "exe": None},
+    # Not an Xbox title: a free Store app that Windows Update serves as a
+    # plain AppxBundle, signed in to with a school or work account inside the
+    # game (issue #351, bol.wustore). Its own "title": none of Bedrock's
+    # fixups apply, and hiding Bedrock's sign-in button would take away the
+    # only way into it. "xbox_live": False keeps the Xbox Live account and
+    # its pre-auth away from it.
+    {"id": "education", "product": "9NBLGGH4R2R6", "channel": "education",
+     "source": "windows-update",
+     "family": "Microsoft.MinecraftEducationEdition_8wekyb3d8bbwe",
+     "wu_category": "df31e196-d4c7-4a25-8e23-2788c261f328",
+     "content_id": "ad6a119f-978a-62c1-5f10-c017dde2343a",
+     "name": "Minecraft Education", "beta": False, "xbox_live": False,
+     "title": "education", "catalogue": "windows-update",
+     "short": "Education", "exe": "Minecraft.Windows.exe"},
+)
 
 
 def _legacy_install_location_file() -> Path:

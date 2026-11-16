@@ -60,16 +60,317 @@
   <screenshots>
     <screenshot type="default">
       <caption>The launcher: pick a version, sign in, play</caption>
-      <image>https://raw.githubusercontent.com/Wyze3306/BedrockOnLinux/v1.0.9/screenshot.png</image>
+      <image>https://raw.githubusercontent.com/Wyze3306/BedrockOnLinux/v2.2.6/screenshot.png</image>
     </screenshot>
   </screenshots>
 
   <content_rating type="oars-1.1">
+    <content_attribute id="violence-fantasy">mild</content_attribute>
     <content_attribute id="social-chat">moderate</content_attribute>
     <content_attribute id="money-purchasing">mild</content_attribute>
   </content_rating>
 
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+    <control>gamepad</control>
+  </supports>
+
   <releases>
+    <release version="3.0.0" date="2026-11-12" type="development">
+      <description>
+        <p>A pre-release of the next major version.</p>
+        <ul>
+          <li>installs add-ons, maps and texture packs from MCPEDL and
+              CurseForge, and LeviLamina mods</li>
+          <li>has a new layout with a menu on the left</li>
+          <li>runs Minecraft on Debian 12, Ubuntu 22.04, Fedora 39 and Asahi
+              Linux</li>
+          <li>starts the game sooner and unlocks achievements</li>
+          <li>spends less CPU between frames and reacts sooner to the
+              mouse</li>
+        </ul>
+      </description>
+    </release>
+    <release version="2.3.1" date="2026-11-11">
+      <description>
+        <p>Other players keep their own skins on servers, and the Realms button
+           of the title screen works again.</p>
+        <ul>
+          <li>no longer replaces the skins of players who join after you with
+              default ones</li>
+          <li>opens the Realms page from the title screen instead of an
+              error</li>
+          <li>ends the session when Minecraft is closed, so PLAY works
+              again</li>
+          <li>can update Minecraft before a start from a shortcut</li>
+          <li>lists Linesia under Featured Servers</li>
+        </ul>
+      </description>
+    </release>
+    <release version="2.3.0" date="2026-11-08">
+      <description>
+        <p>Signing in works again on the current Minecraft, and Minecraft keeps
+           starting two months after the Microsoft Store sign-in.</p>
+        <ul>
+          <li>applies the in-game sign-in fixes to Minecraft 1.26.60 and later
+              again</li>
+          <li>renews the Microsoft Store sessions the game's licence is fetched
+              with, instead of failing after about two months</li>
+          <li>keeps the online-play sign-in when Microsoft rotates its token</li>
+          <li>no longer changes the graphics card when Settings is scrolled</li>
+          <li>reads Minecraft Preview's own settings</li>
+          <li>works on Python 3.15</li>
+        </ul>
+      </description>
+    </release>
+    <release version="2.2.10" date="2026-10-27">
+      <description>
+        <p>Minecraft starts and downloads again, Minecraft Preview 1.26.70
+           starts, and PLAY reaches the game sooner.</p>
+        <ul>
+          <li>starts and downloads Minecraft again after Microsoft changed its
+              sign-in token</li>
+          <li>starts Minecraft Preview 1.26.70 on the new engine</li>
+          <li>reaches the game about a second sooner, and names a missing
+              system locale that slows every start</li>
+          <li>says why when Microsoft refuses the game licence instead of
+              doing nothing</li>
+          <li>makes DualSense and DualShock 4 controllers work in the game</li>
+          <li>removes outdated server resource packs from the game's cache</li>
+        </ul>
+      </description>
+    </release>
+    <release version="2.2.9" date="2026-10-09">
+      <description>
+        <p>Worlds are backed up before another Minecraft version opens them,
+           the graphics card can be chosen, the .deb and .rpm update
+           themselves, and fullscreen starts, the Microsoft sign-in and new
+           installs are fixed.</p>
+        <ul>
+          <li>backs up your worlds before a different Minecraft version opens
+              them, restores any backup, and offers Preview a copy of them</li>
+          <li>lets you choose the graphics card Minecraft renders on</li>
+          <li>updates the .deb and .rpm packages by itself</li>
+          <li>adds a BetterRTX preset manager and opens Bedrock Editor</li>
+          <li>no longer stretches a fullscreen start, switches a game that came
+              up windowed, and clears the screen when the game is minimized</li>
+          <li>draws the Microsoft sign-in on systems whose EGL cannot open a
+              display or whose WebKitGTK has no TLS support</li>
+          <li>finds its online-login components on a new install again</li>
+          <li>checks third-party DLLs and its own updates against pinned
+              SHA-256 sums</li>
+          <li>explains a launch without a network connection, and what an ARM
+              computer needs to run x86-64 programs</li>
+        </ul>
+      </description>
+    </release>
+    <release version="2.2.8" date="2026-10-04">
+      <description>
+        <p>Exports work, the mouse wheel no longer closes the game under the
+           Wayland driver, and setups that blocked PLAY or the download now
+           explain themselves or recover on their own.</p>
+        <ul>
+          <li>exports structures, worlds and the album through a save picker
+              the engine now implements</li>
+          <li>keeps the mouse wheel from closing the game under the Wayland
+              driver</li>
+          <li>brings GameInput up to the version each Minecraft build ships,
+              for the camera and controllers</li>
+          <li>clears the safety record of a launch whose launcher was closed
+              with its terminal, Flatpak or container, instead of blocking
+              until a reboot, and no longer treats a recovered Intel GPU hang
+              as fatal</li>
+          <li>reports a stalled or disk-full download and retries it from the
+              other Microsoft mirror</li>
+          <li>explains the one-time password prompt of the first Store sign-in
+              and refuses to run through sudo</li>
+          <li>opens its window on Chromebooks and points at the legacy renderer
+              after a crash on a virtual GPU</li>
+          <li>holds Minecraft's own frame cap without spinning a CPU core,
+              keeps the game out of swap, and adds an experimental OptiScaler
+              integration</li>
+        </ul>
+      </description>
+    </release>
+    <release version="2.2.7" date="2026-09-17">
+      <description>
+        <p>Repair keeps your worlds, the Flatpak starts Minecraft on X11 desktops
+           and in Steam Deck Game Mode again, and several setups that stopped
+           the launcher or PLAY work again.</p>
+        <ul>
+          <li>keeps worlds and settings when the Wine prefix is repaired, as the
+              button always promised</li>
+          <li>lets the Flatpak start Minecraft on X11 sessions, Steam Deck Game
+              Mode included, instead of refusing PLAY as an unsafe graphics
+              session</li>
+          <li>stops breaking a Steam installed after BedrockOnLinux</li>
+          <li>opens again after its files were moved to another drive</li>
+          <li>starts the game when the launcher was opened from the Cinnamon
+              application menu</li>
+          <li>says when glibc is too old for the Minecraft downloader, and when
+              a DNS filter blocks the download servers</li>
+          <li>moves the Flatpak to the GNOME 51 runtime, with a narrower
+              sandbox</li>
+        </ul>
+      </description>
+    </release>
+    <release version="2.2.6" date="2026-09-16">
+      <description>
+        <p>Minecraft 1.26.50 and newer start again, and come up online: your
+           friends, Realms and featured servers are back.</p>
+        <ul>
+          <li>stops Minecraft 1.26.50 and newer crashing at 78–82 % on the
+              loading screen, and repairs an install an earlier version of the
+              launcher already broke</li>
+          <li>brings friends, Realms invitations and featured servers back on
+              1.26.50 and newer, with a new game engine the launcher downloads
+              on its own</li>
+          <li>keeps the in-game mouse working on machines with an AIO cooler, a
+              fan or RGB controller or a similar USB device</li>
+          <li>adds a refresh button to the version picker, to see a build
+              Mojang just released without waiting for the list to expire</li>
+          <li>reuses an Xbox Live sign-in that is still valid when you press
+              PLAY, instead of redoing it every time</li>
+          <li>clears out the downloads of older game engines, which could take
+              gigabytes and leave no room for the engine update</li>
+        </ul>
+      </description>
+    </release>
+    <release version="2.2.5" date="2026-08-31">
+      <description>
+        <p>Your Xbox friends can see you again while you play, the Microsoft
+           sign-in no longer hangs on "Please wait" or dies part-way through,
+           and the launcher stops downloading a version you never asked
+           for.</p>
+        <ul>
+          <li>publishes the play session on Xbox Live, so the social tab stops
+              saying you are offline and friends can invite you</li>
+          <li>keeps the sign-in window alive where the desktop runs
+              accessibility, and opens the second leg of the sign-in the way
+              Windows does, instead of on a page that never finishes</li>
+          <li>remembers which build you play, rather than reinstalling the
+              newest one behind your back</li>
+          <li>lists every Minecraft build you have downloaded, what it weighs
+              and removes the ones you are done with, in Settings ▸
+              Versions</li>
+          <li>fixes a download that failed on the downloader's own package
+              cache, and leaves a log behind when one does fail</li>
+          <li>warns at PLAY when nothing is signed in for online play, instead
+              of leaving Realms and servers quietly missing</li>
+        </ul>
+      </description>
+    </release>
+    <release version="2.2.4" date="2026-08-25">
+      <description>
+        <p>Fixes the Play screen telling you to sign in to an account that is
+           already linked, and a Minecraft download that ended on the licence
+           Microsoft issued for it.</p>
+        <ul>
+          <li>keeps the Servers and Realms tabs reachable, and takes away the
+              in-game sign-in button that could only ever fail — the account is
+              linked from the launcher</li>
+          <li>says so when a Minecraft update moves the interface past those
+              patches, instead of passing over them in silence</li>
+          <li>finishes a download whose licence Microsoft granted as a trial
+              rather than outright</li>
+          <li>stops a download failing on a race against its own package
+              cache, and counting past a hundred percent while it ran</li>
+        </ul>
+      </description>
+    </release>
+    <release version="2.2.3" date="2026-08-23">
+      <description>
+        <p>Fixes a first install that could not fetch the game engine, adds
+           controller navigation of the launcher window back, and shows the
+           play session on Discord.</p>
+        <ul>
+          <li>fetches the game engine again on a first install, which 2.2.0 to
+              2.2.2 refused after its archive was rebuilt at the same address</li>
+          <li>drives the launcher window with a controller again, rewritten for
+              the Qt window</li>
+          <li>shows what you are playing on Discord, and can be turned off</li>
+          <li>takes the version you highlighted in the picker, not the first
+              one in the list</li>
+        </ul>
+      </description>
+    </release>
+    <release version="2.2.2" date="2026-08-22">
+      <description>
+        <p>The launcher window is rebuilt on Qt, both Microsoft sign-ins now
+           share one menu, and Minecraft shows up in Steam Deck Game Mode
+           again.</p>
+        <ul>
+          <li>puts the sign-in that plays online and the one that downloads the
+              game in a single menu, top right, and says why there are two</li>
+          <li>offers the download sign-in when PLAY needs it, instead of
+              reporting a launch failure with nothing to act on</li>
+          <li>shows Minecraft in Steam Deck Game Mode, where the window was
+              rendering but never presented</li>
+          <li>keeps the Microsoft Store sign-in across restarts, which also
+              stops it filling the account's ten-device limit</li>
+          <li>switches between Stable and Preview without restarting first</li>
+          <li>ships a server you can join in the Servers tab</li>
+          <li>rebuilds the window on Qt: sharper text, correct DPI scaling and
+              native Wayland output. Controller navigation of the launcher is
+              gone for now and returns in a later release</li>
+        </ul>
+      </description>
+    </release>
+    <release version="2.2.1" date="2026-08-21">
+      <description>
+        <p>The launcher can be driven with a controller, the Microsoft sign-in
+           window opens on Wayland again, and a Store-downloaded Minecraft
+           starts inside the Flatpak.</p>
+        <ul>
+          <li>navigates the whole window with a controller: the d-pad or left
+              stick moves, A activates, B goes back, Start plays, so a Steam
+              Deck no longer needs a mouse to reach PLAY</li>
+          <li>opens the Microsoft sign-in window on Wayland desktops where it
+              used to die instantly, taking the game download with it</li>
+          <li>starts a Store-downloaded Minecraft from inside the Flatpak
+              sandbox, and installs and starts it again on SteamOS</li>
+          <li>can close the launcher when the game starts, from Settings</li>
+          <li>finishes a first run that used to fail with "wineboot timed out"
+              while the runtime it needs was still downloading</li>
+          <li>retries a Minecraft download that failed, instead of leaving a
+              cache no later attempt could get past</li>
+          <li>reports in doctor what ray tracing the graphics stack granted the
+              game on its last launch</li>
+          <li>says plainly that the achievements list loads but new
+              achievements do not unlock yet</li>
+        </ul>
+      </description>
+    </release>
+    <release version="2.2.0" date="2026-08-19">
+      <description>
+        <p>Minecraft is now downloaded from the Microsoft Store with your own
+           account, and the launcher opens again in every session.</p>
+        <ul>
+          <li>downloads the game from the Microsoft Store with the account you
+              link, using the licence that account holds, instead of a
+              repackaged copy from a third-party repository: you must own
+              Minecraft on that account to install it, and the Store sign-in is
+              a second, separate link from the in-game one</li>
+          <li>keeps the choice of build, and adds the edition: Minecraft or
+              Minecraft Preview, then any build, each in its own folder</li>
+          <li>plays a Store package whose executable stays encrypted on disk,
+              by decrypting it into memory at launch; such a package needs the
+              network and a valid Store session at every start, even for
+              single-player</li>
+          <li>installs the game inside the Flatpak sandbox again: the manifest
+              moved to the GNOME runtime, the only one carrying the WebKitGTK
+              the Store sign-in window needs</li>
+          <li>stops the crash that hit the main menu as soon as an account was
+              signed in</li>
+          <li>opens the launcher window in every session, including Steam Deck
+              Game Mode, where the game had become unreachable; launching
+              without the launcher stays available where it is asked for</li>
+          <li>names why the game is slow before it starts, and adds a ray
+              tracing switch to Settings</li>
+        </ul>
+      </description>
+    </release>
     <release version="2.1.4" date="2026-08-11">
       <description>
         <p>Fixes the game freezing when its window is hidden, and makes the

@@ -4,17 +4,22 @@
 import shutil
 import sys
 
-from . import deps
-from .config import PRETTY, VERSION
+from . import (deps, discord, fixups, gamepad, hostarch, presence, selinux,
+               webview)
+from .config import DATA, PRETTY, VERSION
 from .gpu_safety import (
     GpuSafetyAcknowledgementStatus,
     acknowledge_gpu_safety_incident,
     graphics_safety_problem,
     gpu_safety_acknowledgement_status,
 )
+from .hidraw import summary as hidraw_summary
 from .log import BolError, info, ok, warn
 from .ntsync import inproc_sync_problem, inproc_sync_summary
+from .perfcheck import performance_problems, performance_summary
+from .raytracing import ray_tracing_problem, ray_tracing_summary
 from .util import custom_env_map, load_settings
+from .waylanddrv import wayland_driver_summary
 
 
 def gpu_crash_acknowledgement_status():
@@ -69,39 +74,155 @@ def acknowledge_gpu_crash():
     return _acknowledge_gpu_crash()
 
 
+def gui_toolkit_summary():
+    """One line about the Qt toolkit: present, absent, or present and unable
+    to load.
+
+    Installed is not the same as usable. Qt loads its own shared libraries
+    when PySide6 is imported, so a host missing one of them — libzstd.so.1 on
+    NixOS, issue #205 — has the toolkit right there on the path and still
+    cannot open a window. Import it here, and name what the loader could not
+    find rather than reporting it as ready.
+    """
+    if not deps.have("PySide6"):
+        return "auto-installed on launch"
+    error = deps.gui_import_error()
+    if not error:
+        # Importing Qt does not load its X11 plugin, and a plugin that cannot
+        # load aborts the launcher instead of raising (stock Ubuntu and Mint
+        # have no libxcb-cursor0).
+        library = deps.xcb_plugin_missing_library()
+        if library:
+            return (f"installed, but Qt's X11 plugin cannot load: this "
+                    f"system has no {library}")
+        return "OK (GUI)"
+    library = deps.missing_shared_library(error)
+    if library:
+        return (f"installed, but Qt cannot load: this system has no "
+                f"{library}")
+    return f"installed, but Qt cannot load: {error}"
+
+
 def doctor(acknowledge_gpu_crash=False):
     if acknowledge_gpu_crash and not _acknowledge_gpu_crash():
         return False
     info(f"{PRETTY} {VERSION} — system check")
-    hint = next((h for pm, h in (
+    manager, hint = next(((pm, h) for pm, h in (
         ("apt-get", "sudo apt install {}"), ("dnf", "sudo dnf install {}"),
         ("pacman", "sudo pacman -S {}"), ("zypper", "sudo zypper in {}"))
-        if shutil.which(pm)), "installe : {}")
+        if shutil.which(pm)), (None, "install: {}"))
     miss = []
     print(f"  {'python3':12} : {sys.version.split()[0]}")
+    # The game, the engine and xodus-cli are x86-64 programs (#250).
+    print(f"  {'cpu':12} : {hostarch.summary()}")
+    arch_problem = hostarch.problem()
+    if arch_problem:
+        warn(arch_problem)
+    # A stock openSUSE refuses Wine execmod (#380).
+    print(f"  {'selinux':12} : {selinux.summary()}")
+    selinux_problem = selinux.problem()
+    if selinux_problem:
+        warn(selinux_problem)
     for tool, pkg in (("tar", "tar"), ("curl", "curl"), ("unzstd", "zstd")):
         have = shutil.which(tool)
-        print(f"  {tool:12} : {'OK' if have else 'MANQUANT'}")
+        print(f"  {tool:12} : {'OK' if have else 'MISSING'}")
         if not have and not (tool == "curl" and shutil.which("wget")):
             miss.append(pkg)
-    tk_ok = deps.have("tkinter")
-    print(f"  {'tkinter':12} : {'OK (GUI)' if tk_ok else 'MANQUANT (GUI)'}")
-    if not tk_ok:
-        miss.append("python3-tk")
-    ctk_ok = deps.have("customtkinter")
-    print(f"  {'customtkinter':12} : "
-          f"{'OK (GUI)' if ctk_ok else 'auto-installed on launch'}")
+    # PySide6 is not named in `miss`: bol.deps.ensure_gui_deps() fetches the
+    # pinned PySide6-Essentials wheels on the first GUI launch, so a
+    # portable .pyz or a bare checkout without it is ready even though the
+    # import is not there yet. Reporting it as missing would also have to
+    # name a package -- and there is no `python3-pyside6` to
+    # install on Debian or Ubuntu, where it is split per Qt module
+    # (python3-pyside6.qtcore, .qtgui, .qtwidgets).
+    print(f"  {'PySide6':12} : {gui_toolkit_summary()}")
+    # A toolkit that is there but cannot load is a missing package all the
+    # same: libgthread-2.0 on a stock openSUSE, libxcb-cursor0 on Ubuntu.
+    gui_library = None
+    if deps.have("PySide6"):
+        import_error = deps.gui_import_error()
+        gui_library = deps.missing_shared_library(import_error) \
+            if import_error else deps.xcb_plugin_missing_library()
+    if gui_library:
+        libraries = deps.missing_qt_libraries(gui_library)
+        command = deps.install_hint(*libraries)
+        # "sudo <manager> <verb> <package>..." -> the packages.
+        miss.extend(command.split()[3:] if command and
+                    command.startswith("sudo ") else libraries)
     cr_ok = deps.have("cryptography")
     print(f"  {'cryptography':12} : "
-          f"{'OK (login)' if cr_ok else 'MANQUANT (login)'}")
+          f"{'OK (login)' if cr_ok else 'MISSING (login)'}")
     if not cr_ok:
-        miss.append("python3-cryptography")
-    gpu_problem = graphics_safety_problem()
+        # Arch drops the "3": python3-cryptography is no package there.
+        miss.append("python-cryptography" if manager == "pacman"
+                    else "python3-cryptography")
+    # Minecraft is downloaded from the Microsoft Store, and xodus-cli opens
+    # that sign-in in an embedded WebKitGTK webview. Without the library it
+    # cannot even start -- not the download and not an installed game, whose
+    # executable stays encrypted -- so name it here rather than at the first
+    # download. Hosts that cannot install it use the bundled runtime instead.
+    webkit_summary, webkit_package = webview.status()
+    print(f"  {'webkit2gtk':12} : {webkit_summary}")
+    if webkit_package:
+        miss.append(webkit_package)
+    # Whether that sign-in is on file, and where. Never a missing dependency:
+    # it is linked from the launcher, not installed. It is printed with its
+    # path because losing it is expensive -- each fresh sign-in claims one of
+    # the account's ten Microsoft Store devices (issue #198) -- so a report
+    # that "it asks me to sign in every time" can be answered from here
+    # instead of from inside the sandbox.
+    from . import xodus
+
+    print(f"  {'store acct':12} : "
+          + ("linked" if xodus.signed_in() else "not linked")
+          + f" ({xodus.XODUS_KEYRING})")
+    # And whether the installed build can still be decrypted. A Store package
+    # keeps the game executable as ciphertext and the only copy of the plain
+    # one is made, at every launch, out of the package file beside it -- so a
+    # game directory that lost it is unplayable while looking complete.
+    from .games import edition_exe, game_executable, is_bedrock, \
+        selected_edition
+
+    settings = load_settings()
+    game_dir = (settings.get("game_dir") or "").strip()
+    edition = selected_edition(settings)
+    game_exe = game_executable(game_dir, edition) if game_dir else None
+    if not is_bedrock(edition):
+        print(f"  {'title':12} : {edition['name']} (Minecraft for "
+              "Windows' own checks are skipped)")
+    if game_exe is not None and xodus.exe_is_encrypted(game_exe):
+        print(f"  {'mc package':12} : "
+              + ("OK" if not xodus.lost_package_cache(
+                  game_dir, edition_exe(edition)) else
+                 f"MISSING ({xodus.PACKAGE_CACHE} in {game_dir}) — "
+                 "press PLAY to download this build again"))
+    # Whether the installed build still carries the two HBUI patches that
+    # keep the Servers tab reachable and hide the in-game Sign-in link. They
+    # fail silently by nature -- a Minecraft build rebundles its minified UI
+    # and the anchors stop matching -- and nothing else notices: the game
+    # starts, setup reports success, and only the Play screen behaves as
+    # though no patch had run (#227/#228/#229).
+    if is_bedrock(edition):
+        signin_summary, signin_problem = fixups.hbui_signin_gate_status(
+            game_dir)
+        print(f"  {'sign-in ui':12} : {signin_summary}")
+        if signin_problem:
+            warn(signin_problem)
+    # Which controllers the launcher window itself can be driven with. The
+    # game reads its own pad through GameInput inside the prefix, so a blank
+    # here says nothing about playing -- only about navigating the launcher
+    # with no mouse, which is how Steam Game Mode reaches PLAY.
+    print(f"  {'controller':12} : {gamepad.summary()}")
+    gpu_notes = []
+    gpu_problem = graphics_safety_problem(notes=gpu_notes)
     print(f"  {'graphics':12} : "
           f"{'BLOQUÉ' if gpu_problem else 'OK (no unsafe state found)'}")
     if gpu_problem:
         warn("Unsafe graphics session: " + gpu_problem + ". Repair the host "
              "GPU driver and reboot; no Vulkan probe was attempted.")
+    else:
+        for note in gpu_notes:
+            warn(note)
     # Wine 11 has no esync/fsync; without ntsync every wait is a wineserver
     # round-trip and the game behaves as if it were single-threaded. Import
     # lazily so the ordinary doctor keeps not depending on the Wine modules.
@@ -116,10 +237,48 @@ def doctor(acknowledge_gpu_crash=False):
     sync_problem = inproc_sync_problem(engine, environ=custom)
     if sync_problem:
         warn(sync_problem)
+    # Whether BOL_INPUT=wayland has a driver it can actually use. Reported
+    # without a warning: the launcher runs on XWayland by default, so an
+    # unusable native driver is not a problem for anyone who never asks for
+    # it — but it is the first thing to look at for anyone who did (#180).
+    print(f"  {'wayland drv':12} : {wayland_driver_summary(engine)}")
+    # A non-controller hidraw device Wine can open can crash its whole HID
+    # stack, and the in-game mouse with it; name the ones PLAY keeps away.
+    print(f"  {'hidraw':12} : {hidraw_summary()}")
+    # What the graphics payload granted the game last time it ran: the tier
+    # Minecraft's Ray Traced mode is gated on, read back from the launch log
+    # rather than measured here, since answering it live would mean opening
+    # the GPU device this check exists to avoid (#153).
+    print(f"  {'ray tracing':12} : {ray_tracing_summary()}")
+    rt_problem = ray_tracing_problem()
+    if rt_problem:
+        warn(rt_problem)
+    # The same "it lags" report, from causes outside the engine entirely:
+    # no memory, no disk, windowed vsync, a render distance past the main
+    # thread. Prefix-scoped, so it is imported next to the other Wine module.
+    from .prefix import active_prefix
+
+    prefix = active_prefix()
+    print(f"  {'performance':12} : {performance_summary(prefix, DATA)}")
+    for perf_problem in performance_problems(prefix, DATA):
+        warn(perf_problem)
+    # What Discord shows while you play. Nothing here can keep the game from
+    # starting, but "my friends do not see it" has three separate answers --
+    # switched off, Discord not running, or a build with no application id --
+    # and only this line tells them apart.
+    print(f"  {'discord':12} : {discord.presence_summary(load_settings())}")
+    # And the half of "my friends do not see me" that is not Discord at all:
+    # under Wine nothing in the game publishes Xbox Live presence, so the
+    # launcher does it, and this says whether it will (#238, #243).
+    print(f"  {'xbox friends':12} : "
+          f"{presence.presence_summary(load_settings())}")
+    presence_problem = presence.presence_problem(load_settings())
+    if presence_problem:
+        warn(presence_problem)
     if miss:
         warn("To install: " + hint.format(" ".join(sorted(set(miss)))))
         return False
-    if gpu_problem:
+    if gpu_problem or arch_problem:
         return False
     ok("System ready.")
     return True

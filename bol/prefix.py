@@ -14,6 +14,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from . import selinux
 from .archive import safe_extract_tar
 from .config import (
     CACHE,
@@ -33,8 +34,9 @@ from .config import (
     WINEGDK_OUT,
 )
 from .log import BolError, die, info, ok, warn
+from .perfcheck import find_game_data_dirs, find_options_files
 from .proton import proton_path
-from .util import download, sha256_file
+from .util import download, sha256_file, steam_app_id
 
 # Records the engine revision a managed prefix was last built/refreshed with,
 # so an engine upgrade can refresh the prefix's cached Windows system DLLs
@@ -165,35 +167,164 @@ def shared_assets_lock(operation, exclusive):
         os.close(fd)
 
 
+def shared_assets_busy():
+    """Whether a game or an installation holds the shared files right now.
+
+    A probe, not a lock: it takes the exclusive lock and lets go of it at
+    once. A launch that skips setup on its answer still goes through
+    :func:`launch_lock`, which settles any race with the real locks.
+    """
+    try:
+        path = GAMES.resolve(strict=False).parent / ".shared-assets.lock"
+        fd = os.open(path, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
+# How long a launch waits for the shared files while another profile's launch
+# prepares them. Preparing takes a few seconds; an installation or an update
+# holds them for minutes, and is not waited for.
+SHARED_FILES_WAIT_S = 90.0
+
+
+class SessionLocks(tuple):
+    """The (shared-assets, prefix) lock descriptors of one game session.
+
+    A tuple, because that is what the game wrapper inherits. ``sole`` says
+    whether the shared game and engine files are this session's alone -- no
+    other profile is playing -- and so whether it may still write to them.
+    """
+
+    def __new__(cls, fds, sole=True):
+        locks = super().__new__(cls, fds)
+        locks.sole = sole
+        return locks
+
+    def share(self):
+        """Let other profiles start beside this one, from now on.
+
+        Called once everything this session writes to the shared files is
+        written. An installation or an update still needs them exclusively
+        and keeps being refused while any game runs.
+        """
+        if self.sole and self:
+            fcntl.flock(self[0], fcntl.LOCK_SH)
+
+
 @contextmanager
-def launch_lock():
-    """Serialize PLAY with setup/repair and without stale crash locks."""
-    with shared_assets_lock(
-            "start Minecraft", exclusive=True) as shared_fd, \
-            prefix_operation_lock("start Minecraft") as prefix_fd:
-        yield shared_fd, prefix_fd
+def _joinable_shared_assets_lock(operation, wait=SHARED_FILES_WAIT_S):
+    """The shared-assets lock for a game: alone if it can be, else beside
+    the games already running. Yields (descriptor, sole)."""
+    sleep, clock = time.sleep, time.monotonic
+    try:
+        shared_root = GAMES.resolve(strict=False).parent
+        shared_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise BolError(
+            f"Cannot locate the shared game-data root for {operation}: {exc}"
+        ) from exc
+    path = shared_root / ".shared-assets.lock"
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        os.chmod(path, 0o600)
+        deadline = clock() + max(0.0, wait)
+        announced = False
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                sole = True
+                break
+            except BlockingIOError:
+                pass
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                sole = False
+                break
+            except BlockingIOError as exc:
+                if clock() >= deadline:
+                    raise BolError(
+                        f"Cannot {operation}: shared Minecraft files are in "
+                        "use by another BedrockOnLinux profile or are being "
+                        "updated."
+                    ) from exc
+            if not announced:
+                announced = True
+                info("Another profile is preparing the shared game files; "
+                     "waiting for it …")
+            sleep(0.25)
+        yield fd, sole
+    finally:
+        # As in shared_assets_lock: never LOCK_UN, the wrapper may hold it.
+        os.close(fd)
+
+
+@contextmanager
+def launch_lock(join=False):
+    """Serialize PLAY with setup/repair and without stale crash locks.
+
+    By default nothing else may hold the shared game and engine files, which
+    is what the doctor's acknowledgement needs. With ``join``, a game may
+    start beside the games other profiles are running: the prefix lock is
+    still this profile's alone, and the shared files are held together with
+    those sessions (see :class:`SessionLocks`).
+    """
+    if not join:
+        with shared_assets_lock(
+                "start Minecraft", exclusive=True) as shared_fd, \
+                prefix_operation_lock("start Minecraft") as prefix_fd:
+            yield SessionLocks((shared_fd, prefix_fd))
+        return
+    # The profile's own lock first: a second PLAY in the same profile is
+    # refused at once instead of after waiting for the shared files.
+    with prefix_operation_lock("start Minecraft") as prefix_fd, \
+            _joinable_shared_assets_lock("start Minecraft") as shared:
+        shared_fd, sole = shared
+        yield SessionLocks((shared_fd, prefix_fd), sole)
+
+
+def _remove_empty_steam_dir(steam):
+    """Take back the empty ~/.steam/steam that earlier launchers created.
+
+    Steam's bootstrapper needs that path to be a symlink to its data
+    directory. With a real directory in the way, every Steam installed
+    afterwards fails with "Couldn't set up Steam data" (#265). Proton only
+    ever read from the one the launcher made, so it is still empty, and that
+    is what keeps this safe: rmdir refuses a directory holding any entry, so
+    a real Steam installation is never touched.
+    """
+    if steam.is_symlink():
+        return
+    for path in (steam, steam.parent):
+        try:
+            path.rmdir()
+        except OSError:
+            return
 
 
 def steam_compat_dir():
     """Return a writable Steam compatibility directory for UMU/Proton.
 
-    Flatpak cannot follow Steam Deck's host symlink, so sandboxed and unusable
-    host paths fall back to app-owned storage.
+    Proton only reads the Steam client from it, so a Steam installation that
+    is really there is handed over as it is. Everything else gets app-owned
+    storage: Flatpak cannot follow Steam Deck's host symlink, and a
+    ~/.steam/steam created on a host without Steam breaks the Steam installed
+    after it (#265).
     """
-    if "FLATPAK_ID" in os.environ or Path("/.flatpak-info").exists():
-        fallback = DATA / "steamcompat"
-        fallback.mkdir(parents=True, exist_ok=True)
-        return fallback
-    steam = HOME / ".steam/steam"
-    if steam.is_dir():                     # real Steam, or one we made earlier
-        return steam
-    try:
-        steam.mkdir(parents=True, exist_ok=True)
-        return steam
-    except OSError:
-        fallback = DATA / "steamcompat"
-        fallback.mkdir(parents=True, exist_ok=True)
-        return fallback
+    if "FLATPAK_ID" not in os.environ and not Path("/.flatpak-info").exists():
+        steam = HOME / ".steam/steam"
+        _remove_empty_steam_dir(steam)
+        if steam.is_dir():
+            return steam
+    fallback = DATA / "steamcompat"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
 
 
 def _prepare_managed_prefix_layout(prefix):
@@ -231,9 +362,16 @@ def proton_umu_cmd(exe, prefix=None):
             env["PROTON_USE_WOW64"] = "1"
     except (OSError, RuntimeError):
         pass
-    # GAMEID selects protonfixes, not the inherited Steam session identity.
+    # GAMEID selects protonfixes, but UMU also rebuilds the Steam session
+    # identity from it: SteamAppId and SteamGameId inside the container become
+    # whatever follows "umu-". Its own `umu-default` fallback therefore turns
+    # a launch Steam started into the literal strings "SteamAppId=default"
+    # and "SteamGameId=default" (#199). Hand it back the inherited application
+    # ID so the container keeps the identity Steam gave this session, and keep
+    # the neutral default for every launch that never had one.
     game_id = env.get("GAMEID", "").strip()
-    env["GAMEID"] = game_id or "umu-default"
+    app_id = steam_app_id(env)
+    env["GAMEID"] = game_id or (f"umu-{app_id}" if app_id else "umu-default")
     return [sys.executable, str(ensure_umu()), exe], env
 
 
@@ -252,27 +390,40 @@ def prefix_ready(prefix: Path):
     return True
 
 
-def seed_managed_bootstrap_cryptbase(prefix: Path):
-    """Install native cryptbase before managed-prefix services start.
+def managed_bootstrap_prefix(prefix):
+    """Whether this is the app's own prefix running on the app's own engine.
 
-    GDK-Proton's advapi32 forwards SystemFunction036 to cryptbase.  With the
-    managed pure-WoW64 engine, forcing only Wine's builtin cryptbase during an
-    engine upgrade can leave that forward unresolved and make every wineboot
-    service repeatedly abort.  Never materialise or modify an explicitly
-    supplied prefix or a prefix used with a custom engine.
+    Only that pair is ours to prepare before Wine has created it; an explicit
+    ``BOL_WINEPREFIX`` or a user-supplied engine is left alone.
     """
     if os.environ.get("BOL_WINEPREFIX", "").strip():
         return False
-    pfx = Path(prefix)
     engine = proton_path()
     if engine is None:
         return False
     try:
-        if pfx.resolve(strict=False) != PFX.resolve(strict=False) or \
-                Path(engine).resolve(strict=False) != \
-                WINEGDK_OUT.resolve(strict=False):
-            return False
+        return (
+            Path(prefix).resolve(strict=False) == PFX.resolve(strict=False)
+            and Path(engine).resolve(strict=False)
+            == WINEGDK_OUT.resolve(strict=False)
+        )
     except (OSError, RuntimeError):
+        return False
+
+
+def seed_managed_bootstrap_cryptbase(prefix: Path):
+    """Install native cryptbase before managed-prefix services start.
+
+    GDK-Proton's advapi32 forwards SystemFunction036 to cryptbase, and until
+    wineboot's own ``wine.inf`` pass materialises that DLL there is no
+    ``cryptbase.dll`` in a brand-new prefix for the forward to resolve to — no
+    ``WINEDLLOVERRIDES`` spelling substitutes for the file.  Every wineboot
+    service then aborts on its first RtlGenRandom call and the prefix can only
+    time out (#144).  Never materialise or modify an explicitly supplied
+    prefix or a prefix used with a custom engine.
+    """
+    pfx = Path(prefix)
+    if not managed_bootstrap_prefix(pfx):
         return False
 
     if pfx.is_symlink():
@@ -346,6 +497,29 @@ def _log_size(path: Path):
         return 0
 
 
+# Wine's own budget for creating a prefix from Proton's template.
+WINEBOOT_TIMEOUT = 300
+# umu-launcher installs the Steam Linux Runtime the first time it is invoked,
+# and it does so *inside* the process we are timing.  That is close to 900 MB
+# to download, unpack and verify, so on an ordinary connection it alone can
+# outlast Wine's budget and report a wineboot timeout for a wineboot that never
+# even started (#144).  Give that one-time bootstrap its own allowance.
+RUNTIME_SETUP_TIMEOUT = 1500
+
+
+def runtime_setup_pending():
+    """Whether the next umu run still has to install the Steam Linux Runtime.
+
+    Mirrors umu-launcher's own check: it looks for an unpacked
+    ``sniper_platform_*`` under the runtime directory and rebuilds the whole
+    runtime when none is there.
+    """
+    try:
+        return not any((UMU_DIR / "steamrt3").glob("sniper_platform_*"))
+    except OSError:
+        return True
+
+
 def _wineboot_hit_rng_abort(log_path: Path, offset=0):
     """Whether this attempt's own log section shows the cryptbase RNG abort.
 
@@ -367,16 +541,25 @@ def _run_wineboot(pfx: Path, log_path: Path, native_cryptbase):
     cmd, env = proton_umu_cmd("wineboot", prefix=pfx)
     cmd.append("-u")
     env = headless_setup_env(env, native_cryptbase=native_cryptbase)
-    env.setdefault("WINEDEBUG", "-all")
+    # Wine's errors, not its fixmes: "-all" also silenced the one line that
+    # says why a prefix could not be made, and a wineboot that exits with
+    # status 1 then leaves nothing in the log to go on (#380).
+    env.setdefault("WINEDEBUG", "fixme-all")
+    timeout = WINEBOOT_TIMEOUT
+    if runtime_setup_pending():
+        # This first run pays for the Steam Linux Runtime as well as for Wine.
+        timeout += RUNTIME_SETUP_TIMEOUT
+        info("Downloading the Steam Linux Runtime for the first prefix "
+             "(close to 900 MB) — this run takes much longer than later ones.")
     failure = None
     try:
         with log_path.open("a") as log:
             try:
                 completed = subprocess.run(
                     cmd, env=env, stdout=log, stderr=subprocess.STDOUT,
-                    timeout=300)
+                    timeout=timeout)
             except subprocess.TimeoutExpired:
-                failure = "timed out after 300 seconds"
+                failure = f"timed out after {timeout} seconds"
             except Exception as exc:
                 failure = f"raised {type(exc).__name__}: {exc}"
             else:
@@ -394,8 +577,43 @@ def _run_wineboot(pfx: Path, log_path: Path, native_cryptbase):
     return failure
 
 
+# Why the last boot_prefix() returned False, in a sentence; "" otherwise.
+LAST_BOOT_PROBLEM = ""
+
+
+def _log_tail(path, lines=6, width=200):
+    """The last meaningful lines of a log, for an error dialog."""
+    try:
+        with open(path, "rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - 16384))
+            text = stream.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    kept = [line.strip()[:width] for line in text.splitlines()
+            if line.strip() and not line.startswith("BedrockOnLinux: wineboot")]
+    return kept[-lines:]
+
+
+def boot_failure_message(what):
+    """The error for a prefix that could not be created: what stopped, why,
+    the end of the log, and what to send."""
+    log_path = LOGS / "native-login.log"
+    parts = [f"Could not initialise the Wine prefix, so {what}."]
+    if LAST_BOOT_PROBLEM:
+        parts.append(LAST_BOOT_PROBLEM)
+    tail = _log_tail(log_path)
+    if tail:
+        parts.append("Last lines of the log:\n" + "\n".join(tail))
+    parts.append(f"Full log: {log_path}. Use 'Report a problem' to send it "
+                 "with your system details, then try PLAY again.")
+    return "\n\n".join(parts)
+
+
 def boot_prefix(prefix=None):
     """Ensure Wine created system32 and its persistent registry hives."""
+    global LAST_BOOT_PROBLEM
+    LAST_BOOT_PROBLEM = ""
     pfx = Path(prefix or active_prefix())
     _prepare_managed_prefix_layout(pfx)
     if prefix_ready(pfx):
@@ -404,16 +622,26 @@ def boot_prefix(prefix=None):
             # Windows system DLLs no longer match the managed runtime.
             refresh_managed_prefix_runtime(pfx)
             _record_managed_engine_rev_if_managed(pfx)
+        # Also for a prefix refreshed by an earlier release, which kept them.
+        prune_engine_dll_backups(pfx)
         repair_managed_prefix_user32(pfx)
+        # Only a rule known to apply: inside the Flatpak the boolean cannot
+        # be read, and a warning at every PLAY of a working game is noise.
+        if selinux.execmod_state() == selinux.DENIED:
+            warn(selinux.problem())
         return True
     # Refuse a known-bad graphics session before Wine can open a device.
     from .gpu_safety import require_safe_graphics_session
     require_safe_graphics_session()
     info("Initialising the Wine prefix (first run) …")
+    selinux_problem = selinux.problem()
+    if selinux_problem:
+        warn(selinux_problem)
     native_cryptbase = seed_managed_bootstrap_cryptbase(pfx)
     LOGS.mkdir(parents=True, exist_ok=True)
     log_path = LOGS / "native-login.log"
     retried = False
+    rng_abort = False
     while True:
         attempt_offset = _log_size(log_path)
         failure = _run_wineboot(pfx, log_path, native_cryptbase)
@@ -425,7 +653,8 @@ def boot_prefix(prefix=None):
                 _record_managed_engine_rev_if_managed(pfx)
                 repair_managed_prefix_user32(pfx)
                 return True
-        if retried or not _wineboot_hit_rng_abort(log_path, attempt_offset):
+        rng_abort = _wineboot_hit_rng_abort(log_path, attempt_offset)
+        if retried or not rng_abort:
             break
         retried = True
         # The engine's first run creates the prefix from Proton's template and
@@ -436,23 +665,66 @@ def boot_prefix(prefix=None):
              "verified RNG component and retrying the prefix once.")
         native_cryptbase = repair_bootstrap_cryptbase(pfx)
         if not native_cryptbase:
-            warn("No verified cryptbase.dll is available for this prefix. "
-                 "Connect to the network and re-run 'Install / Update' so the "
-                 "online-login components can be downloaded.")
+            if managed_bootstrap_prefix(pfx):
+                warn("No verified cryptbase.dll is available for this prefix. "
+                     "Connect to the network and re-run 'Install / Update' so "
+                     "the online-login components can be downloaded.")
+            else:
+                # Nothing the launcher can repair: seeding a prefix or engine
+                # the user supplied is exactly what this path refuses to do.
+                warn("This Wine prefix or engine is user-supplied, so the "
+                     "launcher will not write to its system32. Copy a "
+                     "cryptbase.dll exporting SystemFunction036 (a Wine or "
+                     "Proton build ships one under "
+                     "files/lib/wine/x86_64-windows/) into "
+                     "drive_c/windows/system32, or switch back to the managed "
+                     "engine and prefix.")
             break
     if failure:
-        warn(f"Wine prefix initialisation failed: wineboot {failure}. "
+        cause = ""
+        if rng_abort:
+            # A bare "timed out" sent this failure's reporters chasing Wine
+            # packages and file-descriptor limits (#144); name what aborted.
+            cause = (" Wine aborted every prefix service on the unresolved "
+                     "advapi32.SystemFunction036 (RtlGenRandom → cryptbase) "
+                     "forward, so the prefix could never finish.")
+        else:
+            # A stock openSUSE refuses Wine execmod, and Proton's first
+            # process dies on it without a word (#380).
+            selinux_problem = selinux.problem(failed=True)
+            if selinux_problem:
+                cause = " " + selinux_problem
+        LAST_BOOT_PROBLEM = f"wineboot {failure}.{cause}"
+        warn(f"Wine prefix initialisation failed: wineboot {failure}.{cause} "
              f"Details: {log_path}")
         return False
+    LAST_BOOT_PROBLEM = ("wineboot finished, but the prefix has no valid "
+                         "system.reg, user.reg and system32.")
     warn("Wine prefix initialisation finished without valid system.reg, "
          f"user.reg, and system32 state. Details: {log_path}")
     return False
 
 
 def _environ_uses_prefix(environ, prefix):
-    """Match an exact NUL-delimited WINEPREFIX entry."""
-    target = b"WINEPREFIX=" + os.fsencode(str(prefix))
-    return target in environ.split(b"\0")
+    """Whether a process's NUL-delimited environment names this prefix.
+
+    The launcher's own processes (umu-run, the Steam Linux Runtime container)
+    carry ``WINEPREFIX=<prefix>`` exactly. Proton takes that path as its
+    compatdata folder and points Wine itself at ``<prefix>/pfx/``, trailing
+    slash included, so Minecraft and everything it starts carry that one.
+    Matching only the first saw the wrappers and never the game: the
+    leftover reaper never learnt Minecraft had run and left WebView2's
+    updater holding the session open, and force-stop and the "prefix still
+    busy" checks missed every Wine process.
+    """
+    base = os.fsencode(str(prefix)).rstrip(b"/")
+    wanted = (base, base + b"/pfx")
+    for entry in environ.split(b"\0"):
+        if entry.startswith(b"WINEPREFIX="):
+            value = entry[len(b"WINEPREFIX="):].rstrip(b"/")
+            if value in wanted:
+                return True
+    return False
 
 
 def prefix_processes(prefix: Path):
@@ -621,6 +893,30 @@ def _dll_differs(source, target):
         return True
 
 
+# Wine marks every DLL it builds right after the DOS header, and the copies
+# wineboot puts into a prefix keep that mark: "Wine builtin DLL" for a real
+# one, "Wine placeholder DLL" for the stub that stands in for a DLL Wine loads
+# from the engine directory instead.
+_WINE_DLL_MARKS = (b"Wine builtin DLL", b"Wine placeholder DLL")
+_DOS_HEADER_SIZE = 0x40
+_RUNTIME_BACKUP_SUFFIX = ".bol-runtime-backup"
+
+
+def _is_wine_built_dll(path):
+    """Whether ``path`` is a DLL that any Wine engine builds again.
+
+    Anything else -- a DXVK or vkd3d-proton copy, a redistributable, a DLL
+    the player put there -- did not come from the engine, and cannot be
+    had back from it.
+    """
+    try:
+        with open(path, "rb") as stream:
+            head = stream.read(_DOS_HEADER_SIZE + 32)
+    except OSError:
+        return False
+    return head[_DOS_HEADER_SIZE:].startswith(_WINE_DLL_MARKS)
+
+
 def _replace_managed_dll(source, target):
     """Atomically refresh one prefix DLL from the engine; return if changed."""
     source_hash = sha256_file(source)
@@ -630,8 +926,13 @@ def _replace_managed_dll(source, target):
                 return False
         except OSError:
             pass
-    backup = target.with_name(target.name + ".bol-runtime-backup")
-    if not (backup.exists() or backup.is_symlink()):
+    backup = target.with_name(target.name + _RUNTIME_BACKUP_SUFFIX)
+    # A DLL the engine built is what any engine builds again, so a copy of the
+    # old one only costs its size: across system32 and syswow64 that came to
+    # more than a gigabyte, kept for good and never read back (#289). Only
+    # what did not come from an engine is worth keeping.
+    if not (backup.exists() or backup.is_symlink()) \
+            and not _is_wine_built_dll(target):
         if target.is_symlink():
             backup.symlink_to(os.readlink(target))
         elif target.exists():
@@ -717,6 +1018,47 @@ def refresh_managed_prefix_runtime(prefix=None):
     return changed
 
 
+def prune_engine_dll_backups(prefix=None):
+    """Delete the refresh's copies of DLLs any Wine engine builds again.
+
+    An engine update used to leave a copy of every system DLL it replaced
+    beside it -- some 1,100 of Wine's own DLLs, over a gigabyte -- which
+    nothing ever restored (#289). Copies of anything that did not come from an
+    engine stay. Only the managed prefix is touched. Returns the bytes freed.
+    """
+    pfx = Path(prefix or PFX)
+    if not _managed_runtime_guards(pfx, proton_path()) or pfx.is_symlink():
+        return 0
+    freed = 0
+    try:
+        resolved_root = pfx.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return 0
+    for _engine_rel, prefix_rel in _MANAGED_RUNTIME_ARCH_DIRS:
+        folder = pfx / prefix_rel
+        try:
+            if folder.is_symlink() or not folder.is_dir():
+                continue
+            folder.resolve(strict=True).relative_to(resolved_root)
+            backups = sorted(folder.glob("*" + _RUNTIME_BACKUP_SUFFIX))
+        except (OSError, RuntimeError, ValueError):
+            continue
+        for backup in backups:
+            if backup.is_symlink() or not backup.is_file() \
+                    or not _is_wine_built_dll(backup):
+                continue
+            try:
+                size = backup.stat().st_size
+                backup.unlink()
+            except OSError:
+                continue
+            freed += size
+    if freed:
+        info("Removed %d MB of old Wine DLL copies from the Wine prefix."
+             % round(freed / 1024 ** 2))
+    return freed
+
+
 def stop_prefix_procs(prefix: Path, grace=5, kill_grace=2):
     """Stop a prefix, including children spawned during shutdown.
 
@@ -782,7 +1124,8 @@ def headless_setup_env(env, native_cryptbase=False):
     result.pop("XAUTHORITY", None)
     result.pop("PROTON_ENABLE_WAYLAND", None)
     result["SDL_VIDEODRIVER"] = "dummy"
-    setup_keys = {"cryptbase", "winevulkan", "dxgi", "d3d11", "d3d12"}
+    setup_keys = {"cryptbase", "winevulkan", "dxgi", "d3d11", "d3d12",
+                  "mscoree"}
     current = [
         item for item in result.get("WINEDLLOVERRIDES", "").split(";")
         if item and item.partition("=")[0].strip().lower() not in setup_keys
@@ -791,7 +1134,10 @@ def headless_setup_env(env, native_cryptbase=False):
     # native implementations could recurse through advapi32, so retain the
     # builtin-only behavior when no safe DLL was staged.
     cryptbase = "cryptbase=n,b" if native_cryptbase else "cryptbase=b"
-    overrides = [cryptbase, "winevulkan=", "dxgi=", "d3d11=", "d3d12="]
+    # The managed engine ships no Wine Mono from native24 on, and a prefix
+    # being created would otherwise stop to download and install one.
+    overrides = [cryptbase, "winevulkan=", "dxgi=", "d3d11=", "d3d12=",
+                 "mscoree="]
     result["WINEDLLOVERRIDES"] = ";".join(overrides + current)
     return result
 
@@ -806,50 +1152,591 @@ def kill_wine():
         info("No BedrockOnLinux Wine process is running.")
 
 
+# What Minecraft keeps inside the prefix for the player: every world, pack,
+# skin and screenshot, and the game's own settings, one folder per edition.
+# Wine rebuilds everything else around them.
+_GAME_DATA_GLOB = "drive_c/users/*/AppData/Roaming/Minecraft Bedrock*"
+# Beside COMPAT, so that setting the old tree aside is a rename.
+_REPAIR_LEFTOVER = ".compatdata-repair-"
+
+
+def _game_data_folders(prefix):
+    """Minecraft's folders inside ``prefix``, as paths relative to it.
+
+    Only a path with no symlink anywhere in it counts. Proton links
+    drive_c/users/<login> to steamuser, and the same folder reached through
+    that link is not a second one to move; a folder a link leads out of the
+    prefix is not at risk either, since rmtree never follows a link.
+    """
+    prefix = Path(prefix)
+    if prefix.is_symlink() or not prefix.is_dir():
+        return []
+    root = prefix.resolve(strict=True)
+    found = []
+    for folder in sorted(prefix.glob(_GAME_DATA_GLOB)):
+        relative = folder.relative_to(prefix)
+        if folder.is_symlink() or not folder.is_dir() \
+                or folder.resolve(strict=True) != root / relative:
+            continue
+        found.append(relative)
+    return found
+
+
+def _discard_repair_leftovers():
+    """Delete what an interrupted repair left beside COMPAT.
+
+    A leftover still holding Minecraft's folders was interrupted before they
+    moved, so it is named instead of deleted.
+    """
+    for leftover in COMPAT.parent.glob(_REPAIR_LEFTOVER + "*"):
+        try:
+            if leftover.is_symlink() or not leftover.is_dir():
+                continue
+            if _game_data_folders(leftover / PFX.relative_to(COMPAT)):
+                warn("An interrupted repair left Minecraft worlds and "
+                     f"settings in {leftover}; it was not deleted.")
+                continue
+        except (OSError, RuntimeError):
+            continue
+        shutil.rmtree(leftover, ignore_errors=True)
+
+
+def _reset_compat_keeping_game_data():
+    """Delete the compatibility tree except Minecraft's own folders.
+
+    Returns the folders kept. The worlds, packs and settings live inside the
+    prefix, and Repair is for Wine's part of it: deleting them along with it
+    cost players their worlds, while the button promised to keep them
+    (#253). Everything that decides whether a world survives is a rename
+    done before any delete: the old tree moves aside, Minecraft's folders
+    move into an otherwise empty new prefix, which Wine completes around them
+    on the next launch, and only then is the rest deleted. The GUI repairs on
+    a daemon thread, so closing the launcher during that long delete must
+    cost no world either.
+    """
+    _discard_repair_leftovers()
+    try:
+        keep = _game_data_folders(PFX)
+        old = Path(tempfile.mkdtemp(prefix=_REPAIR_LEFTOVER,
+                                    dir=COMPAT.parent))
+    except (OSError, RuntimeError) as exc:
+        die("Repair stopped before deleting anything: the Wine prefix "
+            f"could not be read ({exc}).")
+    try:
+        os.rename(COMPAT, old)
+    except OSError as exc:
+        old.rmdir()
+        die("Repair stopped before deleting anything: the Wine prefix "
+            f"could not be set aside ({exc}).")
+    old_pfx = old / PFX.relative_to(COMPAT)
+    moved = []
+    try:
+        for relative in keep:
+            (PFX / relative).parent.mkdir(parents=True, exist_ok=True)
+            os.rename(old_pfx / relative, PFX / relative)
+            moved.append(relative)
+    except OSError as exc:
+        try:
+            for relative in reversed(moved):
+                os.rename(PFX / relative, old_pfx / relative)
+            # Only the empty folders made for them are left in the new tree.
+            for path, _dirs, _files in os.walk(COMPAT, topdown=False):
+                os.rmdir(path)
+            os.rename(old, COMPAT)
+        except OSError:
+            die(f"Repair stopped half-way ({exc}). Nothing was deleted: the "
+                f"old Wine prefix is in {old}, and the Minecraft folders "
+                f"already moved out of it are in {PFX}.")
+        die("Repair stopped before deleting anything: Minecraft's worlds "
+            f"and settings could not be moved into the new prefix ({exc}).")
+    shutil.rmtree(old)
+    return keep
+
+
 def reset_prefix():
     # Repair must never delete an explicit third-party prefix.
     with prefix_operation_lock("repair the Wine prefix"):
         stop_prefix_procs(PFX)
         require_prefix_idle(PFX, "repair the Wine prefix")
+        kept = []
         if COMPAT.is_symlink() or (
                 COMPAT.exists() and not COMPAT.is_dir()):
             # Never follow a damaged or dangling compatibility-tree link.
             COMPAT.unlink()
         elif COMPAT.exists():
-            shutil.rmtree(COMPAT)
-        ok("Wine prefix reset — rebuilt on next launch.")
+            kept = _reset_compat_keeping_game_data()
+        ok("Wine prefix reset — rebuilt on next launch."
+           + (" Minecraft worlds and settings were kept." if kept else ""))
 
 
 OPTIONS_REL = ("drive_c/users/steamuser/AppData/Roaming/Minecraft Bedrock/"
                "Users/Shared/games/com.mojang/minecraftpe/options.txt")
 
+# Minecraft saves options.txt by truncating the file and streaming the whole
+# thing back. A crash in that window — and the game does crash on Wine with an
+# unhandled page fault — leaves the file cut off mid-write, and every setting
+# past the cut silently reads as its default next time (#175). The tail is
+# where the graphics mode, the tutorial flags and the entire keyboard-mapping
+# block live, which is why those are the ones players notice losing. The write
+# is the game's, so it cannot be made atomic from here; keep a copy of the last
+# intact file instead and put it back when the game leaves a torn one behind.
+OPTIONS_BACKUP_SUFFIX = ".bol-backup"
 
-def patch_options():
-    opt = PFX / OPTIONS_REL
-    if not opt.exists():
-        return
-    kv, order = {}, []
-    for l in opt.read_text(errors="ignore").splitlines():
-        if ":" in l:
-            k, _, v = l.partition(":")
-            k = k.strip()
-            if k not in kv:
-                order.append(k)
-            kv[k] = v.strip()
-    if kv.get("do_not_show_multiplayer_online_safety_warning") == "1":
-        return
-    if "do_not_show_multiplayer_online_safety_warning" not in order:
-        order.append("do_not_show_multiplayer_online_safety_warning")
-    kv["do_not_show_multiplayer_online_safety_warning"] = "1"
-    opt.write_text("\n".join(f"{k}:{kv[k]}" for k in order) + "\n")
-    ok("Multiplayer warning disabled")
+_MULTIPLAYER_WARNING_KEY = b"do_not_show_multiplayer_online_safety_warning"
+
+
+def _options_backup_path(options_path: Path) -> Path:
+    return options_path.with_name(options_path.name + OPTIONS_BACKUP_SUFFIX)
+
+
+def _read_bytes(path: Path):
+    """The file's contents, or None when it cannot be read at all."""
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def _options_intact(data) -> bool:
+    """Whether *data* is a finished options.txt rather than a cut-off write.
+
+    Minecraft terminates every line it writes, so a file that stops without a
+    line ending stopped in the middle of being written. Demanding at least one
+    parsed ``key:value`` on top of that keeps an empty or shredded file from
+    being mistaken for a good copy worth keeping.
+    """
+    if not data or not data.endswith(b"\n"):
+        return False
+    return any(b":" in line for line in data.splitlines())
+
+
+def _write_file_atomically(path: Path, data: bytes) -> bool:
+    """Replace *path* with *data* in one step, or leave it exactly as it was.
+
+    Writing in place is what produces a half-file if anything interrupts the
+    write; a rename cannot be observed halfway through.
+    """
+    tmp = None
+    try:
+        handle_fd, name = tempfile.mkstemp(
+            dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+        tmp = Path(name)
+        with os.fdopen(handle_fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(tmp), str(path))
+        return True
+    except OSError:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        return False
+
+
+def _options_files(prefix=None):
+    """Every settings file the game may be using, across accounts."""
+    root = active_prefix() if prefix is None else Path(prefix)
+    try:
+        return find_options_files(root)
+    except OSError:
+        return []
+
+
+def _prefix_is_idle(prefix_idle=None) -> bool:
+    """Whether nothing in the prefix can still be writing the settings file.
+
+    Callers that have already waited for the prefix to settle pass their
+    answer in rather than paying for a second scan.
+    """
+    if prefix_idle is not None:
+        return bool(prefix_idle)
+    try:
+        return not prefix_processes(active_prefix())
+    except OSError:
+        return False
+
+
+def snapshot_game_options(prefix=None) -> int:
+    """Keep a copy of each intact options.txt before the game rewrites it.
+
+    Only an intact file may replace a kept copy. If the previous session
+    already left a torn one behind, the good copy from before it is the whole
+    point and has to survive.
+    """
+    kept = 0
+    for path in _options_files(prefix):
+        data = _read_bytes(path)
+        if not _options_intact(data):
+            continue
+        backup = _options_backup_path(path)
+        if _read_bytes(backup) == data:
+            kept += 1
+            continue
+        if _write_file_atomically(backup, data):
+            kept += 1
+    return kept
+
+
+def restore_truncated_game_options(prefix=None, prefix_idle=None):
+    """Put back any options.txt the game left cut off mid-write (#175).
+
+    Deliberately narrow: it restores only from a copy this launcher took
+    itself, and only over a file that cannot be a finished save. A settings
+    file the game wrote to the end is never touched, however much it changed.
+    """
+    restored = []
+    for path in _options_files(prefix):
+        if _options_intact(_read_bytes(path)):
+            continue
+        kept = _read_bytes(_options_backup_path(path))
+        if not _options_intact(kept):
+            continue
+        if not _prefix_is_idle(prefix_idle):
+            # The game is still shutting down and may yet finish its save.
+            return restored
+        if _write_file_atomically(path, kept):
+            restored.append(path)
+    if restored:
+        warn("Minecraft was interrupted while saving its settings and left "
+             "options.txt cut off — the last complete copy has been restored. "
+             "Settings changed during that session may need setting again.")
+    return restored
+
+
+def _set_option_line(data: bytes, key: bytes, value: bytes):
+    """*data* with one ``key:value`` line set, or None when already set.
+
+    Rewrites only the line it owns. Every other byte — the file's CRLF
+    terminators, the key order, and any line this launcher does not
+    understand — is carried over untouched, because Minecraft's own writer
+    produced them and is the only thing that should be changing them.
+    """
+    newline = b"\r\n" if b"\r\n" in data else b"\n"
+    lines = data.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        body = line.rstrip(b"\r\n")
+        name, separator, current = body.partition(b":")
+        if separator and name.strip() == key:
+            if current.strip() == value:
+                return None
+            lines[index] = key + b":" + value + (line[len(body):] or newline)
+            return b"".join(lines)
+    return data + key + b":" + value + newline
+
+
+def patch_options(prefix_idle=None):
+    """Turn off Minecraft's repeated online-multiplayer safety warning.
+
+    This runs once the game has exited, so it has to be sure the game is
+    really gone first: two processes truncating and rewriting the same
+    settings file is precisely how one ends up cut in half (#175).
+    """
+    # Every settings file, not only the signed-out one: a signed-in game
+    # reads its account's own, and Preview keeps a folder of its own.
+    changed = False
+    for opt in _options_files(PFX) or [PFX / OPTIONS_REL]:
+        data = _read_bytes(opt)
+        if not _options_intact(data):
+            continue
+        updated = _set_option_line(data, _MULTIPLAYER_WARNING_KEY, b"1")
+        if updated is None:
+            continue
+        if not _prefix_is_idle(prefix_idle):
+            return
+        changed = _write_file_atomically(opt, updated) or changed
+    if changed:
+        ok("Multiplayer warning disabled")
+
+
+# Minecraft's own Max Framerate waits for each frame's deadline by polling for
+# window messages, and under Wine every empty poll is a sched_yield between two
+# getrusage calls: the main thread, which builds every frame, sits at a full
+# core doing nothing, half of it in the kernel (#173). vkd3d-proton's limiter
+# sleeps instead, but it only gets the job while the game's own limiter is off.
+# So for the length of a session the player's value waits in this file beside
+# options.txt and the setting reads Unlimited; once the game has exited, the
+# value goes back where the player left it.
+FRAME_LIMIT_SUFFIX = ".bol-max-framerate"
+
+_MAX_FRAMERATE_KEY = b"gfx_max_framerate"
+
+
+def _frame_limit_path(options_path: Path) -> Path:
+    return options_path.with_name(options_path.name + FRAME_LIMIT_SUFFIX)
+
+
+def _option_line_int(data, key: bytes):
+    """One ``key:value`` line of a settings file as an int, or None."""
+    for line in (data or b"").splitlines():
+        name, separator, value = line.partition(b":")
+        if separator and name.strip() == key:
+            try:
+                return int(value.strip())
+            except ValueError:
+                return None
+    return None
+
+
+def _held_frame_limit(options_path: Path):
+    """The Max Framerate a session set aside and has not put back, or None."""
+    try:
+        value = int((_read_bytes(_frame_limit_path(options_path))
+                     or b"").strip())
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def game_frame_limit(options_path):
+    """The player's own Max Framerate in one settings file, or None.
+
+    A value set aside by an earlier session still counts while the file reads
+    Unlimited: that session ended before it could put it back — the launcher
+    was killed, or the machine went down with the game.
+    """
+    if not options_path:
+        return None
+    path = Path(options_path)
+    value = _option_line_int(_read_bytes(path), _MAX_FRAMERATE_KEY)
+    if value is not None and value > 0:
+        return value
+    return _held_frame_limit(path) if value == 0 else None
+
+
+def set_aside_game_frame_limit(options_path, prefix_idle=None):
+    """Switch Minecraft's own Max Framerate off for one session.
+
+    Returns the player's limit once the file reads Unlimited with the value
+    kept beside it, or None when nothing changed: no limit set, a torn file,
+    a prefix still in use, a write that failed. None is always safe — the
+    game then paces itself exactly as it did before.
+    """
+    if not options_path:
+        return None
+    path = Path(options_path)
+    data = _read_bytes(path)
+    if not _options_intact(data):
+        return None
+    limit = _option_line_int(data, _MAX_FRAMERATE_KEY)
+    if limit is None or limit <= 0:
+        # Already Unlimited: a value an interrupted session kept is still
+        # waiting beside the file, and nothing needs writing.
+        return _held_frame_limit(path) if limit == 0 else None
+    if not _prefix_is_idle(prefix_idle):
+        return None
+    # The player's value is written down first, so that no interruption
+    # between the two writes can lose it.
+    side = _frame_limit_path(path)
+    if not _write_file_atomically(side, b"%d\n" % limit):
+        return None
+    if not _write_file_atomically(
+            path, _set_option_line(data, _MAX_FRAMERATE_KEY, b"0")):
+        try:
+            side.unlink()
+        except OSError:
+            pass
+        return None
+    return limit
+
+
+def restore_game_frame_limits(prefix=None, prefix_idle=None):
+    """Put back every Max Framerate a session set aside.
+
+    Runs once the game has exited. A file that still reads Unlimited gets the
+    player's value back; one that reads anything else was changed in-game
+    during the session, and that newer choice is the one kept. A torn file is
+    left for restore_truncated_game_options and retried after the next game.
+    """
+    restored = []
+    for path in _options_files(prefix):
+        held = _held_frame_limit(path)
+        side = _frame_limit_path(path)
+        if held is None:
+            if side.exists():
+                # Unreadable or not a limit: nothing in it can be put back.
+                try:
+                    side.unlink()
+                except OSError:
+                    pass
+            continue
+        if not _prefix_is_idle(prefix_idle):
+            # The game may still be saving; the value waits for next time.
+            return restored
+        data = _read_bytes(path)
+        if not _options_intact(data):
+            continue
+        if not _option_line_int(data, _MAX_FRAMERATE_KEY):
+            updated = _set_option_line(data, _MAX_FRAMERATE_KEY,
+                                       b"%d" % held)
+            if updated is not None and not _write_file_atomically(path,
+                                                                  updated):
+                continue
+            restored.append(path)
+        try:
+            side.unlink()
+        except OSError:
+            pass
+    return restored
+
+
+# The Servers tab keeps the player's own server list beside options.txt, in
+# the same per-account folder (#188): one
+# "<id>:<name>:<host>:<port>:<added>" line per server, in no particular
+# order. Minecraft has no way to import a server, so a server every player
+# should find there has to be written into that list before the game reads it.
+SERVERS_FILE = "external_servers.txt"
+
+# Records which defaults a list has already been offered, so a player who
+# deletes one has deleted it for good.
+SERVERS_SEEDED_SUFFIX = ".bol-seeded"
+
+# The folder the game reads while nobody is signed in, and the only one that
+# exists before the first launch.
+SHARED_GAME_DATA_REL = OPTIONS_REL.rsplit("/", 1)[0]
+
+# (name, host, port) of the servers this launcher puts in the Servers tab.
+# The name is what the tile reads until the server itself answers.
+DEFAULT_SERVERS = (
+    ("Linesia SkyFaction", "play.linesia.net", 19132),
+)
+
+
+def _server_address(host, port):
+    """One server's address, in the form the lists are compared by."""
+    return "%s:%s" % (str(host).strip().lower(), str(port).strip())
+
+
+def _server_entries(data):
+    """The id and address of every server already in a Servers-tab list.
+
+    A server's name is free to hold a colon of its own, so the address is
+    read from the end of the line rather than by counting fields from the
+    start. An id that cannot be read counts as none: it must not keep the
+    address it belongs to from being seen as already listed.
+    """
+    entries = []
+    for line in (data or b"").decode("utf-8", "replace").splitlines():
+        fields = line.strip().split(":")
+        if len(fields) < 5:
+            continue
+        try:
+            index = int(fields[0])
+        except ValueError:
+            index = 0
+        entries.append((index, _server_address(fields[-3], fields[-2])))
+    return entries
+
+
+def _server_line(index, name, host, port):
+    """One external_servers.txt entry, as the game writes them."""
+    # A colon in the name would read as the start of the address.
+    label = str(name).replace(":", " ").strip()
+    return ("%d:%s:%s:%s:%d\n"
+            % (index, label, host, port, int(time.time()))).encode("utf-8")
+
+
+def _servers_seed_path(path: Path) -> Path:
+    return path.with_name(path.name + SERVERS_SEEDED_SUFFIX)
+
+
+def _seed_servers_file(path: Path, servers):
+    """Offer *servers* in one Servers-tab list; returns the names added."""
+    data = _read_bytes(path) or b""
+    if data and not data.endswith(b"\n"):
+        # Never let a list the game left unterminated swallow the new entry.
+        data += b"\n"
+    entries = _server_entries(data)
+    listed = {address for _index, address in entries}
+    offered = set((_read_bytes(_servers_seed_path(path))
+                   or b"").decode("utf-8", "replace").split())
+    index = max([number for number, _address in entries] or [0])
+    added, newly_offered = [], False
+    for name, host, port in servers:
+        address = _server_address(host, port)
+        if address in offered:
+            continue
+        offered.add(address)
+        newly_offered = True
+        if address in listed:
+            # The player added this server themselves: their own name for it
+            # and their own place in the list stay as they are.
+            continue
+        index += 1
+        data += _server_line(index, name, host, port)
+        added.append(name)
+    if not newly_offered:
+        return []
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if added and not _write_file_atomically(path, data):
+        return []
+    _write_file_atomically(_servers_seed_path(path),
+                           ("\n".join(sorted(offered)) + "\n").encode("utf-8"))
+    return added
+
+
+def seed_default_servers(prefix=None, prefix_idle=None,
+                         servers=DEFAULT_SERVERS):
+    """Put the servers this launcher ships with in the game's Servers tab.
+
+    This writes into a file the player edits in-game, so it may only ever add
+    what that list has never been offered: a default that was deleted stays
+    deleted, and a server the player added themselves keeps the name they
+    gave it. Runs before the game starts, while nothing else can be writing
+    the list — the game rewrites the whole file whenever the list changes.
+    """
+    root = active_prefix() if prefix is None else Path(prefix)
+    if not servers or not _prefix_is_idle(prefix_idle):
+        return []
+    try:
+        folders = find_game_data_dirs(root)
+    except OSError:
+        return []
+    if not folders:
+        # Before the first launch the game has created none of them; the
+        # signed-out profile is the one it reads until an account is added.
+        folders = [root / SHARED_GAME_DATA_REL]
+    added = []
+    for folder in sorted(folders):
+        try:
+            added += _seed_servers_file(folder / SERVERS_FILE, servers)
+        except OSError:
+            continue
+    for name in dict.fromkeys(added):
+        ok(f"{name} added to the Servers tab")
+    return added
+
+
+def _game_process_names():
+    """The executable names a running game shows in its command line.
+
+    Minecraft.Windows.exe always, and the selected build's own executable
+    when it is another title of the family (Minecraft Dungeons, Legends).
+    """
+    names = {b"Minecraft.Windows.exe"}
+    try:
+        from .games import game_executable, selected_edition
+        from .util import load_settings
+
+        settings = load_settings()
+        game_dir = settings.get("game_dir")
+        if game_dir:
+            exe = game_executable(game_dir, selected_edition(settings))
+            if exe is not None:
+                names.add(exe.name.encode())
+    except Exception:
+        pass
+    return names
 
 
 def _mc_running():
+    names = _game_process_names()
     for pid in prefix_processes(active_prefix()):
         try:
             cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
-            if b"Minecraft.Windows.exe" in cmdline:
+            if any(name in cmdline for name in names):
                 return True
         except OSError:
             continue

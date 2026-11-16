@@ -13,6 +13,18 @@ from bol import network
 
 
 class NetworkDiagnosticsTests(unittest.TestCase):
+    def setUp(self):
+        # Every probe in this module is injectable so the tests stay offline.
+        # The Xbox social snapshot is the one that would otherwise reach Xbox
+        # Live by itself, so it is stubbed for the whole class; the tests that
+        # are about those lines pass their own.
+        patch = mock.patch.object(
+            network.presence, "social_snapshot",
+            lambda *_a, **_k: network.presence.SocialSnapshot(
+                state="Online", friends=3, in_session=1))
+        patch.start()
+        self.addCleanup(patch.stop)
+
     @staticmethod
     def _runner(argv, **_kwargs):
         if argv[0] == "timedatectl":
@@ -440,3 +452,70 @@ class NetworkDiagnosticsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class XboxSocialLineTests(unittest.TestCase):
+    """The three answers behind "I can't join my friend's world" (#243/#244).
+
+    None of them may fail the report: an account nobody can see is a real
+    problem but not a broken host, and an evening with no friend in a world
+    is not a fault at all.
+    """
+
+    def _checks(self, **fields):
+        return network._social_checks(network.presence.SocialSnapshot(**fields))
+
+    def test_being_seen_as_offline_is_spelled_out_but_does_not_fail(self):
+        checks = self._checks(state="Offline", friends=12, in_session=0)
+        presence_line = next(c for c in checks if c.kind == "xbox presence")
+        self.assertIsNone(presence_line.ok)
+        self.assertIn("Offline", presence_line.detail)
+        self.assertIn("nobody can join or invite", presence_line.detail)
+
+    def test_being_seen_as_online_says_only_that(self):
+        checks = self._checks(state="Online", friends=12, in_session=2)
+        presence_line = next(c for c in checks if c.kind == "xbox presence")
+        self.assertIn("Online", presence_line.detail)
+        self.assertNotIn("nobody can join", presence_line.detail)
+
+    def test_the_session_count_answers_the_report_directly(self):
+        checks = self._checks(state="Online", friends=12, in_session=0)
+        sessions = next(c for c in checks if c.kind == "xbox sessions")
+        self.assertIsNone(sessions.ok)
+        self.assertIn("0 of 12", sessions.detail)
+
+    def test_a_readable_friends_list_is_a_pass(self):
+        checks = self._checks(state="Online", friends=12, in_session=0)
+        friends = next(c for c in checks if c.kind == "xbox friends")
+        self.assertTrue(friends.ok)
+        self.assertIn("12 friends", friends.detail)
+
+    def test_an_unmeasurable_snapshot_says_so_once(self):
+        checks = self._checks(error="no linked account to ask about")
+        self.assertEqual(len(checks), 1)
+        self.assertIsNone(checks[0].ok)
+        self.assertIn("no linked account", checks[0].detail)
+
+    def test_a_snapshot_that_raises_never_fails_the_report(self):
+        def exploding():
+            raise RuntimeError("boom")
+
+        result, checks = network.diagnose_network(
+            endpoints=(), runner=NetworkDiagnosticsTests._runner,
+            social=exploding)
+
+        self.assertTrue(result)
+        social = next(c for c in checks if c.kind == "xbox social")
+        self.assertIsNone(social.ok)
+        self.assertIn("RuntimeError", social.detail)
+
+    def test_the_lines_reach_the_report(self):
+        result, checks = network.diagnose_network(
+            endpoints=(), runner=NetworkDiagnosticsTests._runner,
+            social=lambda: network.presence.SocialSnapshot(
+                state="Online", friends=4, in_session=1))
+
+        self.assertTrue(result)
+        self.assertEqual(
+            [c.kind for c in checks if c.kind.startswith("xbox")],
+            ["xbox presence", "xbox friends", "xbox sessions"])

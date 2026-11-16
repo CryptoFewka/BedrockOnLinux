@@ -131,31 +131,62 @@ class PrefixShutdownTests(unittest.TestCase):
             self.assertIn(
                 str(logs / "native-login.log"), warn.call_args.args[0])
 
+    def _timed_out_boot(self, td, runtime_pending):
+        logs = Path(td) / "logs"
+        with mock.patch.object(prefix, "LOGS", logs), \
+                mock.patch(
+                    "bol.gpu_safety.require_safe_graphics_session"), \
+                mock.patch.object(
+                    prefix, "proton_umu_cmd",
+                    return_value=(["umu", "wineboot"], {})), \
+                mock.patch.object(
+                    prefix, "seed_managed_bootstrap_cryptbase",
+                    return_value=False), \
+                mock.patch.object(
+                    prefix, "runtime_setup_pending",
+                    return_value=runtime_pending), \
+                mock.patch.object(
+                    prefix.subprocess, "run",
+                    side_effect=prefix.subprocess.TimeoutExpired(
+                        ["umu", "wineboot"], 300)) as run, \
+                mock.patch.object(prefix, "stop_prefix_procs"), \
+                mock.patch.object(prefix, "info"), \
+                mock.patch.object(prefix, "warn") as warn:
+            self.assertFalse(prefix.boot_prefix(Path(td) / "pfx"))
+        return logs, run, warn
+
     def test_wineboot_timeout_is_logged_and_fails(self):
         with tempfile.TemporaryDirectory() as td:
-            logs = Path(td) / "logs"
-            with mock.patch.object(prefix, "LOGS", logs), \
-                    mock.patch(
-                        "bol.gpu_safety.require_safe_graphics_session"), \
-                    mock.patch.object(
-                        prefix, "proton_umu_cmd",
-                        return_value=(["umu", "wineboot"], {})), \
-                    mock.patch.object(
-                        prefix, "seed_managed_bootstrap_cryptbase",
-                        return_value=False), \
-                    mock.patch.object(
-                        prefix.subprocess, "run",
-                        side_effect=prefix.subprocess.TimeoutExpired(
-                            ["umu", "wineboot"], 300)), \
-                    mock.patch.object(prefix, "stop_prefix_procs"), \
-                    mock.patch.object(prefix, "warn") as warn:
-                self.assertFalse(prefix.boot_prefix(Path(td) / "pfx"))
+            logs, run, warn = self._timed_out_boot(td, runtime_pending=False)
 
+            self.assertEqual(run.call_args.kwargs["timeout"], 300)
             self.assertIn(
                 "wineboot timed out after 300 seconds",
                 (logs / "native-login.log").read_text(),
             )
             self.assertIn("timed out", warn.call_args.args[0])
+
+    def test_first_run_does_not_charge_the_runtime_download_to_wine(self):
+        """umu-launcher downloads close to 900 MB of Steam Linux Runtime
+        inside the process we are timing, so Wine's own budget must not be
+        what a slow connection runs out of (#144)."""
+        with tempfile.TemporaryDirectory() as td:
+            _logs, run, _warn = self._timed_out_boot(td, runtime_pending=True)
+
+            self.assertEqual(
+                run.call_args.kwargs["timeout"],
+                prefix.WINEBOOT_TIMEOUT + prefix.RUNTIME_SETUP_TIMEOUT,
+            )
+
+    def test_runtime_setup_is_pending_until_the_platform_is_unpacked(self):
+        with tempfile.TemporaryDirectory() as td:
+            runtime = Path(td) / "steamrt3"
+            with mock.patch.object(prefix, "UMU_DIR", Path(td)):
+                self.assertTrue(prefix.runtime_setup_pending())
+                runtime.mkdir()
+                self.assertTrue(prefix.runtime_setup_pending())
+                (runtime / "sniper_platform_3.0.1").mkdir()
+                self.assertFalse(prefix.runtime_setup_pending())
 
     def test_wineboot_exception_is_logged_and_fails(self):
         with tempfile.TemporaryDirectory() as td:
@@ -309,6 +340,9 @@ class PrefixShutdownTests(unittest.TestCase):
                         prefix, "repair_bootstrap_cryptbase",
                         return_value=False), \
                     mock.patch.object(
+                        prefix, "managed_bootstrap_prefix",
+                        return_value=True), \
+                    mock.patch.object(
                         prefix.subprocess, "run",
                         side_effect=self._rng_abort_writer(attempts)), \
                     mock.patch.object(prefix, "stop_prefix_procs"), \
@@ -320,6 +354,89 @@ class PrefixShutdownTests(unittest.TestCase):
             messages = " ".join(call.args[0] for call in warn.call_args_list)
             self.assertIn("No verified cryptbase.dll", messages)
             self.assertIn("Install / Update", messages)
+
+    def test_rng_abort_on_a_user_supplied_prefix_names_the_manual_fix(self):
+        """A prefix or engine we refuse to seed cannot be repaired for the
+        user, so point at the file they have to place themselves rather than
+        at a download that would change nothing."""
+        with tempfile.TemporaryDirectory() as td:
+            pfx = Path(td) / "pfx"
+            attempts = []
+            with mock.patch.object(prefix, "LOGS", Path(td) / "logs"), \
+                    mock.patch(
+                        "bol.gpu_safety.require_safe_graphics_session"), \
+                    mock.patch.object(
+                        prefix, "proton_umu_cmd",
+                        return_value=(["umu", "wineboot"], {})), \
+                    mock.patch.object(
+                        prefix, "seed_managed_bootstrap_cryptbase",
+                        return_value=False), \
+                    mock.patch.object(
+                        prefix, "repair_bootstrap_cryptbase",
+                        return_value=False), \
+                    mock.patch.object(
+                        prefix, "managed_bootstrap_prefix",
+                        return_value=False), \
+                    mock.patch.object(
+                        prefix.subprocess, "run",
+                        side_effect=self._rng_abort_writer(attempts)), \
+                    mock.patch.object(prefix, "stop_prefix_procs"), \
+                    mock.patch.object(prefix, "warn") as warn:
+                self.assertFalse(prefix.boot_prefix(pfx))
+
+            messages = " ".join(call.args[0] for call in warn.call_args_list)
+            self.assertIn("user-supplied", messages)
+            self.assertIn("drive_c/windows/system32", messages)
+            self.assertNotIn("No verified cryptbase.dll", messages)
+
+    def test_wineboot_failure_names_the_rng_abort_that_caused_it(self):
+        """A bare "timed out" sent this failure's reporters chasing Wine
+        packages and file-descriptor limits; the abort has to be named."""
+        with tempfile.TemporaryDirectory() as td:
+            pfx = Path(td) / "pfx"
+            with mock.patch.object(prefix, "LOGS", Path(td) / "logs"), \
+                    mock.patch(
+                        "bol.gpu_safety.require_safe_graphics_session"), \
+                    mock.patch.object(
+                        prefix, "proton_umu_cmd",
+                        return_value=(["umu", "wineboot"], {})), \
+                    mock.patch.object(
+                        prefix, "seed_managed_bootstrap_cryptbase",
+                        return_value=True), \
+                    mock.patch.object(
+                        prefix, "repair_bootstrap_cryptbase",
+                        return_value=True), \
+                    mock.patch.object(
+                        prefix.subprocess, "run",
+                        side_effect=self._rng_abort_writer([])), \
+                    mock.patch.object(prefix, "stop_prefix_procs"), \
+                    mock.patch.object(prefix, "warn") as warn:
+                self.assertFalse(prefix.boot_prefix(pfx))
+
+            self.assertIn(
+                "advapi32.SystemFunction036", warn.call_args.args[0])
+
+    def test_unrelated_wineboot_failure_is_not_blamed_on_the_rng(self):
+        with tempfile.TemporaryDirectory() as td:
+            pfx = Path(td) / "pfx"
+            with mock.patch.object(prefix, "LOGS", Path(td) / "logs"), \
+                    mock.patch(
+                        "bol.gpu_safety.require_safe_graphics_session"), \
+                    mock.patch.object(
+                        prefix, "proton_umu_cmd",
+                        return_value=(["umu", "wineboot"], {})), \
+                    mock.patch.object(
+                        prefix, "seed_managed_bootstrap_cryptbase",
+                        return_value=True), \
+                    mock.patch.object(
+                        prefix.subprocess, "run",
+                        return_value=SimpleNamespace(returncode=3)), \
+                    mock.patch.object(prefix, "stop_prefix_procs"), \
+                    mock.patch.object(prefix, "warn") as warn:
+                self.assertFalse(prefix.boot_prefix(pfx))
+
+            self.assertNotIn(
+                "SystemFunction036", warn.call_args.args[0])
 
     def test_only_this_attempt_s_log_section_triggers_the_retry(self):
         with tempfile.TemporaryDirectory() as td:
@@ -415,6 +532,79 @@ class PrefixEnvironmentTests(unittest.TestCase):
 
             self.assertEqual(selected, root / "data/steamcompat")
             self.assertTrue(selected.is_dir())
+
+    @contextmanager
+    def _host(self, root):
+        """A non-Flatpak host whose home and data live under ``root``."""
+        exists = Path.exists
+
+        def not_sandboxed(path, *args, **kwargs):
+            if str(path) == "/.flatpak-info":
+                return False
+            return exists(path, *args, **kwargs)
+
+        with mock.patch.dict(prefix.os.environ, {}, clear=True), \
+                mock.patch.object(prefix, "HOME", root / "home"), \
+                mock.patch.object(prefix, "DATA", root / "data"), \
+                mock.patch.object(prefix.Path, "exists", autospec=True,
+                                  side_effect=not_sandboxed):
+            yield
+
+    def test_host_without_steam_never_creates_steam_directory(self):
+        # A real ~/.steam/steam directory is where Steam's bootstrapper has to
+        # put a symlink; making one broke every later Steam install (#265).
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "home").mkdir()
+            with self._host(root):
+                selected = prefix.steam_compat_dir()
+
+            self.assertEqual(selected, root / "data/steamcompat")
+            self.assertTrue(selected.is_dir())
+            self.assertFalse((root / "home/.steam").exists())
+
+    def test_empty_steam_directory_left_by_earlier_launchers_is_removed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "home/.steam/steam").mkdir(parents=True)
+            with self._host(root):
+                selected = prefix.steam_compat_dir()
+
+            self.assertEqual(selected, root / "data/steamcompat")
+            self.assertFalse((root / "home/.steam").exists())
+
+    def test_real_steam_installations_are_used_and_left_alone(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            data = root / "home/.local/share/Steam"
+            data.mkdir(parents=True)
+            (data / "steam.sh").write_text("#!/bin/sh\n")
+            linked = root / "home/.steam/steam"
+            linked.parent.mkdir(parents=True)
+            linked.symlink_to(data)
+            with self._host(root):
+                self.assertEqual(prefix.steam_compat_dir(), linked)
+            self.assertTrue(linked.is_symlink())
+
+            linked.unlink()
+            linked.mkdir()
+            (linked / "steam.sh").write_text("#!/bin/sh\n")
+            with self._host(root):
+                self.assertEqual(prefix.steam_compat_dir(), linked)
+            self.assertTrue((linked / "steam.sh").is_file())
+            self.assertFalse((root / "data/steamcompat").exists())
+
+    def test_uninstalled_steam_link_falls_back_without_touching_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            linked = root / "home/.steam/steam"
+            linked.parent.mkdir(parents=True)
+            linked.symlink_to(root / "home/.local/share/Steam")
+            with self._host(root):
+                selected = prefix.steam_compat_dir()
+
+            self.assertEqual(selected, root / "data/steamcompat")
+            self.assertTrue(linked.is_symlink())
 
     def test_headless_setup_forces_builtin_cryptbase(self):
         env = {
@@ -534,16 +724,22 @@ class PrefixEnvironmentTests(unittest.TestCase):
             self.assertEqual(list(external.iterdir()), [])
             install.assert_not_called()
 
-    def test_proton_umu_uses_neutral_gameid_without_rewriting_steam_identity(
+    def test_proton_umu_gameid_carries_the_inherited_steam_application_id(
             self):
+        # UMU rebuilds SteamAppId/SteamGameId inside the container from
+        # GAMEID, so its `umu-default` fallback turns a launch Steam started
+        # into the literal identity "default" (#199).
         cases = [
             ({"GAMEID": "umu-existing"}, "umu-existing"),
             ({"GAMEID": "17"}, "17"),
             ({"GAMEID": "0", "SteamAppId": "123",
               "SteamGameId": "456"}, "0"),
+            ({"SteamAppId": "2716672805",
+              "SteamGameId": "11668020851441139712"}, "umu-2716672805"),
             ({"SteamAppId": "invalid",
               "SteamGameId": "456"}, "umu-default"),
             ({"SteamAppId": "0", "SteamGameId": ""}, "umu-default"),
+            ({}, "umu-default"),
         ]
         for inherited, expected in cases:
             with self.subTest(inherited=inherited), \
@@ -979,6 +1175,97 @@ class ManagedRuntimeRefreshTests(unittest.TestCase):
                 (pfx / "drive_c/windows/system32/user32.dll").read_bytes(),
                 b"old-user32-64")
 
+    @staticmethod
+    def _wine_dll(mark, body):
+        """DLL bytes carrying Wine's own mark right after the DOS header."""
+        return b"MZ" + b"\0" * 0x3E + mark + b"\0" * 16 + body
+
+    def test_a_dll_the_engine_built_is_replaced_without_a_copy(self):
+        # Keeping one of these per engine update came to over a gigabyte of
+        # system32/syswow64 that nothing ever restored (#289).
+        with tempfile.TemporaryDirectory() as td:
+            engine, pfx = self._runtime_paths(Path(td))
+            sys32 = pfx / "drive_c/windows/system32"
+            (sys32 / "user32.dll").write_bytes(
+                self._wine_dll(b"Wine builtin DLL", b"old-user32"))
+            (sys32 / "ntdll.dll").write_bytes(
+                self._wine_dll(b"Wine placeholder DLL", b"old-ntdll"))
+            m = self._managed(engine, pfx)
+            with m[0], m[1], m[2], m[3], \
+                    mock.patch.object(prefix, "require_prefix_idle"), \
+                    mock.patch.object(prefix, "ok"):
+                self.assertTrue(prefix.refresh_managed_prefix_runtime(pfx))
+
+            self.assertEqual((sys32 / "user32.dll").read_bytes(),
+                             b"new-user32-64")
+            self.assertEqual((sys32 / "ntdll.dll").read_bytes(),
+                             b"new-ntdll-64")
+            self.assertEqual(list(sys32.glob("*.bol-runtime-backup")), [])
+            # Anything that did not come from an engine still gets its copy.
+            self.assertEqual(
+                (pfx / "drive_c/windows/syswow64/"
+                 "user32.dll.bol-runtime-backup").read_bytes(),
+                b"old-user32-32")
+
+    def test_old_copies_of_engine_dlls_are_pruned_and_others_kept(self):
+        with tempfile.TemporaryDirectory() as td:
+            engine, pfx = self._runtime_paths(
+                Path(td), marker_rev=prefix.WINEGDK_BUILD_REV)
+            sys32 = pfx / "drive_c/windows/system32"
+            wow = pfx / "drive_c/windows/syswow64"
+            builtin = self._wine_dll(b"Wine builtin DLL", b"x" * 1000)
+            placeholder = self._wine_dll(b"Wine placeholder DLL", b"stub")
+            (sys32 / "user32.dll.bol-runtime-backup").write_bytes(builtin)
+            (wow / "gdi32.dll.bol-runtime-backup").write_bytes(placeholder)
+            (sys32 / "d3d11.dll.bol-runtime-backup").write_bytes(
+                b"MZ dxvk d3d11")
+            (sys32 / "shell32.dll").write_bytes(builtin)
+            m = self._managed(engine, pfx)
+            with m[0], m[1], m[2], m[3], mock.patch.object(prefix, "info"):
+                freed = prefix.prune_engine_dll_backups(pfx)
+
+            self.assertEqual(freed, len(builtin) + len(placeholder))
+            self.assertFalse(
+                (sys32 / "user32.dll.bol-runtime-backup").exists())
+            self.assertFalse((wow / "gdi32.dll.bol-runtime-backup").exists())
+            self.assertEqual(
+                (sys32 / "d3d11.dll.bol-runtime-backup").read_bytes(),
+                b"MZ dxvk d3d11")
+            # Only the refresh's copies go, never a live DLL.
+            self.assertEqual((sys32 / "shell32.dll").read_bytes(), builtin)
+
+    def test_pruning_leaves_a_prefix_the_launcher_does_not_manage(self):
+        with tempfile.TemporaryDirectory() as td:
+            engine, pfx = self._runtime_paths(Path(td))
+            backup = (pfx / "drive_c/windows/system32/"
+                      "user32.dll.bol-runtime-backup")
+            backup.write_bytes(self._wine_dll(b"Wine builtin DLL", b"old"))
+            with mock.patch.dict(prefix.os.environ,
+                                 {"BOL_WINEPREFIX": str(pfx)}, clear=True), \
+                    mock.patch.object(prefix, "PFX", pfx), \
+                    mock.patch.object(prefix, "WINEGDK_OUT", engine), \
+                    mock.patch.object(prefix, "proton_path",
+                                      return_value=engine):
+                self.assertEqual(prefix.prune_engine_dll_backups(pfx), 0)
+            self.assertTrue(backup.exists())
+
+    def test_boot_prefix_prunes_even_when_the_engine_matches(self):
+        # The copies were left by an earlier release's refresh: a prefix whose
+        # engine is already current has to lose them too.
+        with tempfile.TemporaryDirectory() as td:
+            engine, pfx = self._runtime_paths(
+                Path(td), marker_rev=prefix.WINEGDK_BUILD_REV)
+            compat = Path(td) / "compatdata"
+            m = self._managed(engine, pfx)
+            with m[0], m[1], m[2], m[3], \
+                    mock.patch.object(prefix, "COMPAT", compat), \
+                    mock.patch.object(
+                        prefix, "repair_managed_prefix_user32"), \
+                    mock.patch.object(
+                        prefix, "prune_engine_dll_backups") as prune:
+                self.assertTrue(prefix.boot_prefix(pfx))
+            prune.assert_called_once_with(pfx)
+
     def test_engine_only_dlls_are_not_injected_into_prefix(self):
         # A DLL the engine ships but the prefix lacks is deliberately NOT
         # copied in: a prefix's system dir is the subset wineboot installed
@@ -1015,6 +1302,8 @@ class PrefixSetupTests(unittest.TestCase):
                 "proton_source": "proton",
             }
             with mock.patch.object(gamesetup, "mkdirs"), \
+                    mock.patch.object(gamesetup,
+                                      "prune_legacy_game_archives"), \
                     mock.patch.object(gamesetup, "load_settings",
                                       return_value=settings), \
                     mock.patch.object(gamesetup, "ensure_login_deps"), \
@@ -1096,6 +1385,112 @@ class PrefixOperationLockTests(unittest.TestCase):
                 prefix.reset_prefix()
 
             repaired.assert_not_called()
+
+    @contextmanager
+    def _repairing(self, root, compat):
+        with mock.patch.object(prefix, "DATA", root / "data"), \
+                mock.patch.object(prefix, "COMPAT", compat), \
+                mock.patch.object(prefix, "PFX", compat / "pfx"), \
+                mock.patch.object(
+                    prefix, "stop_prefix_procs", return_value=(0, 0)), \
+                mock.patch.object(prefix, "require_prefix_idle"), \
+                mock.patch.object(prefix, "warn"), \
+                mock.patch.object(prefix, "ok") as repaired:
+            yield repaired
+
+    @staticmethod
+    def _played_prefix(compat):
+        """A prefix that has run the game: Wine state plus the player's."""
+        pfx = compat / "pfx"
+        (pfx / "drive_c/windows/system32").mkdir(parents=True)
+        (pfx / "drive_c/windows/system32/user32.dll").write_bytes(b"stale")
+        (pfx / "system.reg").write_text("WINE REGISTRY Version 2\n")
+        roaming = pfx / "drive_c/users/steamuser/AppData/Roaming"
+        roaming.mkdir(parents=True)
+        # Proton links the Unix login name to steamuser in every prefix, so
+        # each folder below is also reachable a second time through it.
+        (pfx / "drive_c/users/player").symlink_to("steamuser")
+        world = (roaming / "Minecraft Bedrock/Users/1557/games/com.mojang/"
+                 "minecraftWorlds/abc=/level.dat")
+        world.parent.mkdir(parents=True)
+        world.write_bytes(b"my world")
+        options = (roaming / "Minecraft Bedrock Preview/Users/Shared/games/"
+                   "com.mojang/minecraftpe/options.txt")
+        options.parent.mkdir(parents=True)
+        options.write_text("gfx_viewdistance:320\n")
+        (roaming / "Microsoft/Crypto").mkdir(parents=True)
+        return pfx, world.relative_to(pfx), options.relative_to(pfx)
+
+    def test_repair_keeps_minecraft_worlds_and_settings(self):
+        # Repair deleted the whole compatibility tree, and the worlds with it,
+        # while its button promised they would be kept (#253).
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            compat = root / "compat"
+            pfx, world, options = self._played_prefix(compat)
+
+            with self._repairing(root, compat) as repaired:
+                prefix.reset_prefix()
+
+            self.assertEqual((pfx / world).read_bytes(), b"my world")
+            self.assertEqual((pfx / options).read_text(),
+                             "gfx_viewdistance:320\n")
+            self.assertFalse((pfx / "system.reg").exists())
+            self.assertFalse((pfx / "drive_c/windows").exists())
+            self.assertFalse(
+                (pfx / "drive_c/users/steamuser/AppData/Roaming/Microsoft")
+                .exists())
+            self.assertFalse(prefix.prefix_ready(pfx))
+            self.assertEqual(
+                sorted(path.name for path in root.iterdir()),
+                ["compat", "data"])
+            self.assertIn("worlds and settings were kept",
+                          repaired.call_args.args[0])
+
+    def test_a_folder_that_cannot_move_leaves_the_prefix_intact(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            compat = root / "compat"
+            pfx, world, options = self._played_prefix(compat)
+            rename = os.rename
+            calls = []
+
+            def fail_on_the_second_folder(source, target):
+                calls.append(source)
+                if len(calls) == 3:
+                    raise PermissionError("read-only world folder")
+                return rename(source, target)
+
+            with self._repairing(root, compat) as repaired, \
+                    mock.patch.object(prefix.os, "rename",
+                                      side_effect=fail_on_the_second_folder), \
+                    self.assertRaisesRegex(
+                        BolError, "before deleting anything"):
+                prefix.reset_prefix()
+
+            repaired.assert_not_called()
+            self.assertEqual((pfx / world).read_bytes(), b"my world")
+            self.assertTrue((pfx / options).is_file())
+            self.assertTrue((pfx / "system.reg").is_file())
+            self.assertEqual(
+                sorted(path.name for path in root.iterdir()),
+                ["compat", "data"])
+
+    def test_interrupted_repair_leftovers_are_cleared_but_worlds_are_not(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            compat = root / "compat"
+            compat.mkdir()
+            garbage = root / ".compatdata-repair-deleting"
+            (garbage / "pfx/drive_c/windows").mkdir(parents=True)
+            stranded = root / ".compatdata-repair-moving"
+            self._played_prefix(stranded)
+
+            with self._repairing(root, compat):
+                prefix.reset_prefix()
+
+            self.assertFalse(garbage.exists())
+            self.assertTrue(stranded.is_dir())
 
     def test_repair_unlinks_dangling_compat_symlink_without_following_it(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1297,5 +1692,425 @@ class PrefixOperationLockTests(unittest.TestCase):
                                 pass
 
 
+_OPTIONS_REL = ("drive_c/users/steamuser/AppData/Roaming/Minecraft Bedrock/"
+                "Users/%s/games/com.mojang/minecraftpe/options.txt")
+
+# A settings file shaped like Minecraft's own: CRLF terminators, and the keys
+# players report losing (#175) sitting in the tail where a cut-off write drops
+# them — graphics mode, tutorial flags, keyboard mappings.
+_OPTIONS_HEAD = b"gfx_viewdistance:96\r\naudio_main:1\r\n"
+_OPTIONS_TAIL = (b"graphics_mode:2\r\nhas_dismissed_new_player_flow:1\r\n"
+                 b"graphics_mode_switch:1\r\nkeyboard_type_0_key.jump:32\r\n")
+_OPTIONS_FULL = _OPTIONS_HEAD + _OPTIONS_TAIL
+
+
+def _write_options(root, body, user="Shared"):
+    """One options.txt inside a prefix tree, as the game would leave it."""
+    path = Path(root) / (_OPTIONS_REL % user)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(body)
+    return path
+
+
+class GameOptionsTruncationTests(unittest.TestCase):
+    """The settings file must survive a save the game never finished (#175)."""
+
+    def test_a_write_cut_off_mid_line_is_not_mistaken_for_a_finished_save(self):
+        self.assertTrue(prefix._options_intact(_OPTIONS_FULL))
+        # Cut where a buffered write would stop: mid-line, no terminator.
+        self.assertFalse(prefix._options_intact(_OPTIONS_HEAD + b"graphics_mo"))
+        self.assertFalse(prefix._options_intact(b""))
+        self.assertFalse(prefix._options_intact(None))
+        # Terminated but holding nothing parseable is not a copy worth keeping.
+        self.assertFalse(prefix._options_intact(b"\r\n"))
+
+    def test_a_truncated_settings_file_is_restored_after_the_game_exits(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_options(td, _OPTIONS_FULL)
+            self.assertEqual(prefix.snapshot_game_options(td), 1)
+            # The game crashes part-way through rewriting it.
+            path.write_bytes(_OPTIONS_HEAD + b"graphics_mo")
+            restored = prefix.restore_truncated_game_options(
+                td, prefix_idle=True)
+            self.assertEqual(restored, [path])
+            self.assertEqual(path.read_bytes(), _OPTIONS_FULL)
+
+    def test_a_settings_file_the_game_finished_writing_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_options(td, _OPTIONS_FULL)
+            prefix.snapshot_game_options(td)
+            changed = _OPTIONS_HEAD + b"graphics_mode:0\r\n"
+            path.write_bytes(changed)
+            self.assertEqual(
+                prefix.restore_truncated_game_options(td, prefix_idle=True), [])
+            self.assertEqual(path.read_bytes(), changed)
+
+    def test_a_torn_file_never_overwrites_the_copy_that_could_repair_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_options(td, _OPTIONS_FULL)
+            prefix.snapshot_game_options(td)
+            path.write_bytes(_OPTIONS_HEAD + b"graphics_mo")
+            # A second launch must not snapshot the wreckage over the copy.
+            prefix.snapshot_game_options(td)
+            prefix.restore_truncated_game_options(td, prefix_idle=True)
+            self.assertEqual(path.read_bytes(), _OPTIONS_FULL)
+
+    def test_nothing_is_rewritten_while_the_game_may_still_be_saving(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_options(td, _OPTIONS_FULL)
+            prefix.snapshot_game_options(td)
+            torn = _OPTIONS_HEAD + b"graphics_mo"
+            path.write_bytes(torn)
+            self.assertEqual(
+                prefix.restore_truncated_game_options(td, prefix_idle=False),
+                [])
+            self.assertEqual(path.read_bytes(), torn)
+
+    def test_every_account_settings_file_is_guarded_not_only_the_newest(self):
+        with tempfile.TemporaryDirectory() as td:
+            shared = _write_options(td, _OPTIONS_FULL)
+            signed_in = _write_options(td, _OPTIONS_FULL, user="2533274")
+            self.assertEqual(prefix.snapshot_game_options(td), 2)
+            for path in (shared, signed_in):
+                path.write_bytes(_OPTIONS_HEAD + b"graphics_mo")
+            prefix.restore_truncated_game_options(td, prefix_idle=True)
+            self.assertEqual(shared.read_bytes(), _OPTIONS_FULL)
+            self.assertEqual(signed_in.read_bytes(), _OPTIONS_FULL)
+
+
+class MultiplayerWarningPatchTests(unittest.TestCase):
+    """Patching one setting must not rewrite the rest of the file (#175)."""
+
+    @contextmanager
+    def _prefix_with(self, body):
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_options(td, body)
+            with mock.patch.object(prefix, "PFX", Path(td)), \
+                    mock.patch.object(prefix, "ok"):
+                yield path
+
+    def test_only_the_patched_line_changes_and_crlf_survives(self):
+        body = (_OPTIONS_HEAD + prefix._MULTIPLAYER_WARNING_KEY + b":0\r\n"
+                + _OPTIONS_TAIL)
+        with self._prefix_with(body) as path:
+            prefix.patch_options(prefix_idle=True)
+            self.assertEqual(
+                path.read_bytes(),
+                body.replace(b"safety_warning:0", b"safety_warning:1"))
+
+    def test_a_line_the_launcher_cannot_parse_is_carried_over_untouched(self):
+        body = _OPTIONS_HEAD + b"a comment with no separator\r\n" + _OPTIONS_TAIL
+        with self._prefix_with(body) as path:
+            prefix.patch_options(prefix_idle=True)
+            written = path.read_bytes()
+            self.assertIn(b"a comment with no separator\r\n", written)
+            self.assertTrue(written.startswith(body))
+            self.assertTrue(written.endswith(
+                b"do_not_show_multiplayer_online_safety_warning:1\r\n"))
+
+    def test_a_truncated_file_is_never_completed_by_the_patch(self):
+        torn = _OPTIONS_HEAD + b"graphics_mo"
+        with self._prefix_with(torn) as path:
+            prefix.patch_options(prefix_idle=True)
+            self.assertEqual(path.read_bytes(), torn)
+
+    def test_a_signed_in_account_and_preview_are_patched_too(self):
+        body = _OPTIONS_HEAD + _OPTIONS_TAIL
+        with self._prefix_with(body) as shared:
+            root = Path(str(shared).split("/drive_c/")[0])
+            account = _write_options(root, body, user="2533274")
+            preview = root / (_OPTIONS_REL.replace(
+                "/Minecraft Bedrock/", "/Minecraft Bedrock Preview/")
+                % "2533274")
+            preview.parent.mkdir(parents=True)
+            preview.write_bytes(body)
+            prefix.patch_options(prefix_idle=True)
+            for path in (shared, account, preview):
+                self.assertTrue(path.read_bytes().endswith(
+                    b"do_not_show_multiplayer_online_safety_warning:1\r\n"),
+                    path)
+
+    def test_the_patch_waits_for_the_game_to_be_gone(self):
+        body = _OPTIONS_HEAD + _OPTIONS_TAIL
+        with self._prefix_with(body) as path:
+            prefix.patch_options(prefix_idle=False)
+            self.assertEqual(path.read_bytes(), body)
+
+
+class GameFrameLimitHandoverTests(unittest.TestCase):
+    """The player's Max Framerate is set aside for a session, never lost.
+
+    Minecraft's own limiter spins in Wine's message pump (#173), so the
+    launcher holds the same rate through vkd3d-proton and switches the game's
+    off for the session — and then has to give the player back exactly the
+    value they had, whatever happened in between.
+    """
+
+    _LIMITED = _OPTIONS_HEAD + b"gfx_max_framerate:60\r\n" + _OPTIONS_TAIL
+    _UNLIMITED = _OPTIONS_HEAD + b"gfx_max_framerate:0\r\n" + _OPTIONS_TAIL
+
+    def _sidecar(self, path):
+        return path.with_name(path.name + prefix.FRAME_LIMIT_SUFFIX)
+
+    def test_the_limit_is_set_aside_and_only_its_line_changes(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_options(td, self._LIMITED)
+            self.assertEqual(
+                prefix.set_aside_game_frame_limit(path, prefix_idle=True), 60)
+            # CRLF, key order and every other line are the game's own.
+            self.assertEqual(path.read_bytes(), self._UNLIMITED)
+            self.assertEqual(self._sidecar(path).read_bytes(), b"60\n")
+
+    def test_the_value_comes_back_once_the_game_has_exited(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_options(td, self._LIMITED)
+            prefix.set_aside_game_frame_limit(path, prefix_idle=True)
+            restored = prefix.restore_game_frame_limits(td, prefix_idle=True)
+            self.assertEqual(restored, [path])
+            self.assertEqual(path.read_bytes(), self._LIMITED)
+            self.assertFalse(self._sidecar(path).exists())
+
+    def test_a_limit_chosen_in_game_during_the_session_is_kept(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_options(td, self._LIMITED)
+            prefix.set_aside_game_frame_limit(path, prefix_idle=True)
+            # The player moved the slider to 90 while playing.
+            chosen = self._LIMITED.replace(b"framerate:60", b"framerate:90")
+            path.write_bytes(chosen)
+            self.assertEqual(
+                prefix.restore_game_frame_limits(td, prefix_idle=True), [])
+            self.assertEqual(path.read_bytes(), chosen)
+            self.assertFalse(self._sidecar(path).exists())
+
+    def test_nothing_is_put_back_while_the_game_may_still_be_saving(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_options(td, self._LIMITED)
+            prefix.set_aside_game_frame_limit(path, prefix_idle=True)
+            self.assertEqual(
+                prefix.restore_game_frame_limits(td, prefix_idle=False), [])
+            self.assertEqual(path.read_bytes(), self._UNLIMITED)
+            # The value waits for the next exit instead of being dropped.
+            self.assertTrue(self._sidecar(path).exists())
+
+    def test_a_session_that_never_finished_still_counts_the_players_limit(self):
+        # The launcher was killed with the game running: the file still
+        # reads Unlimited and the value is still beside it.
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_options(td, self._LIMITED)
+            prefix.set_aside_game_frame_limit(path, prefix_idle=True)
+            self.assertEqual(prefix.game_frame_limit(path), 60)
+            # The next launch finds nothing left to write, and the limit.
+            self.assertEqual(
+                prefix.set_aside_game_frame_limit(path, prefix_idle=True), 60)
+            self.assertEqual(path.read_bytes(), self._UNLIMITED)
+            prefix.restore_game_frame_limits(td, prefix_idle=True)
+            self.assertEqual(path.read_bytes(), self._LIMITED)
+
+    def test_an_unlimited_player_is_neither_limited_nor_written(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_options(td, self._UNLIMITED)
+            self.assertIsNone(prefix.game_frame_limit(path))
+            self.assertIsNone(
+                prefix.set_aside_game_frame_limit(path, prefix_idle=True))
+            self.assertEqual(path.read_bytes(), self._UNLIMITED)
+            self.assertFalse(self._sidecar(path).exists())
+
+    def test_a_torn_file_is_never_completed_by_the_handover(self):
+        torn = self._LIMITED[:-7]
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_options(td, torn)
+            self.assertIsNone(
+                prefix.set_aside_game_frame_limit(path, prefix_idle=True))
+            self.assertEqual(path.read_bytes(), torn)
+
+    def test_nothing_is_set_aside_while_the_prefix_is_in_use(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_options(td, self._LIMITED)
+            self.assertIsNone(
+                prefix.set_aside_game_frame_limit(path, prefix_idle=False))
+            self.assertEqual(path.read_bytes(), self._LIMITED)
+            self.assertFalse(self._sidecar(path).exists())
+
+    def test_a_failed_write_leaves_the_game_pacing_itself(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_options(td, self._LIMITED)
+            real_write = prefix._write_file_atomically
+
+            def fail_on_options(target, data):
+                if target == path:
+                    return False
+                return real_write(target, data)
+
+            with mock.patch.object(prefix, "_write_file_atomically",
+                                   side_effect=fail_on_options):
+                self.assertIsNone(
+                    prefix.set_aside_game_frame_limit(path, prefix_idle=True))
+            self.assertEqual(path.read_bytes(), self._LIMITED)
+            # No orphan value that a later exit could write over a new one.
+            self.assertFalse(self._sidecar(path).exists())
+
+    def test_a_sidecar_holding_no_limit_is_cleared_not_applied(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_options(td, self._UNLIMITED)
+            self._sidecar(path).write_bytes(b"not a number\n")
+            self.assertIsNone(prefix.game_frame_limit(path))
+            self.assertEqual(
+                prefix.restore_game_frame_limits(td, prefix_idle=True), [])
+            self.assertEqual(path.read_bytes(), self._UNLIMITED)
+            self.assertFalse(self._sidecar(path).exists())
+
+    def test_the_proton_login_symlink_puts_the_value_back_once(self):
+        # Proton links drive_c/users/<login> to steamuser, so a users/* glob
+        # crosses every settings file twice; the lookup keeps one, and the
+        # value goes back exactly once.
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_options(td, self._LIMITED)
+            (Path(td) / "drive_c/users/user").symlink_to("steamuser")
+            self.assertEqual(len(prefix._options_files(td)), 1)
+            prefix.set_aside_game_frame_limit(path, prefix_idle=True)
+            restored = prefix.restore_game_frame_limits(td, prefix_idle=True)
+            self.assertEqual(len(restored), 1)
+            self.assertEqual(path.read_bytes(), self._LIMITED)
+            self.assertFalse(self._sidecar(path).exists())
+
+    def test_every_account_gets_its_own_value_back(self):
+        with tempfile.TemporaryDirectory() as td:
+            shared = _write_options(td, self._LIMITED)
+            signed_in = _write_options(
+                td, self._LIMITED.replace(b"framerate:60", b"framerate:30"),
+                user="2533274")
+            prefix.set_aside_game_frame_limit(shared, prefix_idle=True)
+            prefix.set_aside_game_frame_limit(signed_in, prefix_idle=True)
+            prefix.restore_game_frame_limits(td, prefix_idle=True)
+            self.assertIn(b"gfx_max_framerate:60\r\n", shared.read_bytes())
+            self.assertIn(b"gfx_max_framerate:30\r\n", signed_in.read_bytes())
+
+
+_SERVERS_REL = ("drive_c/users/steamuser/AppData/Roaming/Minecraft Bedrock/"
+                "Users/%s/games/com.mojang/minecraftpe/external_servers.txt")
+
+# A server list shaped like the game's own: "<id>:<name>:<host>:<port>:<added>"
+# lines, in the order the player last left them rather than by id.
+_SERVERS_LIST = (b"2:zeqa:zeqa.net:19132:1771420844\n"
+                 b"1:my server:192.0.2.10:19133:1771420828\n")
+
+_DEFAULT = (("Linesia SkyFaction", "play.linesia.net", 19132),)
+
+
+def _write_servers(root, body, user="Shared"):
+    """One external_servers.txt inside a prefix tree, as the game leaves it."""
+    path = Path(root) / (_SERVERS_REL % user)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(body)
+    return path
+
+
+def _server_names(path):
+    return [line.split(":")[1]
+            for line in path.read_text().splitlines() if line]
+
+
+class DefaultServersTests(unittest.TestCase):
+    """A shipped server may only ever be added to a list the player owns."""
+
+    @contextmanager
+    def _quiet(self):
+        with mock.patch.object(prefix, "ok"):
+            yield
+
+    def test_the_default_is_appended_with_the_next_free_id(self):
+        with tempfile.TemporaryDirectory() as td, self._quiet():
+            path = _write_servers(td, _SERVERS_LIST)
+            added = prefix.seed_default_servers(
+                td, prefix_idle=True, servers=_DEFAULT)
+            self.assertEqual(added, ["Linesia SkyFaction"])
+            written = path.read_text()
+            self.assertTrue(written.startswith(_SERVERS_LIST.decode()))
+            entry = written.splitlines()[-1].split(":")
+            self.assertEqual(entry[:4],
+                             ["3", "Linesia SkyFaction", "play.linesia.net",
+                              "19132"])
+            self.assertTrue(entry[4].isdigit())
+
+    def test_a_default_the_player_deleted_is_never_added_again(self):
+        with tempfile.TemporaryDirectory() as td, self._quiet():
+            path = _write_servers(td, _SERVERS_LIST)
+            prefix.seed_default_servers(td, prefix_idle=True, servers=_DEFAULT)
+            # The player removes the tile in-game: the game rewrites the file.
+            path.write_bytes(_SERVERS_LIST)
+            self.assertEqual(
+                prefix.seed_default_servers(
+                    td, prefix_idle=True, servers=_DEFAULT),
+                [])
+            self.assertEqual(path.read_bytes(), _SERVERS_LIST)
+
+    def test_a_server_the_player_already_added_keeps_their_own_name(self):
+        with tempfile.TemporaryDirectory() as td, self._quiet():
+            mine = b"1:linesia:play.linesia.net:19132:1771420828\n"
+            path = _write_servers(td, mine)
+            self.assertEqual(
+                prefix.seed_default_servers(
+                    td, prefix_idle=True, servers=_DEFAULT),
+                [])
+            self.assertEqual(path.read_bytes(), mine)
+            # And having seen it counts as offered: it must not come back if
+            # the player later deletes their own entry.
+            path.write_bytes(b"")
+            prefix.seed_default_servers(td, prefix_idle=True, servers=_DEFAULT)
+            self.assertEqual(path.read_bytes(), b"")
+
+    def test_every_account_gets_the_default_not_only_the_newest(self):
+        with tempfile.TemporaryDirectory() as td, self._quiet():
+            shared = _write_servers(td, _SERVERS_LIST)
+            signed_in = _write_servers(td, b"", user="2533274")
+            prefix.seed_default_servers(td, prefix_idle=True, servers=_DEFAULT)
+            for path in (shared, signed_in):
+                self.assertIn("Linesia SkyFaction", _server_names(path))
+
+    def test_nothing_is_written_while_the_game_may_still_be_running(self):
+        with tempfile.TemporaryDirectory() as td, self._quiet():
+            path = _write_servers(td, _SERVERS_LIST)
+            self.assertEqual(
+                prefix.seed_default_servers(
+                    td, prefix_idle=False, servers=_DEFAULT),
+                [])
+            self.assertEqual(path.read_bytes(), _SERVERS_LIST)
+
+    def test_a_list_left_without_a_terminator_does_not_swallow_the_entry(self):
+        with tempfile.TemporaryDirectory() as td, self._quiet():
+            path = _write_servers(td, b"1:zeqa:zeqa.net:19132:1771420844")
+            prefix.seed_default_servers(td, prefix_idle=True, servers=_DEFAULT)
+            self.assertEqual(_server_names(path),
+                             ["zeqa", "Linesia SkyFaction"])
+
+    def test_before_the_first_launch_the_signed_out_list_is_created(self):
+        with tempfile.TemporaryDirectory() as td, self._quiet():
+            prefix.seed_default_servers(td, prefix_idle=True, servers=_DEFAULT)
+            path = Path(td) / (_SERVERS_REL % "Shared")
+            self.assertEqual(_server_names(path), ["Linesia SkyFaction"])
+
+    def test_the_shipped_default_is_the_one_the_servers_tab_shows(self):
+        self.assertIn(("Linesia SkyFaction", "play.linesia.net", 19132),
+                      prefix.DEFAULT_SERVERS)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class BootFailureMessageTests(unittest.TestCase):
+    def test_names_the_cause_the_log_tail_and_what_to_send(self):
+        with tempfile.TemporaryDirectory() as td:
+            logs = Path(td)
+            (logs / "native-login.log").write_text(
+                "noise\nerr:module:import_dll Library foo.dll not found\n"
+                "\nBedrockOnLinux: wineboot timed out after 180 seconds.\n")
+            with mock.patch.object(prefix, "LOGS", logs), \
+                    mock.patch.object(prefix, "LAST_BOOT_PROBLEM",
+                                      "wineboot timed out after 180 seconds."):
+                said = prefix.boot_failure_message("Minecraft was not started")
+        self.assertIn("so Minecraft was not started.", said)
+        self.assertIn("timed out after 180 seconds", said)
+        self.assertIn("foo.dll not found", said)
+        self.assertEqual(said.count("timed out"), 1)
+        self.assertIn("Report a problem", said)

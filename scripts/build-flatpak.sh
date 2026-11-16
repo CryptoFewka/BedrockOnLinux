@@ -19,6 +19,11 @@ APPID="io.github.wyze3306.BedrockOnLinux"
 MANIFEST="$SRC/flatpak/$APPID.yml"
 DEV_MANIFEST="$SRC/flatpak/.$APPID.resolved.yml"   # same dir → ../ paths resolve
 RTVER="$(grep -m1 'runtime-version:' "$MANIFEST" | tr -d "'\" " | cut -d: -f2)"
+# Read the runtime and SDK names too: hardcoding them meant a manifest that
+# moved to another runtime still pre-installed the old one, and the builder
+# silently fetched the right pair afterwards on a slower path.
+RTNAME="$(grep -m1 '^runtime:' "$MANIFEST" | tr -d "'\" " | cut -d: -f2)"
+SDKNAME="$(grep -m1 '^sdk:' "$MANIFEST" | tr -d "'\" " | cut -d: -f2)"
 OUT="$SRC/dist"
 WORK="$OUT/flatpak-build"
 BUNDLE="$OUT/BedrockOnLinux-${VER}-x86_64.flatpak"
@@ -189,7 +194,7 @@ mkdir -p "$WORK"
 flatpak remote-add --user --if-not-exists flathub \
   https://flathub.org/repo/flathub.flatpakrepo 2>/dev/null || true
 flatpak install -y --user --noninteractive flathub \
-  org.freedesktop.Platform//"$RTVER" org.freedesktop.Sdk//"$RTVER" 2>/dev/null || \
+  "$RTNAME//$RTVER" "$SDKNAME//$RTVER" 2>/dev/null || \
   echo "  (runtime/SDK pre-install skipped — the builder will fetch them)"
 
 # The checkout may live on eCryptfs or another FUSE-backed home directory.

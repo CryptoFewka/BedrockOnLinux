@@ -1,0 +1,127 @@
+From cd70eb3d41ba1d4d0f77b3b0464c127256ac13aa Mon Sep 17 00:00:00 2001
+From: Wyze3306 <contact.wyze3306@gmail.com>
+Date: Sun, 23 Aug 2026 17:56:22 +0200
+Subject: [PATCH 1/5] msixvc: only count cache bytes that are on disk
+
+PrefixCacheFile writes the package prefix through one tokio File and reads it
+back through a second handle on the same path. tokio performs a file write on
+a blocking thread and reports it accepted as soon as it has been queued, so
+`cached_len += written` in poll_flush_pending_chunk counts bytes that are not
+in the file yet. A read dispatched to the same pool can overtake that write,
+find the file short of `cached_len`, and report it as a corrupt package:
+
+    Header(Io(Custom { kind: UnexpectedEof,
+                       error: "cache ended before cached_len" }))
+
+which aborts the whole download. Measured over a 4 MiB body on an idle disk
+with room to spare, the cache claimed up to 17 KiB more than the file held.
+
+Wait for the flush that performs the write before counting the bytes, so
+`cached_len` only ever describes what a second handle can read. This also
+moves a write refused for want of space onto the write itself, where it says
+so, instead of onto the read it would otherwise cut short.
+---
+ crates/msixvc/src/streaming.rs | 66 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 64 insertions(+), 2 deletions(-)
+
+diff --git a/crates/msixvc/src/streaming.rs b/crates/msixvc/src/streaming.rs
+index 824f9c2..3e11325 100644
+--- a/crates/msixvc/src/streaming.rs
++++ b/crates/msixvc/src/streaming.rs
+@@ -210,6 +210,15 @@ enum CacheWriteState {
+     Idle,
+     Seeking { offset: u64 },
+     Writing,
++    // A write that tokio has accepted but not yet performed. tokio's File
++    // copies into its own buffer and runs the write on a blocking thread, so
++    // poll_write returns Ok(n) while the bytes are still in flight: counting
++    // them as cached there lets a read from cache_reader -- a second handle
++    // on the same path, whose read is dispatched to the same pool -- reach
++    // past the end of the file and come back empty ("cache ended before
++    // cached_len"). The bytes are only cached once the flush that performs
++    // that write has completed.
++    Flushing { written: u64 },
+ }
+ 
+ pub struct PrefixCacheFile<R> {
+@@ -399,15 +408,33 @@ where
+                         }
+                         Poll::Ready(Ok(written)) => {
+                             self.pending_chunk_offset += written;
+-                            self.cached_len += written as u64;
+                             self.cache_write_pos += written as u64;
++                            self.cache_write_state = CacheWriteState::Flushing {
++                                written: written as u64,
++                            };
++                        }
++                        Poll::Ready(Err(err)) => {
++                            self.cache_write_state = CacheWriteState::Idle;
++                            return Poll::Ready(Err(err));
++                        }
++                    }
++                }
++                CacheWriteState::Flushing { written } => {
++                    match AsyncWrite::poll_flush(Pin::new(&mut self.cache_writer), cx) {
++                        Poll::Pending => return Poll::Pending,
++                        Poll::Ready(Ok(())) => {
++                            // On disk now, so cache_reader can see it.
++                            self.cached_len += written;
+                             if self.pending_chunk_offset >= chunk.len() {
+                                 self.pending_chunk = None;
+                                 self.pending_chunk_offset = 0;
+-                                self.cache_write_state = CacheWriteState::Idle;
+                             }
++                            self.cache_write_state = CacheWriteState::Idle;
+                             return Poll::Ready(Ok(()));
+                         }
++                        // A write refused for want of space fails here rather
++                        // than at the read it would otherwise cut short, so a
++                        // full disk says so in its own words.
+                         Poll::Ready(Err(err)) => {
+                             self.cache_write_state = CacheWriteState::Idle;
+                             return Poll::Ready(Err(err));
+@@ -855,6 +882,41 @@ mod tests {
+         let _ = std::fs::remove_file(cache);
+     }
+ 
++    #[tokio::test]
++    async fn cached_prefix_never_reads_past_what_is_on_disk() {
++        // tokio performs a File write on a blocking thread and reports it
++        // accepted before it has happened, so counting those bytes as cached
++        // lets the read side -- a second handle whose read is dispatched to
++        // the same pool -- ask for bytes the file does not hold yet and get
++        // UnexpectedEof ("cache ended before cached_len"). It is a race, so
++        // this reads a body long enough to cross the boundary many times and
++        // checks the invariant the reader relies on after every step.
++        let body: Vec<u8> = (0..(4 * 1024 * 1024)).map(|i| (i % 251) as u8).collect();
++        let server = spawn_server(body.clone(), None, 0).await.unwrap();
++        let cache = cache_path("write-visible");
++        let mut file = open_cached_reader(&server, &cache).await;
++
++        let mut buf = [0u8; 512];
++        let mut read = 0usize;
++        // The tail of the last upstream chunk is a separate matter; this is
++        // about what the cache reports as cached while a write is in flight.
++        let end = body.len() - 64 * 1024;
++        while read < end {
++            let want = buf.len().min(end - read);
++            file.read_exact(&mut buf[..want]).await.unwrap();
++            assert_eq!(&buf[..want], &body[read..read + want]);
++            let on_disk = std::fs::metadata(&cache).unwrap().len();
++            assert!(
++                on_disk >= file.cached_len(),
++                "cache counts {} bytes but only {on_disk} are on disk",
++                file.cached_len(),
++            );
++            read += want;
++        }
++
++        let _ = std::fs::remove_file(cache);
++    }
++
+     #[tokio::test]
+     async fn cached_backward_seek_uses_prefix() {
+         let body = test_body();
+-- 
+2.47.3
+
