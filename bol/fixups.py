@@ -16,8 +16,10 @@ from .config import (
     CACERT_URL,
     CACHE,
     GDK_DEPS_DLLS,
+    GDK_DEPS_SHA256,
     GDK_DEPS_URL,
     MINGW_CURL,
+    MINGW_CURL_SHA256,
     OPENSSL_XCURL_ARCHIVE_SHA256,
     OPENSSL_XCURL_REV,
     OPENSSL_XCURL_SET,
@@ -28,24 +30,100 @@ from .pe import apply_patch
 from .prefix import active_prefix
 from .util import asset_url, download, gh_releases, run
 
+# Where distributions keep the same Mozilla roots curl.se publishes: Debian
+# and Arch, Fedora, openSUSE, then the generic names.
+_SYSTEM_CA_BUNDLES = (
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    "/etc/ssl/ca-bundle.pem",
+    "/var/lib/ca-certificates/ca-bundle.pem",
+    "/etc/ssl/cert.pem",
+)
+
+
+def _system_ca_bundle():
+    """A PEM bundle of root certificates already on this machine, or None."""
+    candidates = list(_SYSTEM_CA_BUNDLES)
+    try:
+        import ssl
+        candidates.insert(0, ssl.get_default_verify_paths().cafile)
+    except Exception:
+        pass
+    try:
+        import certifi
+        candidates.append(certifi.where())
+    except Exception:
+        pass
+    for path in candidates:
+        try:
+            path = Path(path) if path else None
+            # Real bundles hold over a hundred roots; a stub of a few hundred
+            # bytes would leave the game unable to reach anything.
+            if path and path.is_file() and path.stat().st_size > 50_000 \
+                    and b"BEGIN CERTIFICATE" in path.read_bytes()[:200_000]:
+                return path
+        except OSError:
+            continue
+    return None
+
+
+def _ca_bundle():
+    """The CA bundle to give the game: curl.se's, else this machine's (#374).
+
+    curl.se is out of reach from some networks ("Connection reset by peer"
+    after every attempt), and that used to end the launch. The system's
+    bundle carries the same roots, so it stands in; it is not written to the
+    cache, so the download is tried again next time.
+    """
+    cacert = CACHE / "cacert.pem"
+    if cacert.exists():
+        return cacert
+    try:
+        download(CACERT_URL, cacert, "SSL certificates")
+        return cacert
+    except Exception as exc:
+        cacert.unlink(missing_ok=True)
+        fallback = _system_ca_bundle()
+        if fallback is None:
+            raise
+        warn(f"The certificate bundle could not be downloaded ({exc}); "
+             f"using this system's ({fallback}).")
+        return fallback
+
+
+def install_ca_bundle(game_dir: Path):
+    """The CA bundle GDK-Proton looks for beside a game, at
+    etc/ssl/certs/ca-bundle.crt. Only a file of certificates: unlike the
+    libcurl swap below it changes nothing the game ships, so every title of
+    the family gets it."""
+    game_dir = Path(game_dir)
+    cacert = _ca_bundle()
+    for base in (game_dir, game_dir.parent):
+        crt = base / "etc" / "ssl" / "certs" / "ca-bundle.crt"
+        crt.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(cacert, crt)
+
+
 def fix_curl_ssl(game_dir: Path):
     """GDK's XCurl.dll is broken under Wine — swap in MinGW libcurl — and
     GDK-Proton requires a CA bundle at etc/ssl/certs/ca-bundle.crt next to
     the game, else every TLS call (Xbox/online) fails and the server join
     hangs forever. Cert step runs every time (idempotent)."""
-    cacert = CACHE / "cacert.pem"
-    if not cacert.exists():
-        download(CACERT_URL, cacert, "certificats SSL")
-    for base in (game_dir, game_dir.parent):
-        crt = base / "etc" / "ssl" / "certs" / "ca-bundle.crt"
-        crt.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(cacert, crt)
+    install_ca_bundle(game_dir)
     if (game_dir / "XCurl.dll.bol-orig").exists():
         return
     info("Installing libcurl + certificates …")
     pkg = CACHE / "mingw-curl.pkg.tar.zst"
-    if not pkg.exists():
+    if not _sha256_matches(pkg, MINGW_CURL_SHA256):
+        pkg.unlink(missing_ok=True)
         download(MINGW_CURL, pkg, "libcurl")
+        if not _sha256_matches(pkg, MINGW_CURL_SHA256):
+            pkg.unlink(missing_ok=True)
+            raise BolError(
+                "The downloaded MinGW libcurl package is not the reviewed "
+                "build the launcher installs, so it was not put into the "
+                "game. Try again later, and report it if it persists.")
     ex = CACHE / "mingw-curl"
     ex.mkdir(exist_ok=True)
     try:
@@ -61,6 +139,13 @@ def fix_curl_ssl(game_dir: Path):
     ok("libcurl ready")
 
 
+def _sha256_matches(path: Path, expected: str) -> bool:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest() == expected
+    except OSError:
+        return False
+
+
 def install_gdk_xbox_dlls(game_dir: Path):
     """Drop the OSS GDK Xbox-Live DLLs into the game folder
     (libHttpClient.GDK.dll, XCurl.dll), backing up originals. The XCurl
@@ -72,8 +157,15 @@ def install_gdk_xbox_dlls(game_dir: Path):
         if bak.exists():
             continue
         cached = CACHE / ("gdkdeps-" + nm)
-        if not cached.exists():
+        if not _sha256_matches(cached, GDK_DEPS_SHA256[nm]):
+            cached.unlink(missing_ok=True)
             download(f"{GDK_DEPS_URL}/{nm}", cached, nm)
+            if not _sha256_matches(cached, GDK_DEPS_SHA256[nm]):
+                cached.unlink(missing_ok=True)
+                raise BolError(
+                    f"The downloaded {nm} is not the reviewed build the "
+                    "launcher installs, so it was not put into the game. "
+                    "Try again later, and report it if it persists.")
         if dst.exists():
             shutil.copy2(dst, bak)
         shutil.copy2(cached, dst)
@@ -83,66 +175,288 @@ def install_gdk_xbox_dlls(game_dir: Path):
     _patch_hbui_signin_gate(game_dir)
 
 
-def _patch_hbui_signin_gate(game_dir: Path):
-    """Bypass HBUI's 'You need a Microsoft account' banner that blocks the
-    Servers tab: its derived facet (wB() in the minified JS bundle) reports
-    not-signed-in because XSAPI never completes init under Wine, even though
-    the SISU/PlayFab auth works. An early `return ""` makes every consumer
-    fall through to `default: return null`. Idempotent; skips silently when
-    a Minecraft update rebundles the JS (pattern must then be re-found).
+# Both HBUI patches below are anchored on text a Minecraft build cannot rename
+# -- facet property names, the states they derive and the sign-in source --
+# with every minified identifier matched as \w+ instead. Anchoring them on the
+# minified names themselves is what silently retired both: the needles written
+# for 1.1.0 stopped matching once the UI was rebundled (the module alias moved
+# from `l.` to `r.` and every local name changed with it), and because the
+# patch skipped quietly, setup kept reporting success while the Servers tab
+# stayed blocked and the dead in-game "Sign in" link came back (#227/#228/#229).
+# 1.26.60 went further: its bundler calls the imported hooks directly, so
+# `(0,r.useFacetMap)(` became `k(`, and it drops the parentheses around a
+# lone arrow function, so `(0,t.useCallback)((()=>{...}),[...])` lost a `)`.
+_HBUI_FACET_MAP = r'(?:\(0,\w+\.useFacetMap\)|\s[\w$]+)\('
+_HBUI_GATE = re.compile(r'(function\s+\w+\(\)\{)(return' + _HBUI_FACET_MAP + ')')
+# The facet wanted is the one deriving the Play screen's guest/sign-in state,
+# recognised by what it reads out of the account facet and by the states it
+# returns -- none of which minification touches.
+_HBUI_GATE_MARKS = (
+    "isSignedInPlatformNetwork",
+    "isLoggedInWithMicrosoftAccount",
+    '"not-signed-in"',
+    '"msa-guest-playstation"',
+)
+# The selector the facet map is given: `(e,t)=>{`, with the extra parenthesis
+# older bundles wrap a lone arrow function in.
+_HBUI_GATE_SELECTOR = re.compile(r'\(?\([\w$,\s]*\)=>\{')
+_HBUI_GATE_RETURN = 'return"";'
+_HBUI_LINK = re.compile(r'(_NotLoggedInWarning_OreUI`\)\}\)?,\[[^\]]*\]\);)'
+                        r'(return \w+\.createElement\(\w+,)')
+_HBUI_LINK_DONE = re.compile(
+    r'_NotLoggedInWarning_OreUI`\)\}\)?,\[[^\]]*\]\);return null;')
 
-    NOTE: forcing the isLoggedInWithMicrosoftAccount facet true (to unlock
-    Profiles / Skins / Realms / the Sign-in button) was tried and reverted —
-    it only removes the UI gate, exposing that those features genuinely need
-    XSAPI social/persona, which does not work under Wine (they then loop or
-    crash). That's an engine-level (WineGDK) problem, not a UI patch."""
-    import glob, re
-    for js in glob.glob(str(game_dir / "data/gui/dist/hbui/index-*.js")):
+
+def _hbui_gate_patch(data):
+    """Make the derived 'not signed in' facet report nothing.
+
+    Its consumers all switch on the state it returns and end in
+    ``default: return null``, so an empty string takes the "You need a
+    Microsoft account" notice off the Servers and Realms tabs. The notice is
+    there because XSAPI never completes its init under Wine, not because the
+    account is missing -- the SISU/PlayFab auth behind it works.
+
+    The early return goes inside the selector, so the function still returns
+    a facet. Returning the bare string from the function itself, as this
+    patch did up to 2.3.0, satisfied the notice, which only renders the
+    value, but the Realms pages hand the result to another facet map as one
+    of its facets: that threw, and the Realms button of the title screen
+    answered "An error has occurred" (#337). A bundle patched that way is
+    brought to this form.
+    Returns ``(text, status)`` with status "applied", "already" or "missing".
+
+    NOTE: forcing the isLoggedInWithMicrosoftAccount facet true instead (to
+    unlock Profiles / Skins / Realms / the Sign-in button) was tried and
+    reverted -- it only removes the UI gate, exposing that those features
+    genuinely need XSAPI social/persona, which does not work under Wine (they
+    then loop or crash). That is an engine-level problem, not a UI patch.
+    """
+    for gate, marks, selector_re in _hbui_gate_rules():
+        for m in gate.finditer(data):
+            # Bound the window at the next function declaration: the marks
+            # are common enough that an unbounded look-ahead matches the
+            # neighbour.
+            stop = data.find("}function ", m.end())
+            body = data[m.end():stop if stop != -1 else m.end() + 2000]
+            if not all(mark in body for mark in marks):
+                continue
+            selector = selector_re.match(data, m.end())
+            if not selector:
+                continue
+            if data.startswith(_HBUI_GATE_RETURN, selector.end()):
+                return data, "already"
+            return (data[:selector.end()] + _HBUI_GATE_RETURN
+                    + data[selector.end():], "applied")
+    return data, "missing"
+
+
+def _hbui_feed_rules():
+    """Anchor sets the signed data feed adds for builds that rebundled.
+
+    A new Minecraft build that moves the anchors used to wait for a launcher
+    release. The feed can only say *where* the same two fixed insertions go
+    -- ``return"";`` and ``return null;`` -- never what is inserted.
+    """
+    try:
+        from . import feed
+        return feed.hbui_rules()
+    except Exception:
+        return []
+
+
+def _hbui_gate_rules():
+    """(function pattern, marks, selector pattern): ours, then the feed's."""
+    rules = [(_HBUI_GATE, _HBUI_GATE_MARKS, _HBUI_GATE_SELECTOR)]
+    for rule in _hbui_feed_rules():
+        gate = rule.get("gate")
+        if gate:
+            rules.append((re.compile(gate["function"]), tuple(gate["marks"]),
+                          re.compile(gate["selector"])))
+    return rules
+
+
+def _hbui_link_rules():
+    """(anchor pattern, already-patched pattern): ours, then the feed's."""
+    rules = [(_HBUI_LINK, _HBUI_LINK_DONE)]
+    for rule in _hbui_feed_rules():
+        link = rule.get("link")
+        if link:
+            rules.append((re.compile(link["anchor"]),
+                          re.compile(link["done"])))
+    return rules
+
+
+def _hbui_gate_from_2_3_0(data):
+    """Take out the gate patch of launchers up to 2.3.0, if it is there."""
+    return re.sub(r'(function\s+\w+\(\)\{)return"";(?=return'
+                  + _HBUI_FACET_MAP + ')', r'\1', data)
+
+
+def _hbui_link_patch(data):
+    """Remove the in-game "Sign in" link of the not-logged-in notice.
+
+    It reaches an interactive XUser sign-in the engine does not implement, so
+    it can only ever answer "Failed to log in ... Error Code: Llama"
+    (#227/#228); the account is linked from the launcher instead. The early
+    return goes *after* the component's hooks -- the useCallback whose body
+    holds the immutable sign-in source -- so React's hook order is preserved,
+    unlike a naive return at the top. Returns ``(text, status)``.
+    """
+    rules = _hbui_link_rules()
+    if any(done.search(data) for _anchor, done in rules):
+        return data, "already"
+    for anchor, _done in rules:
+        m = anchor.search(data)
+        if m:
+            return (data[:m.end(1)] + "return null;" + data[m.end(1):],
+                    "applied")
+    return data, "missing"
+
+
+def _hbui_bundles(game_dir):
+    import glob
+
+    return sorted(glob.glob(
+        str(Path(game_dir) / "data/gui/dist/hbui/index-*.js")))
+
+
+def _hbui_read_status(game_dir):
+    """Both patch states in an installed game directory, without writing.
+
+    Returns ``(name, gate, link)`` for the bundle carrying the Play screen, or
+    ``(None, "missing", "missing")`` when no bundle has either anchor.
+    """
+    results = []
+    for js in _hbui_bundles(game_dir):
+        try:
+            data = Path(js).read_text()
+        except OSError:
+            continue
+        gate = _hbui_gate_patch(_hbui_gate_from_2_3_0(data))[1]
+        if gate == "already" and _hbui_gate_from_2_3_0(data) != data:
+            gate = "applied"        # still in the form that broke Realms
+        results.append((Path(js).name, gate, _hbui_link_patch(data)[1]))
+    return max(results,
+               key=lambda r: (r[1] != "missing") + (r[2] != "missing"),
+               default=(None, "missing", "missing"))
+
+
+_HBUI_LOST_CONSEQUENCE = (
+    "the Servers tab can stay blocked behind 'You need a Microsoft account' "
+    "and the in-game Sign-in link answers 'Failed to log in'. Sign in from "
+    "the launcher instead, and report the Minecraft version so the patch can "
+    "be re-anchored."
+)
+
+
+def hbui_signin_gate_status(game_dir):
+    """What the HBUI patches are doing in an installed game directory.
+
+    Reported by ``doctor`` because their failure mode is otherwise invisible:
+    the game starts, setup says it completed, and only the Servers tab and the
+    in-game Sign-in link behave as though nothing had been done (#227/#229).
+    Returns ``(summary, problem)``; problem is None when nothing is wrong.
+    """
+    game_dir = (game_dir or "").strip()
+    if not game_dir:
+        return "no game installed", None
+    if not _hbui_bundles(game_dir):
+        return "no HBUI bundle in this build", None
+    _name, gate, link = _hbui_read_status(game_dir)
+    lost = _hbui_lost_labels(gate, link)
+    if lost:
+        return ("NOT PATCHED (this build rebundled its UI)",
+                "This Minecraft build rebundled its UI past "
+                + " and ".join(lost) + ", so " + _HBUI_LOST_CONSEQUENCE)
+    if gate == "applied" or link == "applied":
+        return ("not applied yet",
+                "The in-game Microsoft-account gate is not patched in the "
+                "installed build yet — run Install / Update.")
+    return "OK (gate + link patched)", None
+
+
+def _hbui_lost_labels(gate, link):
+    return [label for label, status in
+            (("the Microsoft-account gate", gate),
+             ("the dead in-game Sign-in link", link))
+            if status == "missing"]
+
+
+def _patch_hbui_signin_gate(game_dir: Path):
+    """Neutralise HBUI's Microsoft-account gate and its dead "Sign in" link.
+
+    Never fatal, but never silent either: a build that rebundles the UI past
+    these anchors leaves both problems in place, which is indistinguishable
+    from a broken install unless the launcher says so. Idempotent.
+    """
+    bundles = _hbui_bundles(game_dir)
+    if not bundles:
+        warn("No HBUI bundle in this game directory, so the in-game "
+             "Microsoft-account gate could not be patched.")
+        return False
+
+    results = []
+    for js in bundles:
         try:
             data = Path(js).read_text()
         except OSError:
             continue
         orig = data
+        data, gate = _hbui_gate_patch(_hbui_gate_from_2_3_0(data))
+        data, link = _hbui_link_patch(data)
+        if data != orig:
+            bak = js + ".bol-orig"
+            if not Path(bak).exists():
+                shutil.copy2(js, bak)
+            Path(js).write_text(data)
+        results.append((Path(js).name, gate, link))
 
-        needle = 'function wB(){return(0,l.useFacetMap)'
-        if needle in data and 'function wB(){return"";return' not in data:
-            data = data.replace(needle, 'function wB(){return"";return', 1)
-
-        # (2) Remove the broken in-game "Sign in" button. The PlayScreen
-        #     not-logged-in warning component (kB) renders a noticeTint with a
-        #     sign-in link; under Wine the MSA facet never flips so it shows
-        #     forever and the button does nothing useful. Make that component
-        #     render null — AFTER its hooks (the useCallback whose body holds the
-        #     stable "_NotLoggedInWarning_OreUI" sign-in source), so React's hook
-        #     order is preserved (unlike a naive early return). Version-tolerant:
-        #     anchored on the immutable signInSource string, minified names free.
-        m = re.search(r'(_NotLoggedInWarning_OreUI`\)\}\),\[[^\]]*\]\);)'
-                      r'(return r\.createElement\(sx,)', data)
-        if m and 'return null;return r.createElement(sx,' not in data:
-            data = data[:m.start()] + m.group(1) + 'return null;' + m.group(2) + data[m.end():]
-
-        if data == orig:
-            continue
-        bak = js + ".bol-orig"
-        if not Path(bak).exists():
-            shutil.copy2(js, bak)
-        Path(js).write_text(data)
-        ok(f"HBUI sign-in gate + button patched in {Path(js).name}")
-        return
+    # The Play screen lives in a single bundle; report on the one that had it.
+    name, gate, link = max(
+        results, key=lambda r: (r[1] != "missing") + (r[2] != "missing"),
+        default=(None, "missing", "missing"))
+    lost = _hbui_lost_labels(gate, link)
+    if lost:
+        warn("This Minecraft build rebundled its UI past "
+             + " and ".join(lost) + ", so " + _HBUI_LOST_CONSEQUENCE)
+        return False
+    ok(f"HBUI sign-in gate + link patched in {name}")
+    return True
 
 
 def ensure_openssl_xcurl_set():
     """Fetch + unpack the OpenSSL XCurl set (release asset, 20 MB) into
     OPENSSL_XCURL_SET on first use. Idempotent via a .rev marker; any
     network/IO failure degrades quietly — _install_openssl_xcurl() then
-    keeps the Schannel XCurl and warns."""
+    keeps the Schannel XCurl and warns.
+
+    A newer set named by the signed data feed (bol.feed) is tried first;
+    when it cannot be installed, the set this launcher pins is.
+    """
+    from . import feed
+    rev, sha256, url = feed.resolve(
+        "openssl_xcurl", OPENSSL_XCURL_REV, OPENSSL_XCURL_ARCHIVE_SHA256)
+    if rev != OPENSSL_XCURL_REV:
+        if _ensure_openssl_xcurl_set(rev, sha256, url, exact=True):
+            return True
+        warn(f"The updated online-login components ({rev}) could not be "
+             "installed; using the ones this launcher shipped with.")
+    return _ensure_openssl_xcurl_set(
+        OPENSSL_XCURL_REV, OPENSSL_XCURL_ARCHIVE_SHA256, None)
+
+
+def _ensure_openssl_xcurl_set(rev, pinned_sha256, direct_url, exact=False):
+    """Install set `rev`. With `exact`, an older set already in place does
+    not count as success."""
     marker = OPENSSL_XCURL_SET / ".rev"
     have = (OPENSSL_XCURL_SET / "libcurl-4.dll").exists() and \
            (OPENSSL_XCURL_SET / "xcurl-cashim.dll").exists()
     if have and marker.exists() and \
-            marker.read_text().strip() == OPENSSL_XCURL_REV:
+            marker.read_text().strip() == rev:
         return True
-    asset = f"openssl-xcurl-set-{OPENSSL_XCURL_REV}.tar.gz"
+    if exact:
+        have = False
+    asset = f"openssl-xcurl-set-{rev}.tar.gz"
     # Unreleased AppImage/zipapp candidates carry this reviewed asset beside
     # the launcher, just like the engine archive. Prefer that exact sibling so
     # local cross-distribution testing does not depend on publishing anything.
@@ -158,9 +472,15 @@ def ensure_openssl_xcurl_set():
                 if (anchor / asset).is_file()), None)
     local_archive = tar is not None
     url = None
-    if not local_archive:
+    if not local_archive and direct_url:
+        url = direct_url
+        tar = CACHE / asset
+    elif not local_archive:
         try:
-            rels = gh_releases(WINEGDK_PREBUILT_REPO, 30)
+            # Every release, not the newest thirty: the set stays in the
+            # release it was uploaded to, and once thirty more had been
+            # published above it, no new install could find it any more.
+            rels = gh_releases(WINEGDK_PREBUILT_REPO, fetch_all=True)
         except Exception as e:
             warn(f"OpenSSL XCurl set lookup failed ({e}).")
             return have
@@ -173,7 +493,7 @@ def ensure_openssl_xcurl_set():
             warn(f"OpenSSL XCurl set asset '{asset}' not published yet.")
             return have
         tar = CACHE / asset
-    expected_hash = OPENSSL_XCURL_ARCHIVE_SHA256.strip().lower()
+    expected_hash = pinned_sha256.strip().lower()
     retry_available = not local_archive
     while True:
         if not tar.is_file():
@@ -181,7 +501,8 @@ def ensure_openssl_xcurl_set():
                 return have
             info("Downloading the online-login components (one-time) …")
             try:
-                download(url, tar, "Online-login components")
+                download(url, tar, "Online-login components",
+                         **({"attempts": 2} if exact else {}))
             except BolError:
                 return have
 
@@ -250,7 +571,7 @@ def ensure_openssl_xcurl_set():
         marker_tmp = Path(marker_name)
         try:
             with os.fdopen(marker_fd, "w") as marker_stream:
-                marker_stream.write(OPENSSL_XCURL_REV)
+                marker_stream.write(rev)
             marker_tmp.replace(marker)
         finally:
             marker_tmp.unlink(missing_ok=True)
@@ -295,14 +616,10 @@ def _install_openssl_xcurl(game_dir: Path):
     shutil.copy2(libcurl, game_dir / "xcurl_real.dll")
     for nm in ("XCurl.dll", "Xcurl.dll"):
         shutil.copy2(shim, game_dir / nm)
-    cacert = CACHE / "cacert.pem"
-    if not cacert.exists():
-        try:
-            download(CACERT_URL, cacert, "certificats SSL")
-        except Exception as e:
-            warn(f"cacert download failed: {e}")
-    if cacert.exists():
-        shutil.copy2(cacert, game_dir / "cacert.pem")
+    try:
+        shutil.copy2(_ca_bundle(), game_dir / "cacert.pem")
+    except Exception as e:
+        warn(f"No certificate bundle for the game's sign-in: {e}")
     ok("OpenSSL XCurl (CA-injecting shim) + deps installed "
        "(PlayFab Azure Front Door bypass)")
 
@@ -419,57 +736,150 @@ def bump_stack_reserve(exe: Path, target=0x1000000):
     every launch so it survives a game reinstall/update or a version switch."""
     try:
         with open(exe, "r+b") as f:
-            head = f.read(0x400)
-            if head[:2] != b"MZ":
-                return
-            e = struct.unpack_from("<I", head, 0x3C)[0]
-            if head[e:e + 4] != b"PE\0\0":
-                return
-            opt = e + 4 + 20                       # PE sig + COFF file header
-            if struct.unpack_from("<H", head, opt)[0] != 0x20B:
-                return                             # not PE32+ — leave it alone
-            field = opt + 72                       # SizeOfStackReserve (PE32+)
-            cur = struct.unpack_from("<Q", head, field)[0]
-            if cur >= target:
-                return                             # already roomy (idempotent)
-            f.seek(field)
-            f.write(struct.pack("<Q", target))
-        ok(f"Stack reserve raised {cur // 1024} KB → {target // 1024} KB "
-           "(settings/pause crash fix)")
-    except OSError as e:                           # never block a launch over this
+            raised = _raise_stack_reserve(f.fileno(), target)
+    except (OSError, struct.error, IndexError) as e: # never block a launch over this
         warn(f"Could not raise the stack reserve: {e}")
+        return
+    if raised:
+        ok(f"Stack reserve raised {raised // 1024} KB → {target // 1024} KB "
+           "(settings/pause crash fix)")
+
+
+def _raise_stack_reserve(fd, target=0x1000000):
+    """Raise SizeOfStackReserve in the PE at ``fd``; return the old value.
+
+    Returns None when there is nothing to do — not a PE32+ image, or already
+    at least ``target``. Takes a descriptor rather than a path because a
+    Microsoft Store package never has a loadable executable on disk: the
+    launcher decrypts it into anonymous memory, and that memfd is the only
+    place this edit can land (see bol.xodus.wrap_encrypted_launch).
+    """
+    head = os.pread(fd, 0x400, 0)
+    if head[:2] != b"MZ":
+        return None
+    e = struct.unpack_from("<I", head, 0x3C)[0]
+    if head[e:e + 4] != b"PE\0\0":
+        return None
+    opt = e + 4 + 20                           # PE sig + COFF file header
+    if struct.unpack_from("<H", head, opt)[0] != 0x20B:
+        return None                            # not PE32+ — leave it alone
+    field = opt + 72                           # SizeOfStackReserve (PE32+)
+    cur = struct.unpack_from("<Q", head, field)[0]
+    if cur >= target:
+        return None                            # already roomy (idempotent)
+    os.pwrite(fd, struct.pack("<Q", target), field)
+    return cur
 
 
 def hide_signin_button(game_dir):
     """Hide the broken in-game title-screen 'Sign in' button (cosmetic).
 
     Under Wine there is no real Xbox Live session, so the dock 'Sign in'
-    button on the start screen is dead weight. Hiding it is awkward because
-    Bedrock renders the menu from a *compiled* UI binary
-    (resource_packs/vanilla/__brarchive/ui.brarchive) that shadows the loose
-    ui/*.json — so editing start_screen.json alone has no visible effect
-    (loc strings are read loose, but UI structure comes from the archive).
-    Fix: move the compiled UI aside so the loose JSON-UI loads, then flip the
-    sign-in button's visibility binding (#sign_in_visible) to an always-false
-    one (#edu_demo_only_ui_visible, false outside Education Edition). Idempotent
-    and never fatal — a cosmetic best-effort."""
+    button on the start screen is dead weight. Bedrock renders the menu from
+    compiled UI archives (resource_packs/vanilla/__brarchive/ui.brarchive).
+
+    - In older builds (<1.26.50), vanilla shipped loose ui/*.json files alongside
+      the archive; moving the archive aside forced fallback to loose files,
+      where #sign_in_visible was flipped to #edu_demo_only_ui_visible (false
+      outside Education Edition).
+    - In modern builds (1.26.50+), the loose ui directory was removed entirely.
+      Moving the archive aside leaves the game with zero UI assets and crashes
+      at 78% startup. Instead, we patch start_screen.json directly inside
+      ui.brarchive using :class:`bol.brarchive.BrArchive`.
+
+    Idempotent and never fatal — a cosmetic best-effort."""
+    import os
     import re
+    import shutil
     try:
         vanilla = Path(game_dir) / "data" / "resource_packs" / "vanilla"
         bra = vanilla / "__brarchive" / "ui.brarchive"
-        if bra.exists():
-            bra.rename(bra.parent / "ui.brarchive.bol-bak")
+        bak = vanilla / "__brarchive" / "ui.brarchive.bol-bak"
+        orig_bak = vanilla / "__brarchive" / "ui.brarchive.bol-orig"
+
+        # If a previous run or broken state left ui.brarchive moved aside,
+        # self-heal: restore ui.brarchive if missing, or remove leftover backup.
+        if bak.exists():
+            try:
+                if not os.access(bak.parent, os.W_OK):
+                    bak.parent.chmod(bak.parent.stat().st_mode | 0o700)
+            except Exception:
+                pass
+            if not bra.exists():
+                bak.rename(bra)
+            else:
+                bak.unlink(missing_ok=True)
+
         ss = vanilla / "ui" / "start_screen.json"
-        if not ss.exists():
+        if ss.exists():
+            # Legacy path (<1.26.50): loose UI exists, move archive aside and patch JSON.
+            if bra.exists():
+                bra.rename(bak)
+
+            # In Bedrock's JSON-UI engine, control visibility is driven by property bindings
+            # that override '#visible'. The engine expects a bound symbol name rather than
+            # a static boolean literal, so we bind to '#edu_demo_only_ui_visible'. This
+            # property is exposed by the start screen controller and is always false in
+            # standard retail builds (true only in Education Edition demo mode), cleanly
+            # hiding the button without breaking UI schema validation.
+            txt = ss.read_text(encoding="utf-8", errors="ignore")
+            new, n = re.subn(
+                r'("xbl_signin_button@start\.xbl_signin_button"\s*:\s*\{\}\s*\}\s*\]'
+                r'\s*,\s*"bindings"\s*:\s*\[\s*\{\s*"binding_name"\s*:\s*)'
+                r'"#sign_in_visible"',
+                r'\g<1>"#edu_demo_only_ui_visible"', txt, count=1)
+            if n:
+                ss.write_text(new, encoding="utf-8")
+                ok("Hid the broken in-game Sign-in button.")
             return
-        txt = ss.read_text(encoding="utf-8", errors="ignore")
-        new, n = re.subn(
-            r'("xbl_signin_button@start\.xbl_signin_button"\s*:\s*\{\}\s*\}\s*\]'
-            r'\s*,\s*"bindings"\s*:\s*\[\s*\{\s*"binding_name"\s*:\s*)'
-            r'"#sign_in_visible"',
-            r'\g<1>"#edu_demo_only_ui_visible"', txt, count=1)
-        if n:
-            ss.write_text(new, encoding="utf-8")
-            ok("Hid the broken in-game Sign-in button.")
+
+        # Modern path (1.26.50+): patch start_screen.json directly inside ui.brarchive
+        if not bra.exists():
+            return
+
+        try:
+            if not os.access(bra.parent, os.W_OK):
+                bra.parent.chmod(bra.parent.stat().st_mode | 0o700)
+        except Exception:
+            pass
+
+        from .brarchive import BrArchive, BrArchiveError
+        try:
+            archive = BrArchive.from_file(bra)
+        except BrArchiveError:
+            # A pristine copy only exists beside an archive this function
+            # already parsed and rewrote, so an archive that no longer parses
+            # next to one is our own write gone wrong -- and this is the
+            # game's whole user interface. Put the original back; the next
+            # PLAY hides the button again.
+            if not orig_bak.exists():
+                raise
+            shutil.copy2(orig_bak, bra)
+            warn("Restored the game's compiled UI (ui.brarchive) from the "
+                 "copy kept beside it: the archive no longer read back.")
+            return
+        if "start_screen.json" not in archive:
+            return
+
+        content = archive.read_bytes("start_screen.json")
+        if b'"#sign_in_visible"' not in content:
+            return  # Already patched or not present
+
+        if not orig_bak.exists():
+            shutil.copy2(bra, orig_bak)
+
+        # In Bedrock's JSON-UI engine, control visibility is driven by property bindings
+        # that override '#visible'. The engine expects a bound symbol name rather than
+        # a static boolean literal, so we bind to '#edu_demo_only_ui_visible'. This
+        # property is exposed by the start screen controller and is always false in
+        # standard retail builds (true only in Education Edition demo mode), cleanly
+        # hiding the button and its padding without breaking UI schema validation.
+        # Bytes, not text: a decode that ignored anything it could not read
+        # would silently drop those bytes from the game's own UI definition.
+        new_content = content.replace(b'"#sign_in_visible"',
+                                      b'"#edu_demo_only_ui_visible"')
+        archive.set("start_screen.json", new_content)
+        archive.write(bra)
+        ok("Hid the broken in-game Sign-in button in ui.brarchive.")
     except Exception as e:
         warn(f"hide_signin_button: {e}")

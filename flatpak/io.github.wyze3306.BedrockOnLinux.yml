@@ -1,163 +1,145 @@
 # Flathub manifest for BedrockOnLinux.
 #
 # Two things make this more than a plain Python app:
-#   1. The GUI is Tkinter, which org.freedesktop.Platform does not ship —
-#      a self-contained Tcl + Tk + CPython is bundled.
-#   2. The game runs through umu-launcher → pressure-vessel, a sub-sandbox
-#      created via the Flatpak portal — hence --talk-name=org.freedesktop.Flatpak,
-#      --allow=devel and --allow=multiarch (the Lutris/Bottles/Heroic recipe).
+#   1. The GUI is PySide6 (Qt for Python), which the GNOME runtime does not
+#      ship, so it is installed from the upstream wheels below. Qt's xcb and
+#      wayland platform plugins both come inside the wheel.
+#   2. The game runs through umu-launcher → pressure-vessel, which builds its
+#      container as a Flatpak sub-sandbox through the org.freedesktop.portal.Flatpak
+#      portal — hence --allow=per-app-dev-shm, --allow=devel and
+#      --allow=multiarch (the Heroic/Bottles recipe).
 #
 # Local test build: scripts/build-flatpak.sh (swaps the app source for the
-# working tree). Submission steps + permission rationale: flatpak/README.md.
+# working tree); add --release to build this manifest as published.
 app-id: io.github.wyze3306.BedrockOnLinux
-runtime: org.freedesktop.Platform
-runtime-version: '25.08'
-sdk: org.freedesktop.Sdk
+# The GNOME runtime is used for one reason: it ships libwebkit2gtk-4.1, and
+# org.freedesktop.Platform ships no WebKitGTK at all. Minecraft is downloaded
+# from the Microsoft Store, xodus-cli opens that sign-in in a WebKitGTK
+# webview, and no Flathub extension provides one — so on the freedesktop
+# runtime the Flatpak could not install the game.
+#
+# GNOME's runtime is built on the same freedesktop base and declares the same
+# org.freedesktop.Platform.GL extension point, so the GPU path is unchanged.
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
 command: bedrock-on-linux
 
-# Tcl/Tk installs several shared libraries read-only. Disabling the optional
-# post-build strip/debug split keeps the manifest buildable by an unprivileged
-# flatpak-builder on native, encrypted, and FUSE-backed home filesystems.
-build-options:
-  strip: false
-  no-debuginfo: true
-
 finish-args:
-  # GPU (Vulkan) + game controllers
-  - --device=all
-  # The launcher GUI is Tkinter, an X11-only toolkit, so the X11 socket must be
-  # granted unconditionally: under a pure Wayland session (e.g. KDE) the weaker
-  # fallback-x11 leaves $DISPLAY unset and tk.Tk() crashes (issue #7). The game
-  # itself runs through XWayland; winewayland stays opt-in (BOL_INPUT=wayland).
-  - --socket=x11
-  - --socket=wayland
-  - --socket=pulseaudio
   - --share=ipc
   # engine/game downloads, Microsoft sign-in, multiplayer
   - --share=network
+  # The launcher window is native Wayland when the session offers it, but
+  # Minecraft itself runs through Wine's X11 driver (winewayland is opt-in via
+  # BOL_INPUT=wayland), so a Wayland session still needs XWayland for the game.
+  - --socket=x11
+  - --socket=wayland
+  - --socket=pulseaudio
+  # GPU (Vulkan) + game controllers (the launcher reads hidraw/evdev pads)
+  - --device=all
+  # Wine needs ptrace (devel) and 32-bit code (multiarch). The game's container
+  # is a sub-sandbox of this app that pressure-vessel requests from the
+  # org.freedesktop.portal.Flatpak portal, which needs no permission (it used
+  # to be granted --talk-name=org.freedesktop.Flatpak, which nothing uses).
+  # Without per-app-dev-shm that sub-sandbox gets a /dev/shm of its own and
+  # pressure-vessel warns about flatpak#4214.
+  - --allow=devel
+  - --allow=multiarch
+  - --allow=per-app-dev-shm
   # Read-only access to the pre-XDG location for one-time migration. Using the
   # xdg-data alias here would shadow the private XDG destination read-only.
   - --filesystem=~/.local/share/bedrock-on-linux:ro
-  # umu/pressure-vessel spawns its Steam Linux Runtime sub-sandbox through the
-  # Flatpak portal; Wine needs ptrace (devel) and 32-bit code (multiarch)
-  - --talk-name=org.freedesktop.Flatpak
-  - --allow=devel
-  - --allow=multiarch
+  # Discord Rich Presence: the client listens on a socket in the *host* runtime
+  # directory, and the sandbox is given a runtime directory of its own, so
+  # without these two paths a play session is simply never announced. One
+  # socket each -- the host build and the Flatpak build of Discord -- and
+  # nothing else; :create is deliberately absent, since it would put a
+  # directory where Discord wants to make its socket. Flatpak binds them at
+  # startup, so inside the sandbox Discord has to be running before the
+  # launcher is (elsewhere the session picks it up whenever it appears).
+  - --filesystem=xdg-run/discord-ipc-0
+  - --filesystem=xdg-run/app/com.discordapp.Discord/discord-ipc-0
 
 cleanup:
   - /include
-  - /share/man
-  - /share/doc
   - /lib/pkgconfig
+  - /share/doc
+  - /share/man
   - '*.a'
   - '*.la'
 
 modules:
-  - name: tcl
-    buildsystem: autotools
-    subdir: unix
-    config-opts:
-      - --enable-shared
-      - --enable-threads
-    post-install:
-      - chmod -R u+w /app/lib
-    sources:
-      - type: archive
-        url: https://prdownloads.sourceforge.net/tcl/tcl8.6.14-src.tar.gz
-        sha256: 5880225babf7954c58d4fb0f5cf6279104ce1cd6aa9b71e9a6322540e1c4de66
-
-  - name: tk
-    buildsystem: autotools
-    subdir: unix
-    config-opts:
-      - --enable-shared
-      - --enable-threads
-      - --with-tcl=/app/lib
-      - --with-x
-    sources:
-      - type: archive
-        url: https://prdownloads.sourceforge.net/tcl/tk8.6.14-src.tar.gz
-        sha256: 8ffdb720f47a6ca6107eac2dd877e30b0ef7fac14f3a84ebbd0b3612cee41a94
-
-  # Self-contained CPython with tkinter, so the launcher's
-  # `#!/usr/bin/env python3` resolves to an interpreter that has Tk
-  # (/app/bin is first on PATH). Python 3.12 dropped --with-tcltk-*;
-  # Tcl/Tk is located through TCLTK_CFLAGS / TCLTK_LIBS.
+  # Self-contained CPython 3.12, first on PATH. The GNOME 51 runtime's Python
+  # is 3.14, and PySide6 6.9 -- the Qt binding the AppImage, the .deb and CI
+  # all run the launcher with -- declares Requires-Python <3.14.
   - name: python3
     buildsystem: autotools
     config-opts:
       - --enable-shared
       - --without-static-libpython
-      - --with-ensurepip=no
+      - --with-ensurepip=install
     build-options:
       env:
-        TCLTK_CFLAGS: -I/app/include
-        TCLTK_LIBS: -L/app/lib -ltcl8.6 -ltk8.6
         LDFLAGS: -Wl,-rpath,/app/lib
     post-install:
-      # fail the build now (not at first run) if tkinter didn't link
-      - /app/bin/python3 -c "import tkinter"
+      - /app/bin/python3 -c "import sys; print(sys.version)"
     cleanup:
+      - /bin/idle3*
+      - /bin/pip3*
       - /lib/python3.12/test
       - /lib/python3.12/idlelib
       - /lib/python3.12/turtledemo
+      - /lib/python3.12/tkinter
+      - /lib/python3.12/site-packages/pip
+      - /lib/python3.12/site-packages/pip-*.dist-info
     sources:
       - type: archive
-        url: https://www.python.org/ftp/python/3.12.8/Python-3.12.8.tar.xz
-        sha256: c909157bb25ec114e5869124cc2a9c4a4d4c1e957ca4ff553f1edc692101154e
+        url: https://www.python.org/ftp/python/3.12.14/Python-3.12.14.tar.xz
+        sha256: 5c8462af5790baf43a321a1559dbe0db06d1be4300fb85fb53c40060668e548a
 
-  # cryptography (+ its cffi / pycparser deps) for the native Microsoft login:
-  # it signs the Xbox Live device/request tokens, and without it sign-in fails
-  # with a connection reset (0x80072746). The runtime ships none and the
-  # bundled Python has no pip, so the wheels are vendored and unzipped straight
-  # into site-packages. Bump all three (url + sha256) when cryptography moves;
-  # the abi3 cryptography wheel stays valid across Python 3.x.
-  - name: python3-cryptography
+  # Python dependencies, installed offline by pip. cffi builds from source
+  # (setuptools is only its build backend); pycparser, python-xlib and six
+  # are pure-Python wheels; cryptography (Rust) and PySide6/shiboken6
+  # (Qt) are the upstream manylinux wheels. Keep the versions in step with
+  # third_party/requirements-appimage.txt and requirements-deb.txt.
+  #   - cryptography signs the Xbox Live device/request tokens; without it the
+  #     Microsoft sign-in fails with a connection reset (0x80072746).
+  #   - PySide6-Essentials only, not the PySide6 meta-package, which also pulls
+  #     PySide6-Addons (~167 MB of Qt modules this app never uses).
+  #   - python-xlib reads monitor geometry from RandR (bol.x11); optional.
+  - name: python3-dependencies
     buildsystem: simple
     build-commands:
-      - install -d /app/lib/python3.12/site-packages
-      - for w in *.whl; do python3 -m zipfile -e "$w" /app/lib/python3.12/site-packages/; done
-      - /app/bin/python3 -c "import cryptography; print('cryptography', cryptography.__version__)"
+      - /app/bin/python3 -m pip install --verbose --no-index --find-links="file://${PWD}"
+        --prefix=${FLATPAK_DEST} setuptools
+      - /app/bin/python3 -m pip install --verbose --no-index --find-links="file://${PWD}"
+        --prefix=${FLATPAK_DEST} --no-build-isolation cryptography PySide6-Essentials
+        python-xlib
+      - /app/bin/python3 -c "import cryptography, PySide6.QtWidgets, Xlib"
+    cleanup:
+      - /lib/python3.12/site-packages/_distutils_hack
+      - /lib/python3.12/site-packages/distutils-precedence.pth
+      - /lib/python3.12/site-packages/setuptools
+      - /lib/python3.12/site-packages/setuptools-*.dist-info
     sources:
       - type: file
-        url: https://files.pythonhosted.org/packages/2c/99/2d13299eb3dd27b02dcfaafcc91d6b5cb3329f7cbd6d8f51921acd566c1a/cryptography-49.0.0-cp39-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
-        sha256: 35b151772baff2c74cba7fa290ceaff4c3b11c0c881eb93eb5dbc05a7cfbba18
+        url: https://files.pythonhosted.org/packages/95/9c/c510029fc6ef33a6275cd2c5d3cecd6613dfd6aa401d57c54f1c18852ccf/setuptools-84.0.0-py3-none-any.whl
+        sha256: 51a52592b3b99e102b609654876bd65f19f999935166d1352678931132b0c670
       - type: file
-        url: https://files.pythonhosted.org/packages/78/2d/7fa73dfa841b5ac06c7b8855cfc18622132e365f5b81d02230333ff26e9e/cffi-2.0.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
-        sha256: 3e17ed538242334bf70832644a32a7aae3d83b57567f9fd60a26257e992b79ba
+        url: https://files.pythonhosted.org/packages/eb/56/b1ba7935a17738ae8453301356628e8147c79dbb825bcbc73dc7401f9846/cffi-2.0.0.tar.gz
+        sha256: 44d1b5909021139fe36001ae048dbdde8214afa20200eda0f64c068cac5d5529
       - type: file
         url: https://files.pythonhosted.org/packages/0c/c3/44f3fbbfa403ea2a7c779186dc20772604442dde72947e7d01069cbe98e3/pycparser-3.0-py3-none-any.whl
         sha256: b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992
-
-  # customtkinter (the modern GUI toolkit, on top of Tk) + its pure-Python deps
-  # darkdetect & packaging. Vendored like cryptography (the runtime has no pip);
-  # the wheels are py3-none-any, so they drop straight into site-packages.
-  - name: python3-customtkinter
-    buildsystem: simple
-    build-commands:
-      - for w in *.whl; do python3 -m zipfile -e "$w" /app/lib/python3.12/site-packages/; done
-      - /app/bin/python3 -c "import customtkinter; print('customtkinter', customtkinter.__version__)"
-    sources:
       - type: file
-        url: https://files.pythonhosted.org/packages/3b/b1/b43b33001a77256b335511e75f257d001082350b8506c8807f30c98db052/customtkinter-5.2.2-py3-none-any.whl
-        sha256: 14ad3e7cd3cb3b9eb642b9d4e8711ae80d3f79fb82545ad11258eeffb2e6b37c
+        url: https://files.pythonhosted.org/packages/a0/84/84fe36f19caf857d61cb7fc9c63035a47ffabd84ea12d1d393148efa3615/cryptography-49.0.0-cp39-abi3-manylinux_2_34_x86_64.whl
+        sha256: 2400ef9c9e2299a25614eb1dea3db54a69b1349efd043bfac9c67630d136df36
       - type: file
-        url: https://files.pythonhosted.org/packages/f2/f2/728f041460f1b9739b85ee23b45fa5a505962ea11fd85bdbe2a02b021373/darkdetect-0.8.0-py3-none-any.whl
-        sha256: a7509ccf517eaad92b31c214f593dbcf138ea8a43b2935406bbd565e15527a85
+        url: https://files.pythonhosted.org/packages/be/82/c1c6932f9849bc5e75c93c38a29419505a6e3e0037261e28f3e7ecbf2751/shiboken6-6.9.3-cp39-abi3-manylinux_2_28_x86_64.whl
+        sha256: f3f5337a3a8fc660ba1462265bd9a2bdda9588f8d90fbc3d5ac4ce3134c11e59
       - type: file
-        url: https://files.pythonhosted.org/packages/df/b2/87e62e8c3e2f4b32e5fe99e0b86d576da1312593b39f47d8ceef365e95ed/packaging-26.2-py3-none-any.whl
-        sha256: 5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e
-
-  # python-xlib (+ its six dep): lets bol.x11 read monitor geometry straight
-  # from the X server's RandR extension instead of parsing `xrandr` CLI text.
-  # Optional (bol.x11 falls back to the xrandr CLI without it),
-  # but vendored the same way since the runtime has no pip.
-  - name: python3-xlib
-    buildsystem: simple
-    build-commands:
-      - for w in *.whl; do python3 -m zipfile -e "$w" /app/lib/python3.12/site-packages/; done
-      - /app/bin/python3 -c "import Xlib; print('python-xlib', Xlib.__version_string__)"
-    sources:
+        url: https://files.pythonhosted.org/packages/85/e8/9396cf11a60f80175bb3c5c1d498d84e87b7af653ab4ea001acf821a3981/pyside6_essentials-6.9.3-cp39-abi3-manylinux_2_28_x86_64.whl
+        sha256: c70d5544e892b201a677b615156fab6a0fef865e7fc287f55a0eae00a682e83f
       - type: file
         url: https://files.pythonhosted.org/packages/fc/b8/ff33610932e0ee81ae7f1269c890f697d56ff74b9f5b2ee5d9b7fa2c5355/python_xlib-0.33-py2.py3-none-any.whl
         sha256: c3534038d42e0df2f1392a1b30a15a4ff5fdc2b86cfa94f072bf11b10a164398
@@ -165,30 +147,17 @@ modules:
         url: https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl
         sha256: 4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274
 
-  # zstd CLI for the one .pkg.tar.zst (libcurl) the launcher extracts;
-  # Python's tarfile can't read zstd and the runtime ships no unzstd.
-  - name: zstd
-    buildsystem: simple
-    build-commands:
-      - make -C programs zstd
-      - install -Dm755 programs/zstd /app/bin/zstd
-      - ln -sf zstd /app/bin/unzstd
-    sources:
-      - type: archive
-        url: https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz
-        sha256: 8c29e06cf42aacc1eafc4077ae2ec6c6fcb96a626157e0593d5e82a34fd403c1
-
   - name: bedrock-on-linux
     buildsystem: simple
     build-commands:
       - install -Dm755 bedrock-on-linux /app/bin/bedrock-on-linux
-      # the implementation now lives in the bol/ package next to <prefix>/lib
+      # the implementation lives in the bol/ package next to <prefix>/lib
       - mkdir -p /app/lib/bedrock-on-linux
       - cp -r bol /app/lib/bedrock-on-linux/bol
       - find /app/lib/bedrock-on-linux/bol -type d -name __pycache__ -prune -exec rm -rf '{}' +
       - find /app/lib/bedrock-on-linux/bol -type f -name '*.pyc' -delete
+      - install -Dm644 LICENSE /app/share/licenses/io.github.wyze3306.BedrockOnLinux/bedrock-on-linux/LICENSE
       - install -Dm644 data/icon.png /app/share/icons/hicolor/256x256/apps/io.github.wyze3306.BedrockOnLinux.png
-      - install -Dm644 LICENSE /app/share/licenses/bedrock-on-linux/LICENSE
       - install -Dm644 flatpak/io.github.wyze3306.BedrockOnLinux.desktop /app/share/applications/io.github.wyze3306.BedrockOnLinux.desktop
       - install -Dm644 flatpak/io.github.wyze3306.BedrockOnLinux.metainfo.xml /app/share/metainfo/io.github.wyze3306.BedrockOnLinux.metainfo.xml
     sources:
@@ -196,5 +165,8 @@ modules:
       #   git rev-parse vX.Y.Z^{commit}
       - type: git
         url: https://github.com/Wyze3306/BedrockOnLinux.git
-        tag: v2.0.0
-        commit: 6e929009f43deb0c35730ac5f0031ac179e7f53e
+        tag: v2.3.1
+        commit: 5a384fd319cabb10615a9fd2046dd2f6b686c1ee
+        x-checker-data:
+          type: git
+          tag-pattern: ^v([\d.]+)$

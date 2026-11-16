@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Details: requirements and how it works | BedrockOnLinux</title>
+<meta name="description" content="What your machine needs to run Minecraft Bedrock Edition on Linux, where the game comes from, how the engine is verified, and what to do when something misbehaves.">
+<link rel="canonical" href="https://wyze3306.github.io/BedrockOnLinux/details.html">
+<meta name="theme-color" content="#0F1115">
+<link rel="icon" href="icon.png" type="image/png">
+<link rel="preload" as="font" type="font/woff2" href="fonts/space-grotesk.woff2" crossorigin>
+<link rel="preload" as="font" type="font/woff2" href="fonts/ibm-plex-sans.woff2" crossorigin>
+<link rel="stylesheet" href="style.css">
+
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="BedrockOnLinux">
+<meta property="og:title" content="Details: requirements and how it works">
+<meta property="og:description" content="What your machine needs, where the game comes from, and what to do when something misbehaves.">
+<meta property="og:url" content="https://wyze3306.github.io/BedrockOnLinux/details.html">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Details: requirements and how it works">
+<meta name="twitter:description" content="What your machine needs, where the game comes from, and what to do when something misbehaves.">
+</head>
+<body>
+
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="topbar">
+  <a class="wordmark" href="index.html">
+    <img src="icon.png" width="128" height="128" alt="">
+    <span>BedrockOnLinux</span>
+  </a>
+  <nav class="topbar-nav" aria-label="Primary">
+    <a href="index.html#how">How it works</a>
+    <a href="index.html#get">Download</a>
+    <a href="index.html#faq">FAQ</a>
+    <a href="details.html" aria-current="page">Details</a>
+    <a class="topbar-cta" href="index.html#get">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"></path><path d="M7 11l5 5 5-5"></path><path d="M4 20h16"></path></svg>
+      Download
+    </a>
+  </nav>
+</header>
+
+<main id="main">
+
+  <section class="page-head">
+    <div class="wrap">
+      <p class="crumbs"><a href="index.html">Home</a><span>/</span>Details</p>
+      <h1>Everything the home page leaves out.</h1>
+      <p class="lede">
+        What your machine needs, where the game actually comes from, and what to do
+        when something misbehaves.
+      </p>
+    </div>
+  </section>
+
+  <section class="band">
+    <div class="wrap">
+      <h2>What you need</h2>
+      <p class="lede" style="margin: .9rem 0 2.4rem; max-width: 38rem">Every build is x86-64.</p>
+
+      <ul class="checks checks-2">
+        <li>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12.5l5 5L20 6.5"></path></svg>
+          <p><b>An x86-64 desktop with glibc.</b> Checked against a glibc 2.31 baseline. You do not need a 32-bit userspace. ARM and musl-only systems such as stock Alpine are out of scope.</p>
+        </li>
+        <li>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12.5l5 5L20 6.5"></path></svg>
+          <p><b>A Vulkan 1.3 driver</b> exposing <code>VK_EXT_device_generated_commands</code>, or the older NVIDIA <code>VK_NV_device_generated_commands</code>. The bundled vkd3d-proton payload carries both.</p>
+        </li>
+        <li>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12.5l5 5L20 6.5"></path></svg>
+          <p><b>X11 or XWayland</b> for the launcher window. The game normally uses XWayland too. Native Wine Wayland exists behind <code>BOL_INPUT=wayland</code>, but it stays experimental.</p>
+        </li>
+        <li>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12.5l5 5L20 6.5"></path></svg>
+          <p><b>A Microsoft account that owns Minecraft.</b> Required to install at all, not only to play online.</p>
+        </li>
+        <li>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12.5l5 5L20 6.5"></path></svg>
+          <p><b>Disk space</b> for the game, the compressed engine and a temporary extraction. Running out is harmless: free some space and press PLAY again.</p>
+        </li>
+        <li>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12.5l5 5L20 6.5"></path></svg>
+          <p><b>WebKitGTK</b> (<code>libwebkit2gtk-4.1-0</code>) for the Store sign-in window. The .deb and .rpm pull it in, and <code>doctor</code> reports it when missing.</p>
+        </li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="band band-alt">
+    <div class="wrap">
+      <p class="eyebrow">Under the hood</p>
+      <h2 style="margin-bottom: 2.4rem">Where the game comes from, and what runs it</h2>
+
+      <div class="split">
+        <div>
+          <p class="muted">
+            <a href="https://github.com/xodus-gaming/xodus">Xodus</a> signs in to your
+            Microsoft account, asks Microsoft's licensing service for the title
+            licence, then streams the MSIXVC package straight from the Xbox CDN and
+            decrypts it on the way. This is the same path Windows takes.
+          </p>
+          <p class="muted">
+            The game then runs on a GDK-Proton engine built from a WineGDK fork. You
+            never need a compiler, a Windows install or a second machine.
+          </p>
+          <div class="inset">
+            <p>
+              <b>There is no version list.</b> The Xbox CDN serves only the current
+              build of each edition, so you get whatever Microsoft ships today,
+              exactly as on Windows. The launcher re-checks for a delta every twelve
+              hours and downloads only what changed.
+            </p>
+          </div>
+        </div>
+
+        <div>
+          <h3 class="h-sub">Engine integrity</h3>
+          <ul class="checks">
+            <li>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12.5l5 5L20 6.5"></path></svg>
+              <p>The engine is <b>not built on your computer</b>. The launcher accepts only the revision and archive SHA-256 recorded in <code>bol/config.py</code>.</p>
+            </li>
+            <li>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12.5l5 5L20 6.5"></path></svg>
+              <p>WineGDK is built in an unprivileged Debian 11 chroot. Any binary needing a glibc symbol newer than 2.31 is rejected.</p>
+            </li>
+            <li>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12.5l5 5L20 6.5"></path></svg>
+              <p>The exact source commit, the reviewed patches and per-file hashes live under <code>third_party/</code>.</p>
+            </li>
+            <li>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12.5l5 5L20 6.5"></path></svg>
+              <p>Installation uses a lock and a transactional rename, so an interrupted update can never quietly become the active engine.</p>
+            </li>
+            <li>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12.5l5 5L20 6.5"></path></svg>
+              <p>Nothing touches Minecraft while it runs. Three files are adjusted on disk before launch, each behind a byte fingerprint that skips the edit when it no longer matches.</p>
+            </li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band">
+    <div class="wrap">
+      <h2 style="margin-bottom: 2.4rem">Good to know</h2>
+
+      <div class="cards">
+        <article class="card">
+          <h3>Stuck on Vulkan 1.2?</h3>
+          <p><b class="ui">Settings, Advanced, Legacy compatibility renderer</b> exists, but treat it as a last resort: it swaps the whole Direct3D stack to WineD3D. Minecraft renders purely through D3D12, so this replaces exactly the renderer it uses. Artifacts are common and performance may not improve.</p>
+        </article>
+        <article class="card">
+          <h3>Achievements</h3>
+          <p>Your existing list loads. New ones do not unlock yet: Xbox awards those from in-game events, and that path is not implemented. Nothing is unlocked, emulated or forced.</p>
+        </article>
+        <article class="card">
+          <h3>Several players, one machine</h3>
+          <p>Separate Xbox profiles keep accounts, prefixes and worlds apart, while the multi-gigabyte game and its caches stay shared.</p>
+        </article>
+      </div>
+
+      <div class="callout" style="max-width: none; margin-top: 1.25rem">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4.2l8.4 15.1H3.6z"></path><path d="M12 10v4"></path><path d="M12 17.1v.1"></path></svg>
+        <p>
+          <b>If your desktop froze, do not just retry.</b>
+          Find out why the session died, then reboot. A fatal GPU event in the kernel
+          log means fixing the driver first. Once the launcher can prove the incident
+          belongs to a previous boot, <b class="ui">Settings, Tools</b> offers to acknowledge it.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section class="band" style="padding-top: 0">
+    <div class="wrap">
+      <div class="panel">
+        <div>
+          <h2>When something misbehaves</h2>
+          <p>
+            Start with <code>bedrock-on-linux doctor</code>: host dependencies and
+            graphics safety, in plain words. Run
+            <code>bedrock-on-linux doctor --network</code> for DNS, TLS, clock and
+            VPN observations.
+          </p>
+          <p>
+            Logs live in <code>~/.local/share/bedrock-on-linux/logs/</code>, and
+            <b class="ui">Settings, Open logs folder</b> opens them.
+          </p>
+          <p class="note">
+            A bug report is far easier to act on with the launcher version, engine
+            revision, Minecraft version, distribution, GPU and driver, plus the
+            relevant logs. Never include account tokens.
+          </p>
+          <p class="help-actions" style="margin-top: 1.5rem">
+            <a class="btn btn-primary" href="https://github.com/Wyze3306/BedrockOnLinux/issues">Report a bug</a>
+            <a class="btn" href="https://discord.gg/5YJq54Yhbu">Ask on Discord</a>
+          </p>
+        </div>
+        <div>
+          <h3 class="h-sub">From a terminal</h3>
+          <pre><code>bedrock-on-linux doctor     <span class="hash"># host deps + GPU safety</span>
+bedrock-on-linux play       <span class="hash"># launch right now</span>
+bedrock-on-linux shortcut   <span class="hash"># desktop / Steam entry</span>
+bedrock-on-linux import world.mcworld</code></pre>
+          <p class="note" style="margin-top: 1.1rem">
+            On your <code>PATH</code> with the .deb and .rpm. The AppImage, .pyz and
+            Flatpak take the same commands through their own entry point.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band" style="padding-top: 0">
+    <div class="wrap">
+      <h2 style="text-align: center; margin-bottom: 2.2rem">More questions</h2>
+
+      <div class="faq">
+        <details>
+          <summary>Does it run on Steam Deck?</summary>
+          <p>Yes, Game Mode included. Add either the launcher or the generated Minecraft Bedrock shortcut as a non-Steam game. In Game Mode the launcher steps aside while the game runs, then comes back when you quit.</p>
+        </details>
+        <details>
+          <summary>Can I install an older Minecraft version?</summary>
+          <p>No. The Xbox CDN serves only the current build of each edition, so there is no way to match a server frozen on an older one. Updates arrive on their own.</p>
+        </details>
+        <details>
+          <summary>Does it work on Wayland?</summary>
+          <p>The launcher window needs X11 or XWayland, and the game normally uses XWayland too. Native Wine Wayland is available with BOL_INPUT=wayland, but it is experimental and does not remove the launcher's own requirement.</p>
+        </details>
+        <details>
+          <summary>Does it modify Minecraft?</summary>
+          <p>Not while it runs. The engine never scans or rewrites the Minecraft process, and packaging rejects any build that still contains that code. Before launch, three files on disk are adjusted: two Wine libraries and the game executable's stack size, which prevents a crash in the settings and pause menus. Every edit checks a byte fingerprint first and is skipped when the bytes no longer match.</p>
+        </details>
+        <details>
+          <summary>Can I bring my worlds, add-ons and skins?</summary>
+          <p>Yes. Files ending in .mcworld, .mcaddon, .mcpack, .mctemplate and .mcskin import from the command line, and nothing already installed is overwritten. Import World and custom-skin selection open your real desktop file chooser.</p>
+        </details>
+        <details>
+          <summary>Does it run on ARM, a Raspberry Pi or Alpine?</summary>
+          <p>No. Every build is x86-64 and glibc-based. ARM and musl-only systems are out of scope.</p>
+        </details>
+        <details>
+          <summary>Is it free?</summary>
+          <p>Yes. BedrockOnLinux is free and open source under the MIT licence. You still need to own the game.</p>
+        </details>
+      </div>
+
+      <p class="faq-more">
+        Back to the <a href="index.html">home page</a>.
+      </p>
+    </div>
+  </section>
+
+</main>
+
+<footer class="footer">
+  <div class="wrap footer-grid">
+    <div>
+      <p class="wordmark"><img src="icon.png" width="128" height="128" alt=""><span>BedrockOnLinux</span></p>
+      <p class="footer-note">
+        An independent compatibility project. Not affiliated with, endorsed by or
+        supported by Mojang or Microsoft. Minecraft is a trademark of Mojang AB.
+      </p>
+    </div>
+    <nav aria-label="Project">
+      <h2 class="footer-h">Project</h2>
+      <a href="details.html">Requirements and details</a>
+      <a href="https://github.com/Wyze3306/BedrockOnLinux">Source code</a>
+      <a href="https://github.com/Wyze3306/BedrockOnLinux/releases/latest">Releases</a>
+      <a href="https://github.com/Wyze3306/BedrockOnLinux/blob/main/CHANGELOG.md">Changelog</a>
+      <a href="https://github.com/Wyze3306/BedrockOnLinux/issues">Issues</a>
+    </nav>
+    <nav aria-label="Licences">
+      <h2 class="footer-h">Licences</h2>
+      <a href="https://github.com/Wyze3306/BedrockOnLinux/blob/main/LICENSE">BedrockOnLinux (MIT)</a>
+      <a href="https://github.com/xodus-gaming/xodus">Xodus (GPL-3.0)</a>
+      <a href="https://github.com/Wyze3306/BedrockOnLinux/tree/main/third_party">Third-party provenance</a>
+    </nav>
+  </div>
+</footer>
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    { "@type": "Question", "name": "Does it run on Steam Deck?", "acceptedAnswer": { "@type": "Answer", "text": "Yes, Game Mode included. Add either the launcher or the generated Minecraft Bedrock shortcut as a non-Steam game. In Game Mode the launcher steps aside while the game runs, then comes back when you quit." } },
+    { "@type": "Question", "name": "Can I install an older Minecraft version?", "acceptedAnswer": { "@type": "Answer", "text": "No. The Xbox CDN serves only the current build of each edition, so there is no way to match a server frozen on an older one. Updates arrive on their own." } },
+    { "@type": "Question", "name": "Does it work on Wayland?", "acceptedAnswer": { "@type": "Answer", "text": "The launcher window needs X11 or XWayland, and the game normally uses XWayland too. Native Wine Wayland is available with BOL_INPUT=wayland, but it is experimental and does not remove the launcher's own requirement." } },
+    { "@type": "Question", "name": "Does it modify Minecraft?", "acceptedAnswer": { "@type": "Answer", "text": "Not while it runs. The engine never scans or rewrites the Minecraft process, and packaging rejects any build that still contains that code. Before launch, three files on disk are adjusted: two Wine libraries and the game executable's stack size, which prevents a crash in the settings and pause menus. Every edit checks a byte fingerprint first and is skipped when the bytes no longer match." } },
+    { "@type": "Question", "name": "Can I bring my worlds, add-ons and skins?", "acceptedAnswer": { "@type": "Answer", "text": "Yes. Files ending in .mcworld, .mcaddon, .mcpack, .mctemplate and .mcskin import from the command line, and nothing already installed is overwritten. Import World and custom-skin selection open your real desktop file chooser." } },
+    { "@type": "Question", "name": "Does it run on ARM, a Raspberry Pi or Alpine?", "acceptedAnswer": { "@type": "Answer", "text": "No. Every build is x86-64 and glibc-based. ARM and musl-only systems are out of scope." } },
+    { "@type": "Question", "name": "Is it free?", "acceptedAnswer": { "@type": "Answer", "text": "Yes. BedrockOnLinux is free and open source under the MIT licence. You still need to own the game." } }
+  ]
+}
+</script>
+
+</body>
+</html>

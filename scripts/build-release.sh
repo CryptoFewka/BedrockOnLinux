@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
 # Build unreleased Linux candidate artifacts: .deb, AppImage, portable .pyz,
-# and a local/dev Flatpak bundle.
+# and a Flatpak bundle.
+#
+# BOL_RELEASE_CHANNEL selects where the Flatpak's app payload comes from:
+#   release (default) — the tracked Flathub manifest, i.e. the pinned tag. The
+#                       checkout must be that tag; the payload audit compares
+#                       the built tree against it.
+#   nightly           — this working tree, like every other artifact here. The
+#                       pinned tag is by definition behind the default branch
+#                       between releases, so building it would ship a Flatpak
+#                       that does not match the .deb/AppImage/.pyz next to it
+#                       and would fail that same audit.
+#   prerelease        — this working tree too: a versioned pre-release is
+#                       built from a branch the Flathub manifest does not pin.
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -11,6 +23,15 @@ XCURL_REV="$(grep -m1 '^OPENSSL_XCURL_REV = ' "$SRC/bol/config.py" | cut -d'"' -
 XCURL_SHA="$(grep -m1 '^OPENSSL_XCURL_ARCHIVE_SHA256 = ' "$SRC/bol/config.py" | cut -d'"' -f2)"
 OUT="$SRC/dist"
 mkdir -p "$OUT"
+CHANNEL="${BOL_RELEASE_CHANNEL:-release}"
+case "$CHANNEL" in
+  release) FLATPAK_NOTE="" ;;
+  nightly|prerelease) FLATPAK_NOTE=" (working tree, not the pinned tag)" ;;
+  *)
+    echo "!! BOL_RELEASE_CHANNEL must be 'release', 'nightly' or 'prerelease', got '$CHANNEL'" >&2
+    exit 1
+    ;;
+esac
 SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-1782250551}"
 [[ "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]] || {
   echo "!! SOURCE_DATE_EPOCH must be a non-negative integer" >&2
@@ -23,6 +44,7 @@ cleanup_build_trees() {
   # dist/.cache; current builds use XDG_CACHE_HOME, so remove that legacy tree
   # as well. Do not touch config.txt, engine candidates, or XCurl assets.
   rm -rf "$OUT/appimagetool" "$OUT/BedrockOnLinux.AppDir" "$OUT/deb" \
+         "$OUT/rpm" "$OUT/rpmbuild" \
          "$OUT/portable" "$OUT/pyz-stage" "$OUT/flatpak-build" "$OUT/.cache"
   rm -f "$OUT"/BedrockOnLinux-*-SHA256SUMS.tmp.* \
         "$OUT/appimage-build.log" "$OUT/flatpak-build.log"
@@ -36,9 +58,11 @@ cleanup_build_trees
 shopt -s nullglob
 old_application_artifacts=(
   "$OUT"/bedrock-on-linux_*.deb
+  "$OUT"/bedrock-on-linux-*.rpm
   "$OUT"/bedrock-on-linux-*.pyz
   "$OUT"/BedrockOnLinux-x86_64.AppImage
   "$OUT"/BedrockOnLinux-*-x86_64.AppImage
+  "$OUT"/BedrockOnLinux-*-x86_64.AppImage.zsync
   "$OUT"/BedrockOnLinux-*-x86_64.flatpak
   "$OUT"/BedrockOnLinux-*-SHA256SUMS
   "$OUT"/*portable.tar.gz
@@ -116,8 +140,25 @@ else
   required_failures+=(".deb")
 fi
 
-# The zipapp needs host Python 3 and tkinter; login dependencies can be
-# installed on first use by bol/deps.py.
+RPM="$OUT/bedrock-on-linux-${VER}-1.x86_64.rpm"
+if command -v rpmbuild >/dev/null; then
+  rm -f -- "$RPM"
+  if bash "$SRC/scripts/build-rpm.sh" >/dev/null && [[ -s "$RPM" ]]; then
+    echo "  ✓ dist/$(basename "$RPM")"
+    built_artifacts+=("$RPM")
+    verified_artifacts+=("$RPM")
+  else
+    rm -f -- "$RPM"
+    echo "  !! .rpm build failed — run scripts/build-rpm.sh to see why"
+    required_failures+=(".rpm")
+  fi
+else
+  echo "  !! .rpm build unavailable (rpmbuild absent)"
+  required_failures+=(".rpm")
+fi
+
+# The zipapp needs host Python 3; GUI and login dependencies (PySide6-Essentials,
+# cryptography, …) can be installed on first use by bol/deps.py.
 STAGE="$OUT/pyz-stage"
 PYZ="$OUT/bedrock-on-linux-${VER}.pyz"
 rm -rf "$STAGE"
@@ -128,13 +169,8 @@ install -m644 "$SRC/LICENSE" "$STAGE/LICENSE"
 install -Dm644 "$SRC/data/icon.png" "$STAGE/data/icon.png"
 find "$STAGE/bol" -name __pycache__ -type d -exec rm -rf {} +
 cat > "$STAGE/__main__.py" <<'PYEOF'
-import sys
-from bol.cli import main
-try:
-    main()
-except KeyboardInterrupt:
-    print()
-    sys.exit(130)
+from bol.__main__ import main
+main()
 PYEOF
 # zipapp uses the freshly copied/generated mtimes, so two otherwise identical
 # builds receive different central-directory timestamps. Write the same
@@ -174,18 +210,26 @@ built_artifacts+=("$PYZ")
 verified_artifacts+=("$PYZ")
 
 APPIMAGE="$OUT/BedrockOnLinux-${VER}-x86_64.AppImage"
+# The .zsync sidecar carries the block checksums AppImageUpdate and friends use
+# to transfer only what changed (issue #191); it describes exactly these bytes,
+# so it is built, published and checksummed with the AppImage, never separately.
+APPIMAGE_ZSYNC="$APPIMAGE.zsync"
 # build-appimage.sh removes its output only at the packaging stage.  Remove it
 # before starting too, otherwise an early dependency/network failure could make
 # an old file look like the successful result of this invocation.
-rm -f -- "$APPIMAGE"
+rm -f -- "$APPIMAGE" "$APPIMAGE_ZSYNC"
 APPIMAGE_LOG="$OUT/appimage-build.log"
 if bash "$SRC/scripts/build-appimage.sh" >"$APPIMAGE_LOG" 2>&1 \
     && [[ -s "$APPIMAGE" ]]; then
   echo "  ✓ dist/$(basename "$APPIMAGE")"
   built_artifacts+=("$APPIMAGE")
   verified_artifacts+=("$APPIMAGE")
+  if [[ -s "$APPIMAGE_ZSYNC" ]]; then
+    echo "  ✓ dist/$(basename "$APPIMAGE_ZSYNC") (AppImage delta updates)"
+    built_artifacts+=("$APPIMAGE_ZSYNC")
+  fi
 else
-  rm -f -- "$APPIMAGE"
+  rm -f -- "$APPIMAGE" "$APPIMAGE_ZSYNC"
   echo "  !! AppImage build failed — last 40 lines of scripts/build-appimage.sh:"
   tail -n 40 "$APPIMAGE_LOG" | sed 's/^/     /'
   required_failures+=("AppImage")
@@ -197,18 +241,28 @@ if command -v flatpak-builder >/dev/null \
     || { command -v flatpak >/dev/null \
          && flatpak info org.flatpak.Builder >/dev/null 2>&1; }; then
   FLATPAK_LOG="$OUT/flatpak-build.log"
-  if bash "$SRC/scripts/build-flatpak.sh" >"$FLATPAK_LOG" 2>&1 \
-      && [[ -s "$FLATPAK" ]]; then
-    echo "  ✓ dist/$(basename "$FLATPAK")"
+  declare -a FLATPAK_ARGS=()
+  if [[ "$CHANNEL" == "release" ]]; then
+    FLATPAK_ARGS=(--release)
+  fi
+  if bash "$SRC/scripts/build-flatpak.sh" "${FLATPAK_ARGS[@]}" \
+      >"$FLATPAK_LOG" 2>&1 && [[ -s "$FLATPAK" ]]; then
+    echo "  ✓ dist/$(basename "$FLATPAK")$FLATPAK_NOTE"
     built_artifacts+=("$FLATPAK")
   else
     rm -f -- "$FLATPAK"
     echo "  !! Flatpak build failed — last 40 lines of scripts/build-flatpak.sh:"
     tail -n 40 "$FLATPAK_LOG" | sed 's/^/     /'
+    if [[ "$CHANNEL" == "release" ]] \
+        && grep -q "payload differs from checkout" "$FLATPAK_LOG"; then
+      echo "     ^ the checkout has moved past the tag the Flatpak manifest" \
+           "pins. Re-pin flatpak/*.yml to this release, or build this" \
+           "candidate with BOL_RELEASE_CHANNEL=nightly."
+    fi
     required_failures+=("Flatpak")
   fi
 else
-  echo "  – Flatpak skipped (no host or org.flatpak.Builder builder) — see flatpak/README.md"
+  echo "  – Flatpak skipped (no host or org.flatpak.Builder builder) — install it with: flatpak install flathub org.flatpak.Builder"
 fi
 
 if (( ${#required_failures[@]} )) \

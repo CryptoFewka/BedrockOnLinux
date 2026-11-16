@@ -1,0 +1,140 @@
+From: BedrockOnLinux contributors
+Subject: [PATCH] ntdll: support loading the main image from a mapped file descriptor
+
+Minecraft is no longer installed from a repackaged copy of the game.  It is
+downloaded from the Microsoft Store with the user's own account, and the
+package keeps the segments it flags KEEP_ENCRYPTED_ON_DISK -- the game
+executable on GDK titles -- encrypted at rest, exactly as on Windows.  What
+sits on disk is not a loadable PE, so the loader has nothing to open.
+
+The launcher therefore decrypts the executable into anonymous memory at launch
+and hands the loader that memory instead.  WINE_DLL_FILE_MAP carries
+"<fd>:<nt-name>" entries separated by '|', and open_main_image() consults them
+before touching the filesystem: a matching entry becomes an image section
+straight from the inherited descriptor, so the plaintext never reaches a file.
+Without a match, or without the variable, the loader takes its usual path
+unchanged, so an ordinary installation behaves exactly as before.
+
+Ported from xodus-gaming/wine commit 183d5d90b62a.  Two changes were needed
+against this tree.  The upstream commit calls the utf8_wcstombs helpers behind
+locale_private.h, which this Wine base predates; RtlUnicodeToUTF8N is that same
+pair of calls (see dlls/ntdll/unix/env.c) and is used here instead, with the
+source length in bytes as it expects.  The name buffer is malloc'd rather than
+alloca'd, since nothing else in this file uses alloca.  The upstream commit
+also adds a standalone C launcher to create the descriptor; BedrockOnLinux does
+that from Python instead, so it is not carried here.  Keeping Xodus's own
+loader contract avoids inventing a second, incompatible one for the same
+packages.
+
+Origin: https://github.com/xodus-gaming/wine commit 183d5d90b62a
+---
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -92,6 +92,7 @@
+ #include "unix_private.h"
+ #include "wine/list.h"
+ #include "wine/debug.h"
++#include "wine/server.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(module);
+ 
+@@ -1060,6 +1061,77 @@
+ 
+ 
+ /***********************************************************************
++ *           open_mapped_dll_file
++ *
++ * Map an image straight from a file descriptor listed in WINE_DLL_FILE_MAP,
++ * whose entries are "<fd>:<nt-name>" separated by '|'. Used for images that
++ * never exist on disk in loadable form.
++ */
++static NTSTATUS open_mapped_dll_file( const UNICODE_STRING *nt_name, HANDLE *mapping )
++{
++    const char *value = getenv( "WINE_DLL_FILE_MAP" );
++    const char *entry, *sep, *end;
++    char *utf8_name;
++    DWORD len_needed;
++    NTSTATUS status;
++
++    if (!value || !*value) return STATUS_DLL_NOT_FOUND;
++
++    if ((status = RtlUnicodeToUTF8N( NULL, 0, &len_needed, nt_name->Buffer, nt_name->Length )))
++        return status;
++    if (!(utf8_name = malloc( len_needed ))) return STATUS_NO_MEMORY;
++    if ((status = RtlUnicodeToUTF8N( utf8_name, len_needed, &len_needed,
++                                     nt_name->Buffer, nt_name->Length )))
++    {
++        free( utf8_name );
++        return status;
++    }
++
++    for (entry = value; *entry; entry = *end ? end + 1 : end)
++    {
++        HANDLE handle;
++        LARGE_INTEGER size;
++        size_t len;
++        int fd = 0;
++        const char *p;
++
++        end = strchr( entry, '|' );
++        if (!end) end = entry + strlen( entry );
++        if (end == entry) continue;
++
++        sep = strchr( entry, ':' );
++        if (!sep || sep >= end) continue;
++
++        for (p = entry; p < sep; p++)
++        {
++            if (*p < '0' || *p > '9')
++            {
++                fd = -1;
++                break;
++            }
++            fd = fd * 10 + (*p - '0');
++        }
++        if (fd < 0 || sep == entry || sep + 1 == end) continue;
++        len = end - sep - 1;
++        if (len != len_needed || strncmp( sep + 1, utf8_name, len )) continue;
++
++        free( utf8_name );
++        if ((status = wine_server_fd_to_handle( fd, GENERIC_READ | SYNCHRONIZE, 0, &handle )))
++            return status;
++
++        size.QuadPart = 0;
++        status = NtCreateSection( mapping, STANDARD_RIGHTS_REQUIRED | SECTION_QUERY |
++                                  SECTION_MAP_READ | SECTION_MAP_EXECUTE,
++                                  NULL, &size, PAGE_EXECUTE_READ, SEC_IMAGE, handle );
++        NtClose( handle );
++        return status;
++    }
++    free( utf8_name );
++    return STATUS_DLL_NOT_FOUND;
++}
++
++
++/***********************************************************************
+  *	open_dll_file
+  *
+  * Open a file for a new dll. Helper for open_builtin_pe_file.
+@@ -1362,6 +1434,20 @@
+     if (loadorder == LO_DISABLED) NtTerminateProcess( GetCurrentProcess(), STATUS_DLL_NOT_FOUND );
+ 
+     InitializeObjectAttributes( &attr, nt_name, OBJ_CASE_INSENSITIVE, 0, NULL );
++    status = open_mapped_dll_file( nt_name, &mapping );
++    if (!status)
++    {
++        status = virtual_map_module( mapping, module, &size, info, 0, 0, machine );
++        if (status == STATUS_IMAGE_MACHINE_TYPE_MISMATCH && info->ComPlusNativeReady)
++        {
++            info->Machine = native_machine;
++            status = STATUS_SUCCESS;
++        }
++        NtClose( mapping );
++        return status;
++    }
++    if (status != STATUS_DLL_NOT_FOUND) return status;
++
+     if (get_nt_and_unix_names( &attr, &true_nt_name, &unix_name, FILE_OPEN, FALSE )) return STATUS_DLL_NOT_FOUND;
+ 
+     status = open_dll_file( unix_name, &attr, &mapping );

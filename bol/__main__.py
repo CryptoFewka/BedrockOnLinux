@@ -1,12 +1,38 @@
-"""Entry point for ``python3 -m bol`` and the packaged zipapp (.pyz)."""
+"""The launcher's one entry point.
+
+``python3 -m bol``, the ``bedrock-on-linux`` script, the zipapp (.pyz) and
+the console script a wheel installs all run :func:`main`. ``optiscaler`` is
+not a subcommand of :mod:`bol.cli`, and the OptiScaler bootstrap has to run
+before it: an entry point that called ``bol.cli.main`` itself answered
+``bedrock-on-linux optiscaler install`` with "invalid choice" (#306).
+"""
 # SPDX-License-Identifier: MIT
 import sys
 
-from .cli import main
 
-if __name__ == "__main__":
+def main():
+    # First of all: an update that left a launcher unable to start is undone
+    # here, before anything of the new version has had a chance to fail.
+    from .rollback import guard
+    guard()
+    # Apple silicon under Asahi: Wine and FEX-Emu need the 4 KiB pages of a
+    # muvm microVM, so the whole launcher moves there before it starts
+    # anything x86-64 (#250).
+    from .hostarch import relaunch_in_muvm
+    relaunch_in_muvm()
+    if len(sys.argv) > 1 and sys.argv[1] == "optiscaler":
+        from .optiscaler import cli_main
+        entry = lambda: cli_main(sys.argv[2:])
+    else:
+        from .optiscaler import bootstrap
+        bootstrap()
+        from .cli import main as entry
     try:
-        main()
+        entry()
     except KeyboardInterrupt:
         print()
         sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,48 @@
+# Publish site/ to GitHub Pages (https://wyze3306.github.io/BedrockOnLinux/).
+# Only main deploys, so work in progress on other branches never becomes the
+# public page. Kept consistent with the rest of the pipeline: hosted runners,
+# SHA-pinned actions, least privilege.
+name: Pages
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: pages
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Check the site is self-contained
+        run: |
+          # No CDN, no remote fonts: the page must load from this origin alone.
+          # api.github.com is the one allowed remote call (the download button).
+          if grep -rEn 'https?://[^"'"'"' )]+' site/ \
+               --include='*.html' --include='*.css' --include='*.js' \
+             | grep -vE 'github\.com|api\.github\.com|discord\.gg|schema\.org|opensource\.org|sitemaps\.org|w3\.org|wyze3306\.github\.io'; then
+            echo "!! unexpected external origin in site/" >&2
+            exit 1
+          fi
+      - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5

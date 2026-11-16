@@ -222,19 +222,22 @@ def test_xdg_migration_refuses_isolated_profiles_without_splitting_roots(
     assert (profile / "games").resolve() == (old_data / "games").resolve()
 
 
+def _staging_leftovers(destination):
+    return sorted(destination.parent.glob(
+        f".{destination.name}.xdg-migration-*"
+    ))
+
+
 def test_transactional_copy_cleans_partial_staging_after_copy_failure(
         tmp_path, monkeypatch):
     source = tmp_path / "source"
     destination = tmp_path / "destination"
     source.mkdir()
     (source / "complete").write_text("source", encoding="utf-8")
-    staging = destination.with_name(
-        f".{destination.name}.xdg-migration-{os.getpid()}"
-    )
 
     def fail_after_partial_copy(_source, partial, **_kwargs):
-        partial.mkdir()
-        (partial / "incomplete").write_text("partial", encoding="utf-8")
+        Path(partial).mkdir(exist_ok=True)
+        (Path(partial) / "incomplete").write_text("partial", encoding="utf-8")
         raise OSError("disk full")
 
     monkeypatch.setattr(xdg_migration.shutil, "copytree",
@@ -243,7 +246,7 @@ def test_transactional_copy_cleans_partial_staging_after_copy_failure(
         xdg_migration._copy_tree_transactionally(source, destination)
 
     assert not destination.exists()
-    assert not staging.exists()
+    assert _staging_leftovers(destination) == []
 
 
 def test_transactional_copy_cleans_staging_after_activation_failure(
@@ -252,9 +255,6 @@ def test_transactional_copy_cleans_staging_after_activation_failure(
     destination = tmp_path / "destination"
     source.mkdir()
     (source / "complete").write_text("source", encoding="utf-8")
-    staging = destination.with_name(
-        f".{destination.name}.xdg-migration-{os.getpid()}"
-    )
 
     def fail_activation(_source, _destination):
         raise OSError("rename failed")
@@ -264,7 +264,54 @@ def test_transactional_copy_cleans_staging_after_activation_failure(
         xdg_migration._copy_tree_transactionally(source, destination)
 
     assert not destination.exists()
-    assert not staging.exists()
+    assert _staging_leftovers(destination) == []
+
+
+def test_transactional_copy_discards_a_stale_staging_tree(tmp_path):
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    (source / "world.dat").write_text("kept", encoding="utf-8")
+    # A killed earlier run (same sandbox PID) left an incomplete copy behind.
+    stale = destination.with_name(
+        f".{destination.name}.xdg-migration-{os.getpid()}"
+    )
+    stale.mkdir()
+    (stale / "incomplete").write_text("partial", encoding="utf-8")
+
+    xdg_migration._copy_tree_transactionally(source, destination)
+
+    assert (destination / "world.dat").read_text(encoding="utf-8") == "kept"
+    assert not (destination / "incomplete").exists()
+    assert not stale.exists()
+    assert _staging_leftovers(destination) == []
+
+
+def test_migration_recovers_from_a_stale_staging_tree(tmp_path):
+    old_data = tmp_path / "legacy"
+    new_data = tmp_path / "xdg" / "bedrock-on-linux"
+    (old_data / "msa").mkdir(parents=True)
+    (old_data / "msa" / "account.json").write_text(
+        '{"gamertag":"kept"}', encoding="utf-8")
+    new_data.parent.mkdir(parents=True)
+    stale = new_data.with_name(
+        f".{new_data.name}.xdg-migration-{os.getpid()}"
+    )
+    (stale / "msa").mkdir(parents=True)
+
+    assert migrate_legacy_flatpak_data(
+        environ={"FLATPAK_ID": "io.github.wyze3306.BedrockOnLinux"},
+        info_path=tmp_path / "no-flatpak-info",
+        old_data=old_data,
+        new_data=new_data,
+        old_umu=tmp_path / "no-old-umu",
+        new_umu=new_data / "umu",
+    )
+
+    assert json.loads(
+        (new_data / "msa" / "account.json").read_text())["gamertag"] == "kept"
+    assert not stale.exists()
+    assert _staging_leftovers(new_data) == []
 
 
 def test_migration_reanchors_game_dir_and_internal_content_link(tmp_path):
@@ -382,6 +429,50 @@ def test_same_directory_through_symlink_is_a_migration_noop(tmp_path):
         new_umu=actual / "umu",
     )
     assert (actual / "world.dat").read_text(encoding="utf-8") == "kept"
+
+
+def test_relocated_install_location_is_not_migrated_into(tmp_path):
+    # Relocation moves the user's data and leaves the engine, caches and logs
+    # in the old root. Reading that as legacy data put the migration lock
+    # beside the chosen folder, whose parent the user could not write to, and
+    # the launcher refused every start (#255).
+    home = tmp_path / "home"
+    leftovers = home / ".local" / "share" / "bedrock-on-linux" / "cache"
+    leftovers.mkdir(parents=True)
+    (leftovers / "engine.tar.gz").write_bytes(b"left behind")
+    mount = tmp_path / "media" / "player"
+    chosen = mount / "bedrock-on-linux"
+    chosen.mkdir(parents=True)
+    (chosen / "settings.json").write_text("{}", encoding="utf-8")
+    pointer = tmp_path / "xdg-config" / "bedrock-on-linux" / "install_location"
+    pointer.parent.mkdir(parents=True)
+    pointer.write_text(str(chosen), encoding="utf-8")
+    env = dict(os.environ)
+    env.update({
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(tmp_path / "xdg-config"),
+        "PYTHONPATH": str(ROOT),
+    })
+    for name in ("BOL_HOME", "XDG_DATA_HOME", "FLATPAK_ID"):
+        env.pop(name, None)
+
+    mount.chmod(0o555)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "from bol.util import _ensure_xdg_storage; "
+             "_ensure_xdg_storage(); print('ready')"],
+            cwd=ROOT, env=env, text=True, capture_output=True,
+        )
+    finally:
+        mount.chmod(0o755)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ready" in result.stdout
+    assert "legacy" not in result.stdout.lower()
+    assert not (mount / ".bedrock-on-linux-xdg-migration.lock").exists()
+    assert sorted(path.name for path in chosen.iterdir()) == ["settings.json"]
+    assert (leftovers / "engine.tar.gz").read_bytes() == b"left behind"
 
 
 def test_cli_migrates_before_first_flatpak_profile_command(tmp_path):

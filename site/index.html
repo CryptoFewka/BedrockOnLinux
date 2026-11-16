@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BedrockOnLinux: Minecraft Bedrock Edition on Linux</title>
+<meta name="description" content="Play Minecraft Bedrock Edition on Linux with real Xbox sign-in, friends, public servers and Realms. Free open-source launcher for Ubuntu, Fedora, Arch and Steam Deck.">
+<link rel="canonical" href="https://wyze3306.github.io/BedrockOnLinux/">
+<meta name="theme-color" content="#0F1115">
+<link rel="icon" href="icon.png" type="image/png">
+<link rel="preload" as="font" type="font/woff2" href="fonts/space-grotesk.woff2" crossorigin>
+<link rel="preload" as="font" type="font/woff2" href="fonts/ibm-plex-sans.woff2" crossorigin>
+<link rel="stylesheet" href="style.css">
+
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="BedrockOnLinux">
+<meta property="og:title" content="BedrockOnLinux: Minecraft Bedrock Edition on Linux">
+<meta property="og:description" content="Play Minecraft Bedrock Edition on Linux with real Xbox sign-in, friends, public servers and Realms. Free and open source.">
+<meta property="og:url" content="https://wyze3306.github.io/BedrockOnLinux/">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="BedrockOnLinux: Minecraft Bedrock Edition on Linux">
+<meta name="twitter:description" content="Play Minecraft Bedrock Edition on Linux with real Xbox sign-in, friends, public servers and Realms.">
+</head>
+<body>
+
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="topbar">
+  <a class="wordmark" href="#top">
+    <img src="icon.png" width="128" height="128" alt="">
+    <span>BedrockOnLinux</span>
+  </a>
+  <nav class="topbar-nav" aria-label="Primary">
+    <a href="#how">How it works</a>
+    <a href="#get">Download</a>
+    <a href="#faq">FAQ</a>
+    <a href="details.html">Details</a>
+    <a class="topbar-cta" href="#get">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"></path><path d="M7 11l5 5 5-5"></path><path d="M4 20h16"></path></svg>
+      Download
+    </a>
+  </nav>
+</header>
+
+<main id="main">
+
+  <section class="hero" id="top">
+    <div class="wrap">
+      <p class="badge"><span class="dot"></span><span>Free, open source, MIT<span id="ver"></span></span></p>
+
+      <h1>Minecraft Bedrock Edition,<br>running on Linux.</h1>
+
+      <p class="lede">
+        Sign in with your real Microsoft account and play, with Realms, public
+        servers and Xbox friends included. The game downloads from the Microsoft
+        Store under <b>your own licence</b>.
+      </p>
+
+      <div class="hero-actions">
+        <a class="btn btn-primary btn-lg" id="dl-main" href="https://github.com/Wyze3306/BedrockOnLinux/releases/latest">
+          <span class="btn-title">Download for Linux</span>
+          <span class="btn-sub" id="dl-main-sub">AppImage, works everywhere</span>
+        </a>
+        <a class="btn" href="#how">See how it works</a>
+      </div>
+
+      <ul class="distros">
+        <li>Ubuntu</li><li>Debian</li><li>Mint</li><li>Fedora</li>
+        <li>Arch</li><li>openSUSE</li><li>Steam Deck</li>
+      </ul>
+
+      <div class="shot">
+        <img src="screenshot.png" width="979" height="680"
+             alt="The BedrockOnLinux launcher, signed in and ready to play Minecraft Bedrock.">
+      </div>
+      <p class="shot-caption">One window. Pick an edition, press PLAY.</p>
+    </div>
+  </section>
+
+  <section class="band band-alt" id="how">
+    <div class="wrap">
+      <div class="section-head">
+        <p class="eyebrow">How it works</p>
+        <h2>Three steps, once.</h2>
+      </div>
+
+      <ol class="steps">
+        <li>
+          <span class="step-num" aria-hidden="true">01</span>
+          <h3>Install and open it</h3>
+          <p>One file, one click. Nothing to configure, no Wine to learn, no compiler to install.</p>
+        </li>
+        <li>
+          <span class="step-num" aria-hidden="true">02</span>
+          <h3>Sign in to Microsoft</h3>
+          <p>On Microsoft's own pages, never in the launcher. Your password stays between you and Microsoft, and only the resulting tokens are kept.</p>
+        </li>
+        <li>
+          <span class="step-num" aria-hidden="true">03</span>
+          <h3>Press PLAY</h3>
+          <p>The first run downloads Minecraft and the engine, then verifies both. Every run after that just starts the game.</p>
+        </li>
+      </ol>
+    </div>
+  </section>
+
+  <section class="band" id="get">
+    <div class="wrap">
+      <div class="section-head">
+        <p class="eyebrow">Download</p>
+        <h2 id="get-h">What are you running?</h2>
+        <p class="lede">Pick your system and take the file underneath. That is the whole decision.</p>
+      </div>
+
+      <div class="picker" role="group" aria-labelledby="get-h">
+        <input class="sr-only" type="radio" name="sys" id="sys-deb" checked>
+        <input class="sr-only" type="radio" name="sys" id="sys-rpm">
+        <input class="sr-only" type="radio" name="sys" id="sys-app">
+        <input class="sr-only" type="radio" name="sys" id="sys-deck">
+        <input class="sr-only" type="radio" name="sys" id="sys-flat">
+
+        <div class="picker-tabs">
+          <label for="sys-deb"><span class="dot" aria-hidden="true"></span>Ubuntu, Debian, Mint</label>
+          <label for="sys-rpm"><span class="dot" aria-hidden="true"></span>Fedora, Nobara</label>
+          <label for="sys-app"><span class="dot" aria-hidden="true"></span>Arch, openSUSE, anything else</label>
+          <label for="sys-deck"><span class="dot" aria-hidden="true"></span>Steam Deck</label>
+          <label for="sys-flat"><span class="dot" aria-hidden="true"></span>Bazzite, Silverblue</label>
+        </div>
+
+        <div class="picker-card">
+
+          <div class="picker-pane" id="pane-deb">
+            <div class="pick-head">
+              <div>
+                <h3>The .deb package</h3>
+                <p>Installs like any other app: it lands on your <code>PATH</code> and pulls in what it needs.</p>
+              </div>
+              <a class="btn btn-primary" data-asset="deb" href="https://github.com/Wyze3306/BedrockOnLinux/releases/latest">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"></path><path d="M7 11l5 5 5-5"></path><path d="M4 20h16"></path></svg>
+                Download .deb <span class="btn-size"></span>
+              </a>
+            </div>
+            <p class="cmd-label">Then, in a terminal</p>
+            <pre><code>sudo apt install ./<span data-file="deb">bedrock-on-linux_*_amd64.deb</span>
+bedrock-on-linux</code></pre>
+            <p>Debian, Ubuntu, Linux Mint and LMDE. Dependencies, including the WebKitGTK sign-in window, are declared for you.</p>
+          </div>
+
+          <div class="picker-pane" id="pane-rpm">
+            <div class="pick-head">
+              <div>
+                <h3>The .rpm package</h3>
+                <p>Same deal as the .deb: a real system install with its dependencies declared.</p>
+              </div>
+              <a class="btn btn-primary" data-asset="rpm" href="https://github.com/Wyze3306/BedrockOnLinux/releases/latest">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"></path><path d="M7 11l5 5 5-5"></path><path d="M4 20h16"></path></svg>
+                Download .rpm <span class="btn-size"></span>
+              </a>
+            </div>
+            <p class="cmd-label">Then, in a terminal</p>
+            <pre><code>sudo dnf install ./<span data-file="rpm">bedrock-on-linux-*.x86_64.rpm</span>
+bedrock-on-linux</code></pre>
+            <p>Fedora and Nobara. On an atomic Fedora such as Silverblue, take the Flatpak instead.</p>
+          </div>
+
+          <div class="picker-pane" id="pane-app">
+            <div class="pick-head">
+              <div>
+                <h3>The AppImage <span class="tag">Works everywhere</span></h3>
+                <p>One file that carries its own Python, GUI toolkit and certificates. Nothing to install.</p>
+              </div>
+              <a class="btn btn-primary" data-asset="appimage" href="https://github.com/Wyze3306/BedrockOnLinux/releases/latest">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"></path><path d="M7 11l5 5 5-5"></path><path d="M4 20h16"></path></svg>
+                Download AppImage <span class="btn-size"></span>
+              </a>
+            </div>
+            <p class="cmd-label">Then, in a terminal</p>
+            <pre><code>chmod +x <span data-file="appimage">BedrockOnLinux-*-x86_64.AppImage</span>
+./<span data-file="appimage">BedrockOnLinux-*-x86_64.AppImage</span></code></pre>
+            <p>No FUSE on your system? Run it with <code>APPIMAGE_EXTRACT_AND_RUN=1</code>.</p>
+          </div>
+
+          <div class="picker-pane" id="pane-deck">
+            <div class="pick-head">
+              <div>
+                <h3>On the Deck, take the AppImage</h3>
+                <p>Download it in Desktop Mode, then add it to Steam. Game Mode is handled.</p>
+              </div>
+              <a class="btn btn-primary" data-asset="appimage" href="https://github.com/Wyze3306/BedrockOnLinux/releases/latest">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"></path><path d="M7 11l5 5 5-5"></path><path d="M4 20h16"></path></svg>
+                Download AppImage <span class="btn-size"></span>
+              </a>
+            </div>
+            <p class="cmd-label">Once, in Desktop Mode</p>
+            <ol>
+              <li>Run the AppImage and sign in.</li>
+              <li>In the launcher: <span class="kbd">Tools</span> then <span class="kbd">Create direct launch shortcut</span>.</li>
+              <li>In Steam: <span class="kbd">Add a Non-Steam Game</span>, pick <i>Minecraft Bedrock</i>.</li>
+            </ol>
+            <p>In Game Mode the launcher hands the screen to Minecraft, then comes back when you quit. Steam Input and Deck fullscreen behave normally.</p>
+          </div>
+
+          <div class="picker-pane" id="pane-flat">
+            <div class="pick-head">
+              <div>
+                <h3>The Flatpak</h3>
+                <p>For atomic systems where you cannot just install a package.</p>
+              </div>
+              <a class="btn btn-primary" data-asset="flatpak" href="https://github.com/Wyze3306/BedrockOnLinux/releases/latest">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"></path><path d="M7 11l5 5 5-5"></path><path d="M4 20h16"></path></svg>
+                Download Flatpak <span class="btn-size"></span>
+              </a>
+            </div>
+            <p class="cmd-label">Then, in a terminal</p>
+            <pre><code>flatpak install --user ./<span data-file="flatpak">BedrockOnLinux-*-x86_64.flatpak</span></code></pre>
+            <p>Sandboxed, so it cannot write desktop shortcuts. The Store sign-in also needs WebKitGTK, which this runtime does not ship yet, so on Bazzite the AppImage is the smoother ride today.</p>
+          </div>
+
+        </div>
+      </div>
+
+      <p class="picker-foot">
+        Every release also ships a portable <code>.pyz</code> and SHA-256 checksums.
+        <a href="https://github.com/Wyze3306/BedrockOnLinux/releases/latest">All files and release notes are on GitHub</a>.
+      </p>
+
+      <div class="callout">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="M12 7.5v5.5"></path><path d="M12 16.4v.1"></path></svg>
+        <p>
+          <b>You need to own Minecraft.</b>
+          The game is downloaded from Microsoft's own servers under your account's
+          licence. BedrockOnLinux ships no Minecraft files and redistributes none.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section class="band band-alt">
+    <div class="wrap">
+      <div class="section-head">
+        <p class="eyebrow">What you get</p>
+        <h2>The real thing, not a workaround.</h2>
+      </div>
+
+      <div class="cards cards-2">
+        <article class="card">
+          <div class="card-icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="8" r="3.2"></circle><path d="M3 20c0-3.4 2.7-5.5 6-5.5s6 2.1 6 5.5"></path><path d="M16 5.5a3.2 3.2 0 010 5.9"></path><path d="M17.6 15c2 .8 3.4 2.5 3.4 5"></path></svg>
+          </div>
+          <h3>Real Xbox sign-in</h3>
+          <p>Friends, invitations, joining a friend's world, public servers and Realms all run on a real Microsoft identity. It is implemented natively, not proxied through anything.</p>
+        </article>
+
+        <article class="card">
+          <div class="card-icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l7.5 3v6c0 4.4-3.1 8.2-7.5 9.4C7.6 20.2 4.5 16.4 4.5 12V6z"></path><path d="M9 12.2l2.2 2.2L15.4 10"></path></svg>
+          </div>
+          <h3>Nothing repacked, nothing relayed</h3>
+          <p>The package comes straight from Microsoft's CDN with your licence, and sign-in happens directly between you, Microsoft and Xbox. No third party sits in the middle.</p>
+        </article>
+
+        <article class="card">
+          <div class="card-icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="6.5" width="19" height="11" rx="4.5"></rect><path d="M7.4 10.4v3.2M5.8 12h3.2"></path><circle cx="16.4" cy="11.2" r="1"></circle><circle cx="18.4" cy="13.4" r="1"></circle></svg>
+          </div>
+          <h3>Steam Deck, Game Mode included</h3>
+          <p>One generated shortcut and Minecraft behaves like any other non-Steam game. The launcher steps aside while you play, then comes back when you quit.</p>
+        </article>
+
+        <article class="card">
+          <div class="card-icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 10-2.4 5.7"></path><path d="M20 6.5V12h-5.4"></path></svg>
+          </div>
+          <h3>Updates that can roll back</h3>
+          <p>Engine updates are hash-pinned and swapped atomically. A bad download, a full disk or a mismatched hash leaves the version that worked exactly where it was.</p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <section class="band" id="faq">
+    <div class="wrap">
+      <div class="section-head">
+        <p class="eyebrow">FAQ</p>
+        <h2>The five questions everyone asks</h2>
+      </div>
+
+      <div class="faq">
+        <details open>
+          <summary>Do I need to own Minecraft?</summary>
+          <p>Yes. The game is downloaded from the Microsoft Store under your own account's licence, so that account has to own Minecraft Bedrock Edition. You can also point the launcher at a copy you already have.</p>
+        </details>
+        <details>
+          <summary>Is this piracy? Does it ship Minecraft files?</summary>
+          <p>No. BedrockOnLinux ships no Minecraft files and redistributes none by proxy either. It is a compatibility launcher: it fetches the real package from Microsoft's CDN with your licence, then runs it on Wine.</p>
+        </details>
+        <details>
+          <summary>Which Linux distributions work?</summary>
+          <p>Any x86-64 desktop with glibc: Ubuntu, Debian, Mint and LMDE, Fedora, Arch, openSUSE and their derivatives. Native packages for the Debian and Fedora families, an AppImage for everything else, a Flatpak for atomic systems.</p>
+        </details>
+        <details>
+          <summary>Do Realms, servers and Xbox friends work?</summary>
+          <p>Yes. Sign-in, friends, invitations, joining a friend's world, public servers and Realms all run on a real Microsoft identity, implemented natively in the engine rather than on a proxy or a relay.</p>
+        </details>
+        <details>
+          <summary>Where does my Microsoft password go?</summary>
+          <p>Not through the launcher. Xbox sign-in uses Microsoft's device-code page in your browser, and the Store sign-in opens Microsoft's own page in a webview. Only the resulting tokens are stored, in the launcher's private data folder.</p>
+        </details>
+      </div>
+
+      <p class="faq-more">
+        Requirements, what runs under the hood and six more answers are on the
+        <a href="details.html">details page</a>.
+      </p>
+    </div>
+  </section>
+
+  <section class="band" style="padding-top: 0">
+    <div class="wrap">
+      <div class="help">
+        <div>
+          <h3>Something is not working?</h3>
+          <p>Run <code>bedrock-on-linux doctor</code>. It checks your host dependencies and graphics stack and tells you what is missing, in plain words.</p>
+        </div>
+        <div class="help-actions">
+          <a class="btn btn-primary" href="https://github.com/Wyze3306/BedrockOnLinux/issues">Report a bug</a>
+          <a class="btn" href="https://discord.gg/5YJq54Yhbu">Ask on Discord</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="footer">
+  <div class="wrap footer-grid">
+    <div>
+      <p class="wordmark"><img src="icon.png" width="128" height="128" alt=""><span>BedrockOnLinux</span></p>
+      <p class="footer-note">
+        An independent compatibility project. Not affiliated with, endorsed by or
+        supported by Mojang or Microsoft. Minecraft is a trademark of Mojang AB.
+      </p>
+    </div>
+    <nav aria-label="Project">
+      <h2 class="footer-h">Project</h2>
+      <a href="details.html">Requirements and details</a>
+      <a href="https://github.com/Wyze3306/BedrockOnLinux">Source code</a>
+      <a href="https://github.com/Wyze3306/BedrockOnLinux/releases/latest">Releases</a>
+      <a href="https://github.com/Wyze3306/BedrockOnLinux/blob/main/CHANGELOG.md">Changelog</a>
+      <a href="https://github.com/Wyze3306/BedrockOnLinux/issues">Issues</a>
+    </nav>
+    <nav aria-label="Licences">
+      <h2 class="footer-h">Licences</h2>
+      <a href="https://github.com/Wyze3306/BedrockOnLinux/blob/main/LICENSE">BedrockOnLinux (MIT)</a>
+      <a href="https://github.com/xodus-gaming/xodus">Xodus (GPL-3.0)</a>
+      <a href="https://github.com/Wyze3306/BedrockOnLinux/tree/main/third_party">Third-party provenance</a>
+    </nav>
+  </div>
+</footer>
+
+<script src="main.js" defer></script>
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "BedrockOnLinux",
+  "description": "Free open-source launcher that runs Minecraft Bedrock Edition on Linux with real Xbox sign-in, friends, public servers and Realms.",
+  "applicationCategory": "GameApplication",
+  "operatingSystem": "Linux (x86-64, glibc 2.31+)",
+  "url": "https://wyze3306.github.io/BedrockOnLinux/",
+  "downloadUrl": "https://github.com/Wyze3306/BedrockOnLinux/releases/latest",
+  "installUrl": "https://github.com/Wyze3306/BedrockOnLinux/releases/latest",
+  "license": "https://opensource.org/licenses/MIT",
+  "isAccessibleForFree": true,
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+  "author": { "@type": "Person", "name": "Wyze3306", "url": "https://github.com/Wyze3306" },
+  "codeRepository": "https://github.com/Wyze3306/BedrockOnLinux"
+}
+</script>
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    { "@type": "Question", "name": "Do I need to own Minecraft?", "acceptedAnswer": { "@type": "Answer", "text": "Yes. The game is downloaded from the Microsoft Store under your own account's licence, so that account has to own Minecraft Bedrock Edition. You can also point the launcher at a copy you already have." } },
+    { "@type": "Question", "name": "Is this piracy? Does it ship Minecraft files?", "acceptedAnswer": { "@type": "Answer", "text": "No. BedrockOnLinux ships no Minecraft files and redistributes none by proxy either. It is a compatibility launcher: it fetches the real package from Microsoft's CDN with your licence, then runs it on Wine." } },
+    { "@type": "Question", "name": "Which Linux distributions work?", "acceptedAnswer": { "@type": "Answer", "text": "Any x86-64 desktop with glibc: Ubuntu, Debian, Mint and LMDE, Fedora, Arch, openSUSE and their derivatives. Native packages for the Debian and Fedora families, an AppImage for everything else, a Flatpak for atomic systems." } },
+    { "@type": "Question", "name": "Do Realms, servers and Xbox friends work?", "acceptedAnswer": { "@type": "Answer", "text": "Yes. Sign-in, friends, invitations, joining a friend's world, public servers and Realms all run on a real Microsoft identity, implemented natively in the engine rather than on a proxy or a relay." } },
+    { "@type": "Question", "name": "Where does my Microsoft password go?", "acceptedAnswer": { "@type": "Answer", "text": "Not through the launcher. Xbox sign-in uses Microsoft's device-code page in your browser, and the Store sign-in opens Microsoft's own page in a webview. Only the resulting tokens are stored, in the launcher's private data folder." } }
+  ]
+}
+</script>
+
+</body>
+</html>

@@ -9,3 +9,9 @@ __pycache__/
 .vscode/
 .claude/
 *.git-original.bak
+result
+result-*
+.direnv
+xodus-cli-*.tar.gz
+xodus-src-*.tar.gz
+xodus-webview-*.tar.xz

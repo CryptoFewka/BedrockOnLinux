@@ -33,7 +33,39 @@ readonly VENDORED_CONTEXT_CALLBACK_PATCH="$PROJECT_ROOT/third_party/winegdk-nati
 readonly VENDORED_CONTEXT_CALLBACK_PATCH_SHA256="33afb0b3bcd7678e828a955d639d3384b8b5c656219b05e9c53bb45dd7c34919"
 readonly VENDORED_CLIENT_SURFACE_PATCH="$PROJECT_ROOT/third_party/winegdk-native5/0005-winex11-use-client-surface-origin.patch"
 readonly VENDORED_CLIENT_SURFACE_PATCH_SHA256="464da914667bd9c683fb79bc7c2a4477546a73060c66f29809cfa93783cbc1c8"
+readonly VENDORED_XSTORE_PATCH="$PROJECT_ROOT/third_party/winegdk-native5/0006-xgameruntime-stop-faking-xstore-answers.patch"
+readonly VENDORED_XSTORE_PATCH_SHA256="0ae38358531a81af9b20a997d73f07b383db68afcd14cf89107dd9442f101fd1"
+readonly VENDORED_MAPPED_FD_PATCH="$PROJECT_ROOT/third_party/winegdk-native5/0007-ntdll-load-main-image-from-a-mapped-fd.patch"
+readonly VENDORED_MAPPED_FD_PATCH_SHA256="0ebb25f67183b0bb052b9cbb76f6a0aca02be89fc7be448ff94702b178e9ffc6"
+readonly VENDORED_PATH_MAP_PATCH="$PROJECT_ROOT/third_party/winegdk-native5/0008-ntdll-accept-a-path-in-the-image-map.patch"
+readonly VENDORED_PATH_MAP_PATCH_SHA256="7510e707abf9869d40b855754d58c025e1bd98cec455bef3dbec79e9d14461a3"
+readonly VENDORED_XSYSTEM_PATCH="$PROJECT_ROOT/third_party/winegdk-native5/0009-xgameruntime-support-IXSystemImpl2-5-and-stub-XSystemHandleTrack.patch"
+readonly VENDORED_XSYSTEM_PATCH_SHA256="c0a8e35717368fdc31f5ba6374ecb64aacb84cbd1dc22958077cff9ab5e2c301"
+readonly VENDORED_SAVE_PICKER_PATCH="$PROJECT_ROOT/third_party/winegdk-native5/0010-windows.storage-implement-the-file-save-picker.patch"
+readonly VENDORED_SAVE_PICKER_PATCH_SHA256="6ec2431cd854c2ae9f47ca6936dff19b0309c82ad3f3bc3fdcd0a9361ecd511c"
+readonly VENDORED_WAYLAND_SEAT_PATCH="$PROJECT_ROOT/third_party/winegdk-native5/0011-winewayland-bind-wl_seat-no-newer-than-the-pointer-listener.patch"
+readonly VENDORED_WAYLAND_SEAT_PATCH_SHA256="ed550ec1c78d581fbd21d25da429b9b37fb137e19df7128056cb2ec5340a5c59"
+readonly VENDORED_GAMING_SERVICES_PATCH="$PROJECT_ROOT/third_party/winegdk-native5/0012-xgameruntime-run-titles-that-target-a-newer-gaming-services.patch"
+readonly VENDORED_GAMING_SERVICES_PATCH_SHA256="d43c0f2cf32b624bb12d6db890d6f9a3a45e72523837310d868bec78318f59ce"
+readonly VENDORED_PRIVATE_USAGE_PATCH="$PROJECT_ROOT/third_party/winegdk-native5/0013-kernelbase-report-PrivateUsage-from-GetProcessMemoryInfo.patch"
+readonly VENDORED_PRIVATE_USAGE_PATCH_SHA256="850b8f80a23e1b9a5b25ab2b647125c7affe6650fe8f9c632678bba9dacae35e"
+readonly VENDORED_FSYNC_PATCH="$PROJECT_ROOT/third_party/winegdk-native5/0014-ntdll-server-fall-back-to-fsync-without-ntsync.patch"
+readonly VENDORED_FSYNC_PATCH_SHA256="57a7cf41297df589e369f9e059a3e3d8925de785ed588a24134ffa26b5f7f81a"
+readonly VENDORED_VM_COUNTERS_PATCH="$PROJECT_ROOT/third_party/winegdk-native5/0015-ntdll-reread-proc-self-status-through-a-kept-descriptor.patch"
+readonly VENDORED_VM_COUNTERS_PATCH_SHA256="9fa03ed50b2a5bfb68a60f55aa4b1ce4b7d842010c6b3f2c176177528a722db6"
+readonly VENDORED_TIME_ZONE_PATCH="$PROJECT_ROOT/third_party/winegdk-native5/0016-ntdll-check-the-time-zone-at-most-once-a-second.patch"
+readonly VENDORED_TIME_ZONE_PATCH_SHA256="6054f33a5a95c5beaf12039dca8b303fdfa66c4e01fb95b75479659f0aebc2d9"
+readonly VENDORED_GAME_EVENT_PATCH="$PROJECT_ROOT/third_party/winegdk-native5/0017-xgameruntime-record-the-title-s-XGameEventWrite-calls.patch"
+readonly VENDORED_GAME_EVENT_PATCH_SHA256="c791f7bcab535204649c27ade0d328f669134f6044a1130362aeb5df964b28ad"
+readonly VENDORED_INTL_PATCH="$PROJECT_ROOT/third_party/winegdk-native5/0018-jscript-add-the-Intl-object-Internet-Explorer-11-has.patch"
+readonly VENDORED_INTL_PATCH_SHA256="154f48790e2a8eecd970438cda3caf3bfea5e0b72f5012f2dd0379d3e49de61a"
+readonly VENDORED_CALL_FLAGS_PATCH="$PROJECT_ROOT/third_party/winegdk-native5/0019-jscript-call-not-get-when-METHOD-PROPERTYGET-carries-arguments.patch"
+readonly VENDORED_CALL_FLAGS_PATCH_SHA256="8e5c60b1eb3e9494abab7ff61f3e4cc8eed1f1d73a31623d76d07f24a35086fb"
+readonly VENDORED_SHELL_BROWSER_PATCH="$PROJECT_ROOT/third_party/winegdk-native5/0020-ieframe-serve-SID_SShellBrowser-from-the-WebBrowser-control.patch"
+readonly VENDORED_SHELL_BROWSER_PATCH_SHA256="b53e95a2d11125744c5abd25ad60c53d32b35adae0c451b4ff85b47b94e4c215"
 readonly SOURCE_SHA256SUMS="$PROJECT_ROOT/third_party/winegdk-native5/SOURCE-SHA256SUMS"
+readonly NTSYNC_UAPI_HEADER="$PROJECT_ROOT/third_party/linux-uapi/ntsync.h"
+readonly NTSYNC_UAPI_HEADER_SHA256="006437ee52a3e04f921df77081eb5c21c44c71f598b10ac534c6ef9e78296262"
 # Fixed build paths so Wine's embedded __FILE__ strings are stable run to run.
 readonly SRC=/winegdk/source
 readonly BUILD=/winegdk/build
@@ -48,7 +80,8 @@ readonly -a BUILD_PACKAGES=(
   libkrb5-dev libpcap-dev libpulse-dev libsdl2-dev libudev-dev libunwind-dev
   libusb-1.0-0-dev libvulkan-dev libwayland-dev libx11-dev libxcomposite-dev
   libxcursor-dev libxext-dev libxfixes-dev libxi-dev libxinerama-dev
-  libxkbcommon-dev libxrandr-dev libxrender-dev libxxf86vm-dev wayland-protocols
+  libxkbcommon-dev libxkbregistry-dev libxrandr-dev libxrender-dev
+  libxxf86vm-dev wayland-protocols
 )
 
 echo "== Installing build dependencies"
@@ -56,6 +89,33 @@ export DEBIAN_FRONTEND=noninteractive
 bash "$PROJECT_ROOT/scripts/pin-apt-snapshot.sh" bullseye
 apt-get update -qq
 apt-get install -y --no-install-recommends git "${BUILD_PACKAGES[@]}" >/dev/null
+
+echo "== Installing the vendored linux/ntsync.h UAPI header"
+# Bullseye's linux-libc-dev is kernel 5.10 and predates ntsync, so configure
+# would leave HAVE_LINUX_NTSYNC_H undefined and compile Wine's whole
+# in-process synchronization backend out to stubs. Every Win32 wait would then
+# be a wineserver round-trip, which serialises Minecraft's worker threads and
+# makes the game behave as if it were single-threaded (issues #63/#139/#143/
+# #148/#150). The header is a frozen ioctl ABI; see third_party/linux-uapi.
+[ -f "$NTSYNC_UAPI_HEADER" ] \
+  || { echo "!! missing vendored linux/ntsync.h" >&2; exit 1; }
+[ "$(sha256sum "$NTSYNC_UAPI_HEADER" | cut -d' ' -f1)" = \
+  "$NTSYNC_UAPI_HEADER_SHA256" ] \
+  || { echo "!! vendored linux/ntsync.h hash mismatch" >&2; exit 1; }
+if cmp -s "$NTSYNC_UAPI_HEADER" /usr/include/linux/ntsync.h 2>/dev/null; then
+  : # already the reviewed header
+elif [ -e /usr/include/linux/ntsync.h ] \
+     && grep -q "NTSYNC_IOC_EVENT_READ" /usr/include/linux/ntsync.h; then
+  # Complete but not ours: a build-input change that needs review, not a
+  # silent build against an unreviewed ABI.
+  echo "!! /usr/include/linux/ntsync.h differs from the vendored copy" >&2
+  exit 1
+else
+  # Absent, or the 6.10-6.13 preview UAPI with only two ioctls. That preview
+  # defines HAVE_LINUX_NTSYNC_H so configure looks satisfied, yet Wine gates
+  # the backend on NTSYNC_IOC_EVENT_READ and still compiles it out.
+  install -D -m 0644 "$NTSYNC_UAPI_HEADER" /usr/include/linux/ntsync.h
+fi
 
 echo "== Exporting pinned WineGDK source ($EXPECTED_COMMIT)"
 git config --global --add safe.directory '*'
@@ -107,6 +167,155 @@ git -C "$SRC" apply --check "$VENDORED_CLIENT_SURFACE_PATCH" \
   || { echo "!! X11 client-surface patch does not apply" >&2; exit 1; }
 git -C "$SRC" apply "$VENDORED_CLIENT_SURFACE_PATCH"
 
+echo "== Applying the XStore honest-failure fix"
+[ -f "$VENDORED_XSTORE_PATCH" ] \
+  || { echo "!! missing XStore patch" >&2; exit 1; }
+[ "$(sha256sum "$VENDORED_XSTORE_PATCH" | cut -d' ' -f1)" = \
+  "$VENDORED_XSTORE_PATCH_SHA256" ] \
+  || { echo "!! XStore patch hash mismatch" >&2; exit 1; }
+git -C "$SRC" apply --check "$VENDORED_XSTORE_PATCH" \
+  || { echo "!! XStore patch does not apply" >&2; exit 1; }
+git -C "$SRC" apply "$VENDORED_XSTORE_PATCH"
+
+echo "== Applying the ntdll mapped-fd main-image loader"
+[ -f "$VENDORED_MAPPED_FD_PATCH" ] \
+  || { echo "!! missing ntdll mapped-fd patch" >&2; exit 1; }
+[ "$(sha256sum "$VENDORED_MAPPED_FD_PATCH" | cut -d' ' -f1)" = \
+  "$VENDORED_MAPPED_FD_PATCH_SHA256" ] \
+  || { echo "!! ntdll mapped-fd patch hash mismatch" >&2; exit 1; }
+git -C "$SRC" apply --check "$VENDORED_MAPPED_FD_PATCH" \
+  || { echo "!! ntdll mapped-fd patch does not apply" >&2; exit 1; }
+git -C "$SRC" apply "$VENDORED_MAPPED_FD_PATCH"
+
+echo "== Applying the ntdll image-map path support"
+[ -f "$VENDORED_PATH_MAP_PATCH" ] \
+  || { echo "!! missing ntdll image-map path patch" >&2; exit 1; }
+[ "$(sha256sum "$VENDORED_PATH_MAP_PATCH" | cut -d' ' -f1)" = \
+  "$VENDORED_PATH_MAP_PATCH_SHA256" ] \
+  || { echo "!! ntdll image-map path patch hash mismatch" >&2; exit 1; }
+git -C "$SRC" apply --check "$VENDORED_PATH_MAP_PATCH" \
+  || { echo "!! ntdll image-map path patch does not apply" >&2; exit 1; }
+git -C "$SRC" apply "$VENDORED_PATH_MAP_PATCH"
+
+echo "== Applying the XSystem interface revisions"
+[ -f "$VENDORED_XSYSTEM_PATCH" ] \
+  || { echo "!! missing XSystem interface patch" >&2; exit 1; }
+[ "$(sha256sum "$VENDORED_XSYSTEM_PATCH" | cut -d' ' -f1)" = \
+  "$VENDORED_XSYSTEM_PATCH_SHA256" ] \
+  || { echo "!! XSystem interface patch hash mismatch" >&2; exit 1; }
+git -C "$SRC" apply --check "$VENDORED_XSYSTEM_PATCH" \
+  || { echo "!! XSystem interface patch does not apply" >&2; exit 1; }
+git -C "$SRC" apply "$VENDORED_XSYSTEM_PATCH"
+
+echo "== Applying the Windows.Storage file save picker"
+[ -f "$VENDORED_SAVE_PICKER_PATCH" ] \
+  || { echo "!! missing file save picker patch" >&2; exit 1; }
+[ "$(sha256sum "$VENDORED_SAVE_PICKER_PATCH" | cut -d' ' -f1)" = \
+  "$VENDORED_SAVE_PICKER_PATCH_SHA256" ] \
+  || { echo "!! file save picker patch hash mismatch" >&2; exit 1; }
+git -C "$SRC" apply --check "$VENDORED_SAVE_PICKER_PATCH" \
+  || { echo "!! file save picker patch does not apply" >&2; exit 1; }
+git -C "$SRC" apply "$VENDORED_SAVE_PICKER_PATCH"
+
+echo "== Applying the Wayland seat version fix"
+[ -f "$VENDORED_WAYLAND_SEAT_PATCH" ] \
+  || { echo "!! missing Wayland seat version patch" >&2; exit 1; }
+[ "$(sha256sum "$VENDORED_WAYLAND_SEAT_PATCH" | cut -d' ' -f1)" = \
+  "$VENDORED_WAYLAND_SEAT_PATCH_SHA256" ] \
+  || { echo "!! Wayland seat version patch hash mismatch" >&2; exit 1; }
+git -C "$SRC" apply --check "$VENDORED_WAYLAND_SEAT_PATCH" \
+  || { echo "!! Wayland seat version patch does not apply" >&2; exit 1; }
+git -C "$SRC" apply "$VENDORED_WAYLAND_SEAT_PATCH"
+
+echo "== Applying the Gaming Services version fix"
+[ -f "$VENDORED_GAMING_SERVICES_PATCH" ] \
+  || { echo "!! missing Gaming Services version patch" >&2; exit 1; }
+[ "$(sha256sum "$VENDORED_GAMING_SERVICES_PATCH" | cut -d' ' -f1)" = \
+  "$VENDORED_GAMING_SERVICES_PATCH_SHA256" ] \
+  || { echo "!! Gaming Services version patch hash mismatch" >&2; exit 1; }
+git -C "$SRC" apply --check "$VENDORED_GAMING_SERVICES_PATCH" \
+  || { echo "!! Gaming Services version patch does not apply" >&2; exit 1; }
+git -C "$SRC" apply "$VENDORED_GAMING_SERVICES_PATCH"
+
+echo "== Applying the GetProcessMemoryInfo PrivateUsage fix"
+[ -f "$VENDORED_PRIVATE_USAGE_PATCH" ] \
+  || { echo "!! missing PrivateUsage patch" >&2; exit 1; }
+[ "$(sha256sum "$VENDORED_PRIVATE_USAGE_PATCH" | cut -d' ' -f1)" = \
+  "$VENDORED_PRIVATE_USAGE_PATCH_SHA256" ] \
+  || { echo "!! PrivateUsage patch hash mismatch" >&2; exit 1; }
+git -C "$SRC" apply --check "$VENDORED_PRIVATE_USAGE_PATCH" \
+  || { echo "!! PrivateUsage patch does not apply" >&2; exit 1; }
+git -C "$SRC" apply "$VENDORED_PRIVATE_USAGE_PATCH"
+
+echo "== Applying the fsync fallback for kernels without ntsync"
+[ -f "$VENDORED_FSYNC_PATCH" ] \
+  || { echo "!! missing fsync fallback patch" >&2; exit 1; }
+[ "$(sha256sum "$VENDORED_FSYNC_PATCH" | cut -d' ' -f1)" = \
+  "$VENDORED_FSYNC_PATCH_SHA256" ] \
+  || { echo "!! fsync fallback patch hash mismatch" >&2; exit 1; }
+git -C "$SRC" apply --check "$VENDORED_FSYNC_PATCH" \
+  || { echo "!! fsync fallback patch does not apply" >&2; exit 1; }
+git -C "$SRC" apply "$VENDORED_FSYNC_PATCH"
+echo "== Applying the per-frame process memory counters fix"
+[ -f "$VENDORED_VM_COUNTERS_PATCH" ] \
+  || { echo "!! missing process memory counters patch" >&2; exit 1; }
+[ "$(sha256sum "$VENDORED_VM_COUNTERS_PATCH" | cut -d' ' -f1)" = \
+  "$VENDORED_VM_COUNTERS_PATCH_SHA256" ] \
+  || { echo "!! process memory counters patch hash mismatch" >&2; exit 1; }
+git -C "$SRC" apply --check "$VENDORED_VM_COUNTERS_PATCH" \
+  || { echo "!! process memory counters patch does not apply" >&2; exit 1; }
+git -C "$SRC" apply "$VENDORED_VM_COUNTERS_PATCH"
+
+echo "== Applying the per-frame time zone check fix"
+[ -f "$VENDORED_TIME_ZONE_PATCH" ] \
+  || { echo "!! missing time zone check patch" >&2; exit 1; }
+[ "$(sha256sum "$VENDORED_TIME_ZONE_PATCH" | cut -d' ' -f1)" = \
+  "$VENDORED_TIME_ZONE_PATCH_SHA256" ] \
+  || { echo "!! time zone check patch hash mismatch" >&2; exit 1; }
+git -C "$SRC" apply --check "$VENDORED_TIME_ZONE_PATCH" \
+  || { echo "!! time zone check patch does not apply" >&2; exit 1; }
+git -C "$SRC" apply "$VENDORED_TIME_ZONE_PATCH"
+
+echo "== Applying the XGameEvent runtime class"
+[ -f "$VENDORED_GAME_EVENT_PATCH" ] \
+  || { echo "!! missing XGameEvent patch" >&2; exit 1; }
+[ "$(sha256sum "$VENDORED_GAME_EVENT_PATCH" | cut -d' ' -f1)" = \
+  "$VENDORED_GAME_EVENT_PATCH_SHA256" ] \
+  || { echo "!! XGameEvent patch hash mismatch" >&2; exit 1; }
+git -C "$SRC" apply --check "$VENDORED_GAME_EVENT_PATCH" \
+  || { echo "!! XGameEvent patch does not apply" >&2; exit 1; }
+git -C "$SRC" apply "$VENDORED_GAME_EVENT_PATCH"
+
+echo "== Applying the jscript Intl object"
+[ -f "$VENDORED_INTL_PATCH" ] \
+  || { echo "!! missing jscript Intl patch" >&2; exit 1; }
+[ "$(sha256sum "$VENDORED_INTL_PATCH" | cut -d' ' -f1)" = \
+  "$VENDORED_INTL_PATCH_SHA256" ] \
+  || { echo "!! jscript Intl patch hash mismatch" >&2; exit 1; }
+git -C "$SRC" apply --check "$VENDORED_INTL_PATCH" \
+  || { echo "!! jscript Intl patch does not apply" >&2; exit 1; }
+git -C "$SRC" apply "$VENDORED_INTL_PATCH"
+
+echo "== Applying the jscript call flags fix"
+[ -f "$VENDORED_CALL_FLAGS_PATCH" ] \
+  || { echo "!! missing jscript call flags patch" >&2; exit 1; }
+[ "$(sha256sum "$VENDORED_CALL_FLAGS_PATCH" | cut -d' ' -f1)" = \
+  "$VENDORED_CALL_FLAGS_PATCH_SHA256" ] \
+  || { echo "!! jscript call flags patch hash mismatch" >&2; exit 1; }
+git -C "$SRC" apply --check "$VENDORED_CALL_FLAGS_PATCH" \
+  || { echo "!! jscript call flags patch does not apply" >&2; exit 1; }
+git -C "$SRC" apply "$VENDORED_CALL_FLAGS_PATCH"
+
+echo "== Applying the ieframe shell browser window fix"
+[ -f "$VENDORED_SHELL_BROWSER_PATCH" ] \
+  || { echo "!! missing ieframe shell browser patch" >&2; exit 1; }
+[ "$(sha256sum "$VENDORED_SHELL_BROWSER_PATCH" | cut -d' ' -f1)" = \
+  "$VENDORED_SHELL_BROWSER_PATCH_SHA256" ] \
+  || { echo "!! ieframe shell browser patch hash mismatch" >&2; exit 1; }
+git -C "$SRC" apply --check "$VENDORED_SHELL_BROWSER_PATCH" \
+  || { echo "!! ieframe shell browser patch does not apply" >&2; exit 1; }
+git -C "$SRC" apply "$VENDORED_SHELL_BROWSER_PATCH"
+
 echo "== Verifying reviewed source hashes"
 [ -f "$SOURCE_SHA256SUMS" ] || { echo "!! missing SOURCE-SHA256SUMS" >&2; exit 1; }
 [ "$(sha256sum "$SOURCE_SHA256SUMS" | cut -d' ' -f1)" = \
@@ -120,10 +329,52 @@ echo "== Configuring + building WineGDK (i386 + x86_64)"
   SOURCE_DATE_EPOCH="$EXPECTED_SOURCE_DATE_EPOCH" \
     "$SRC/configure" --enable-archs=i386,x86_64 --disable-tests --prefix="$PREFIX"
   SOURCE_DATE_EPOCH="$EXPECTED_SOURCE_DATE_EPOCH" make -j"$(nproc)"
-  make install )
+  # Stripped, the way Wine itself installs a release: its install rule strips
+  # each module and writes the builtin mark back onto the PE ones. The
+  # debugging sections were two thirds of the engine: 2.5 GB installed,
+  # 863 MB to download, and again in every prefix.
+  SOURCE_DATE_EPOCH="$EXPECTED_SOURCE_DATE_EPOCH" \
+    make install INSTALL_PROGRAM_FLAGS=-s )
+# strip rewrites each PE file with the time of the run (binutils 2.35 does
+# not read SOURCE_DATE_EPOCH there); put the link time back.
+python3 "$PROJECT_ROOT/scripts/pe-stamp.py" "$EXPECTED_SOURCE_DATE_EPOCH" \
+  "$PREFIX/lib/wine"
 # Wine's installed headers embed the builder's absolute source path and are not
 # runtime material; drop them so the prefix is relocatable + reproducible.
 rm -rf "$PREFIX/include"
+
+# Fail closed if the in-process synchronization backend was compiled out. The
+# "/dev/ntsync" literal only survives when NTSYNC_IOC_EVENT_READ was defined,
+# so this is a direct check that the ntsync path is really in the artifact.
+echo "== Verifying in-process synchronization (ntsync) is compiled in"
+ntsync_servers=0
+for server in "$PREFIX"/bin/wineserver "$PREFIX"/bin-wow64/wineserver; do
+  [ -f "$server" ] || continue
+  ntsync_servers=$((ntsync_servers + 1))
+  grep -qa "/dev/ntsync" "$server" \
+    || { echo "!! $server has no ntsync path — in-process sync compiled out" >&2; exit 1; }
+  # 0014: kernels without ntsync fall back to futex_waitv. The server only
+  # reads WINEFSYNC when that backend is compiled in.
+  grep -qa "WINEFSYNC" "$server" \
+    || { echo "!! $server has no fsync fallback — 0014 not built" >&2; exit 1; }
+done
+[ "$ntsync_servers" -gt 0 ] \
+  || { echo "!! no wineserver below $PREFIX to verify" >&2; exit 1; }
+
+# Fail closed if the Wayland driver was configured out. configure disables it
+# without stopping the build when any of wayland-client, wayland-scanner,
+# xkbcommon, xkbregistry or <linux/input.h> is missing, and the packager then
+# overlays this prefix onto the GE-Proton base: every module we did not build
+# survives from that base, so a missing winewayland.drv does not leave a hole,
+# it leaves Proton's Wine 10 one next to our Wine 11 win32u.so. The two ABIs do
+# not match, the driver fails to load on its win32u imports, and BOL_INPUT=
+# wayland can never start the game (issue #180).
+echo "== Verifying the Wayland driver was built"
+for module in lib/wine/x86_64-unix/winewayland.so \
+              lib/wine/x86_64-windows/winewayland.drv; do
+  [ -f "$PREFIX/$module" ] \
+    || { echo "!! $module was not built — Wayland driver configured out" >&2; exit 1; }
+done
 
 # ntdll.so links libunwind (configure autodetects libunwind-dev), but the
 # pressure-vessel/sniper runtime ships no libunwind, so bundle the exact bullseye

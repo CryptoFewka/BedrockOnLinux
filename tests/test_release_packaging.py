@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -31,10 +32,24 @@ BUILD_RELEASE = ROOT / "scripts/build-release.sh"
 PACKAGE_ENGINE = ROOT / "scripts/package-engine.sh"
 RUN_CANDIDATE = ROOT / "scripts/run-candidate.sh"
 
+# The scripts these tests write stand in for real ones and are executed. A
+# build sandbox such as Guix's has no /usr/bin/env to find bash through, so
+# they name the bash on PATH, as its packaging does for the real ones (#303).
+_BASH = shutil.which("bash") or "/usr/bin/env bash"
+
+
+# The engine pin is blank between adding an engine patch and publishing the
+# build that carries it, and the release scripts refuse a candidate in that
+# state on purpose. These tests exercise the packaging mechanics rather than
+# that gate (verify-release-candidate.sh owns it), so they stand in a
+# syntactically valid pin while the real one is unset.
+_PLACEHOLDER_ENGINE_SHA = "ee" * 32
+_ENGINE_SHA = WINEGDK_ARCHIVE_SHA256 or _PLACEHOLDER_ENGINE_SHA
+
 
 def _config(version=VERSION, rev=WINEGDK_BUILD_REV,
             source_commit=WINEGDK_SOURCE_COMMIT,
-            archive_sha=WINEGDK_ARCHIVE_SHA256,
+            archive_sha=_ENGINE_SHA,
             xcurl_rev=OPENSSL_XCURL_REV,
             xcurl_sha=OPENSSL_XCURL_ARCHIVE_SHA256,
             umu_version=UMU_VERSION,
@@ -63,11 +78,28 @@ def _bol_regular_files():
             yield path, relative.as_posix()
 
 
+def _payload_bytes(source, relative):
+    """The payload byte-for-byte, except for an engine pin that is still unset.
+
+    Between adding an engine patch and publishing the build that carries it,
+    WINEGDK_ARCHIVE_SHA256 is deliberately blank and the release scripts refuse
+    such a candidate. That gate has its own test; here it would only stop the
+    packaging mechanics from being exercised at all.
+    """
+    data = source.read_bytes()
+    if relative == "bol/config.py" and not WINEGDK_ARCHIVE_SHA256:
+        data = data.replace(
+            b'WINEGDK_ARCHIVE_SHA256 = ""',
+            b'WINEGDK_ARCHIVE_SHA256 = "%s"' % _PLACEHOLDER_ENGINE_SHA.encode())
+    return data
+
+
 def _copy_bol_payload(destination):
     for source, relative in _bol_regular_files():
         output = destination / Path(relative).relative_to("bol")
         output.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, output)
+        output.write_bytes(_payload_bytes(source, relative))
+        shutil.copystat(source, output)
 
 
 class CandidateMetadataTests(unittest.TestCase):
@@ -78,10 +110,33 @@ class CandidateMetadataTests(unittest.TestCase):
     def tearDown(self):
         self.tmpdir.cleanup()
 
+    def _staged_checkout(self):
+        """A checkout the verifier can read, with the engine pin filled in.
+
+        verify-release-candidate.sh resolves the checkout from its own path and
+        refuses outright while WINEGDK_ARCHIVE_SHA256 is unset, which is the
+        release gate doing its job (test_release_gate_* covers it). Staging a
+        copy keeps these packaging tests measuring packaging rather than
+        whether an engine happens to be published today.
+        """
+        staged = self.base / "checkout"
+        if staged.exists():
+            return staged
+        _copy_bol_payload(staged / "bol")
+        (staged / "scripts").mkdir(parents=True)
+        shutil.copy2(VERIFY, staged / "scripts" / VERIFY.name)
+        (staged / "data").mkdir(parents=True)
+        for relative in ("LICENSE", "data/icon.png",
+                         "data/bedrock-on-linux.desktop"):
+            shutil.copy2(ROOT / relative, staged / relative)
+        return staged
+
     def _run(self, *artifacts):
+        staged = self._staged_checkout()
         return subprocess.run(
-            [str(VERIFY), *(str(path) for path in artifacts)],
-            cwd=ROOT,
+            [str(staged / "scripts" / VERIFY.name),
+             *(str(path) for path in artifacts)],
+            cwd=staged,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -105,7 +160,7 @@ class CandidateMetadataTests(unittest.TestCase):
                 elif relative in replacements:
                     archive.writestr(relative, replacements[relative])
                 else:
-                    archive.write(source, relative)
+                    archive.writestr(relative, _payload_bytes(source, relative))
             for relative, payload in extras.items():
                 archive.writestr(relative, payload)
             archive.write(ROOT / "LICENSE", "LICENSE")
@@ -198,11 +253,95 @@ class CandidateMetadataTests(unittest.TestCase):
         )
         return package
 
+    def _rpm(self, architecture="x86_64", version=VERSION,
+             rev=WINEGDK_BUILD_REV, requires=()):
+        if shutil.which("rpmbuild") is None or shutil.which("rpm") is None \
+                or shutil.which("rpm2cpio") is None \
+                or shutil.which("cpio") is None:
+            self.skipTest("rpm tooling not installed")
+        root = self.base / ("rpm-root-" + architecture)
+        top = self.base / ("rpm-top-" + architecture)
+        bol_root = root / "usr/lib/bedrock-on-linux/bol"
+        _copy_bol_payload(bol_root)
+        config = bol_root / "config.py"
+        license_file = root / "usr/share/licenses/bedrock-on-linux/LICENSE"
+        license_file.parent.mkdir(parents=True)
+        desktop = root / "usr/share/applications/bedrock-on-linux.desktop"
+        desktop.parent.mkdir(parents=True)
+        icon = root / "usr/share/icons/hicolor/256x256/apps/bedrock-on-linux.png"
+        icon.parent.mkdir(parents=True)
+        launcher = root / "usr/lib/bedrock-on-linux/bedrock-on-linux"
+        launcher.parent.mkdir(parents=True, exist_ok=True)
+        if version != VERSION or rev != WINEGDK_BUILD_REV:
+            config.write_text(_config(version, rev), encoding="utf-8")
+        shutil.copy2(ROOT / "LICENSE", license_file)
+        shutil.copy2(ROOT / "data/bedrock-on-linux.desktop", desktop)
+        shutil.copy2(ROOT / "data/icon.png", icon)
+        launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        launcher.chmod(0o755)
+        spec = top / "SPECS/candidate.spec"
+        spec.parent.mkdir(parents=True)
+        (top / "BUILD").mkdir(parents=True)
+        spec.write_text(
+            "%global debug_package %{nil}\n"
+            "%global __os_install_post %{nil}\n"
+            "Name: bedrock-on-linux-test\n"
+            f"Version: {version}\n"
+            "Release: 1\n"
+            "Summary: packaging verifier fixture\n"
+            "License: MIT\n"
+            "AutoReqProv: no\n"
+            + "".join(f"Requires: {item}\n" for item in requires) +
+            "%description\nfixture\n%files\n"
+            "/usr/lib/bedrock-on-linux\n"
+            "/usr/share/applications/bedrock-on-linux.desktop\n"
+            "/usr/share/icons/hicolor/256x256/apps/bedrock-on-linux.png\n"
+            "%dir /usr/share/licenses/bedrock-on-linux\n"
+            "/usr/share/licenses/bedrock-on-linux/LICENSE\n",
+            encoding="utf-8",
+        )
+        subprocess.run(
+            ["rpmbuild", "-bb", "--target", architecture,
+             "--define", f"_topdir {top}", "--buildroot", str(root),
+             str(spec)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        built = next((top / "RPMS").rglob("*.rpm"))
+        package = self.base / f"candidate-{architecture}.rpm"
+        shutil.move(str(built), package)
+        return package
+
     def test_accepts_matching_pyz_deb_and_appimage(self):
         result = self._run(self._pyz(), self._deb(), self._appimage())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.count("VERSION="), 3)
         self.assertIn("Candidate metadata verified", result.stdout)
+
+    def test_release_gate_refuses_an_unpinned_engine(self):
+        # Adding an engine patch blanks WINEGDK_ARCHIVE_SHA256 until the build
+        # carrying it is published. No candidate may be verified in that state,
+        # otherwise a release could ship pointing at an engine nobody built.
+        staged = self._staged_checkout()
+        config = staged / "bol/config.py"
+        original = config.read_text(encoding="utf-8")
+        config.write_text(
+            re.sub(r'^WINEGDK_ARCHIVE_SHA256 = ".*"$',
+                   'WINEGDK_ARCHIVE_SHA256 = ""',
+                   original, count=1, flags=re.MULTILINE),
+            encoding="utf-8")
+        try:
+            result = subprocess.run(
+                [str(staged / "scripts" / VERIFY.name), str(self._pyz())],
+                cwd=staged, text=True, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, check=False)
+        finally:
+            config.write_text(original, encoding="utf-8")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("WINEGDK_ARCHIVE_SHA256 is not a lowercase SHA-256 pin",
+                      result.stderr)
 
     def test_rejects_stale_engine_revision_inside_versioned_pyz(self):
         artifact = self._pyz(
@@ -218,6 +357,33 @@ class CandidateMetadataTests(unittest.TestCase):
         result = self._run(self._deb(architecture="all"))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Architecture=all, expected amd64", result.stderr)
+
+    def test_accepts_matching_rpm(self):
+        result = self._run(self._rpm())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Candidate metadata verified", result.stdout)
+
+    def test_rejects_noarch_rpm(self):
+        # The launcher only makes sense where the managed engine and the game
+        # exist, so the package must stay x86_64 like the .deb is amd64.
+        result = self._run(self._rpm(architecture="noarch"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Arch=noarch, expected x86_64", result.stderr)
+
+    def test_rejects_rpm_with_generated_python_dependencies(self):
+        # The bundled wheels ship .dist-info; if a build host's Python
+        # generator turned those into requires, the package would be
+        # uninstallable on the distributions it targets.
+        result = self._run(self._rpm(requires=("python3dist(customtkinter)",)))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("generated python3dist() dependencies", result.stderr)
+
+    def test_rejects_stale_bol_payload_inside_rpm(self):
+        artifact = self._rpm(rev="wow64-archs-stale")
+        result = self._run(artifact)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("embeds WINEGDK_BUILD_REV=wow64-archs-stale",
+                      result.stderr)
 
     def test_rejects_missing_bol_payload_file(self):
         result = self._run(self._pyz(missing={"bol/gpu_safety.py"}))
@@ -256,6 +422,66 @@ class BuildReleaseHygieneTests(unittest.TestCase):
         self.assertLess(build, required)
         self.assertIn('required_failures+=("Flatpak")', script[build:required])
 
+    def test_prerelease_channel_is_versioned_and_never_latest(self):
+        # A pre-release (3.0.0) is built from a branch the Flathub manifest
+        # does not pin, so its Flatpak comes from the checkout; it keeps its
+        # own v<VERSION> tag but must never become Latest, which is what the
+        # launcher's updater and AppImageUpdate on stable installs follow.
+        script = BUILD_RELEASE.read_text(encoding="utf-8")
+        self.assertIn(
+            'nightly|prerelease) FLATPAK_NOTE=" (working tree, not the pinned tag)" ;;',
+            script)
+        workflow = (ROOT / ".github/workflows/build-app.yml").read_text(
+            encoding="utf-8")
+        branch = workflow.index('elif [ "$channel" = "prerelease" ]; then')
+        end = workflow.index("fi", branch)
+        self.assertIn('tag="v${ver}"', workflow[branch:end])
+        self.assertIn('pre="true"', workflow[branch:end])
+        self.assertIn("make_latest: ${{ env.RELEASE_PRERELEASE == 'false' }}",
+                      workflow)
+        # An unknown channel fails instead of publishing a stable release.
+        self.assertIn("unknown channel", workflow)
+
+    def test_nightly_builds_the_flatpak_from_the_checkout(self):
+        # The manifest's pinned tag is behind the default branch between
+        # releases, so a nightly that built it would ship a Flatpak unrelated
+        # to the .deb/AppImage/.pyz beside it — and fail the payload audit,
+        # which is what stopped every nightly release after 2.1.2.
+        script = BUILD_RELEASE.read_text(encoding="utf-8")
+        self.assertIn('CHANNEL="${BOL_RELEASE_CHANNEL:-release}"', script)
+        guard = script.index('if [[ "$CHANNEL" == "release" ]]; then')
+        build = script.index('bash "$SRC/scripts/build-flatpak.sh"', guard)
+        self.assertIn("FLATPAK_ARGS=(--release)", script[guard:build])
+        self.assertNotIn(
+            'build-flatpak.sh" --release', script,
+            "the Flatpak mode must follow the channel, not be hard-coded")
+
+        workflow = (ROOT / ".github/workflows/build-app.yml").read_text(
+            encoding="utf-8")
+        self.assertIn("BOL_RELEASE_CHANNEL: ${{ inputs.channel || 'release' }}",
+                      workflow)
+
+    def test_the_appimage_delta_sidecar_ships_with_the_appimage(self):
+        # Issue #191: the .zsync holds block checksums of one exact AppImage.
+        # Published without it, or kept from a previous build, every updater
+        # would compute deltas against bytes nobody is serving — so it is
+        # cleared, checksummed, attested and uploaded with the AppImage, and
+        # never handed to the candidate verifier, which reads payloads.
+        script = BUILD_RELEASE.read_text(encoding="utf-8")
+        self.assertIn('APPIMAGE_ZSYNC="$APPIMAGE.zsync"', script)
+        self.assertIn('rm -f -- "$APPIMAGE" "$APPIMAGE_ZSYNC"', script)
+        self.assertIn('built_artifacts+=("$APPIMAGE_ZSYNC")', script)
+        self.assertNotIn('verified_artifacts+=("$APPIMAGE_ZSYNC")', script)
+
+        # The AppImage glob does not match the sidecar; each list needs it.
+        workflow = (ROOT / ".github/workflows/build-app.yml").read_text(
+            encoding="utf-8")
+        self.assertEqual(
+            workflow.count("dist/BedrockOnLinux-*-x86_64.AppImage\n"),
+            workflow.count("dist/BedrockOnLinux-*-x86_64.AppImage.zsync\n"))
+        self.assertEqual(
+            workflow.count("dist/BedrockOnLinux-*-x86_64.AppImage.zsync\n"), 3)
+
     def test_stale_app_artifacts_are_removed_but_shared_assets_survive(self):
         with tempfile.TemporaryDirectory() as directory:
             checkout = Path(directory)
@@ -289,17 +515,20 @@ class BuildReleaseHygieneTests(unittest.TestCase):
 
             # Avoid network and heavyweight package construction.  These
             # failures must be handled as optional formats by build-release.sh.
-            for name in ("build-deb.sh", "build-appimage.sh",
+            for name in ("build-deb.sh", "build-rpm.sh", "build-appimage.sh",
                          "build-flatpak.sh"):
                 (scripts / name).write_text(
-                    "#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+                    f"#!{_BASH}\nexit 1\n", encoding="utf-8")
 
             stale = (
                 dist / "BedrockOnLinux-x86_64.AppImage",
                 dist / f"BedrockOnLinux-{VERSION}-x86_64.AppImage",
                 dist / "BedrockOnLinux-1.2.9-x86_64.AppImage",
+                dist / "BedrockOnLinux-1.2.9-x86_64.AppImage.zsync",
+                dist / f"BedrockOnLinux-{VERSION}-x86_64.AppImage.zsync",
                 dist / "bedrock-on-linux-1.2.9.pyz",
                 dist / "bedrock-on-linux_1.2.9_all.deb",
+                dist / "bedrock-on-linux-1.2.9-1.x86_64.rpm",
                 dist / "BedrockOnLinux-1.2.9-SHA256SUMS",
                 dist / "BedrockOnLinux-1.2.9-portable.tar.gz",
             )
@@ -423,7 +652,7 @@ class RunCandidateSafetyTests(unittest.TestCase):
         )
         launcher = self.checkout / "bedrock-on-linux"
         launcher.write_text(
-            "#!/usr/bin/env bash\n"
+            f"#!{_BASH}\n"
             "printf '%s\\n' \"$@\" > \"$TEST_LAUNCH_MARKER\"\n",
             encoding="utf-8",
         )
@@ -500,8 +729,8 @@ class EnginePackagingComplianceTests(unittest.TestCase):
             "xgameruntime.dll.threading",
             "windows.storage.dll",
             "Microsoft.Windows.Storage.Pickers.FileOpenPicker",
-            "PickSingleFileAsync",
-            "PickMultipleFilesAsync",
+            ": file_picker_operation.cs",
+            ": multi_file_picker_operation.cs",
             "GDK-Proton10-32.tar.gz",
             "1e80f4e714f877f42101d5775bd38ca0a15a38d304e24af1f15c6deec4ebac2d",
             "4c3e3faf5bcd86779e4a69677902dd8b36a16e1136a5901e616c36d8a02b68f6",
@@ -533,9 +762,10 @@ class EnginePackagingComplianceTests(unittest.TestCase):
         )
         class_marker = script.index(
             '"Microsoft.Windows.Storage.Pickers.FileOpenPicker"', module)
-        method_marker = script.index('"PickSingleFileAsync"', class_marker)
+        method_marker = script.index(
+            '": file_picker_operation.cs"', class_marker)
         multi_method_marker = script.index(
-            '"PickMultipleFilesAsync"', method_marker)
+            '": multi_file_picker_operation.cs"', method_marker)
         registration = script.index(
             'has_file_picker_registration "$storage"', method_marker)
         loop_end = script.index("\ndone", registration)

@@ -25,6 +25,23 @@ class _Response:
         return self._payload
 
 
+class MsaRefreshResultTests(unittest.TestCase):
+    def test_invalid_grant_is_preserved_for_the_gui(self):
+        with mock.patch.object(auth, "http_post_form", return_value={
+                "error": "invalid_grant",
+                "error_description": "refresh token was revoked",
+        }):
+            self.assertEqual(auth.msa_refresh_result("old"),
+                             (None, "invalid_grant"))
+
+    def test_success_keeps_the_rotated_refresh_token(self):
+        response = {"access_token": "access", "refresh_token": "new"}
+        with mock.patch.object(auth, "http_post_form",
+                               return_value=response):
+            self.assertEqual(auth.msa_refresh_result("old"),
+                             (response, None))
+
+
 class PreauthFailureDiagnosticTests(unittest.TestCase):
     access_secret = "msa-access-token-must-not-leak"
     response_secret = "xbox-response-token-must-not-leak"
@@ -89,6 +106,67 @@ class PreauthFailureDiagnosticTests(unittest.TestCase):
         })
         self.assertIn("Xbox profile", auth.xbl_preauth_error_message())
 
+    def test_rejections_name_their_xerr_in_the_log_and_the_message(self):
+        """Every account problem reads "HTTP 401" alone; the XErr is what
+        tells a missing profile from a suspension or an unserved region."""
+
+        expiry = "2999-01-01T00:00:00Z"
+        warnings = []
+        with tempfile.TemporaryDirectory() as td:
+            urlopen = mock.Mock(side_effect=[
+                _Response(200, {"Token": "device", "NotAfter": expiry}),
+                _Response(200, {"Token": "user", "NotAfter": expiry}),
+                *[_Response(401, {"XErr": 2148916235}) for _ in range(6)],
+            ])
+            with mock.patch.object(auth, "DATA", Path(td)), \
+                    mock.patch("urllib.request.urlopen", urlopen), \
+                    mock.patch.object(auth, "warn",
+                                      side_effect=lambda text:
+                                      warnings.append(str(text))), \
+                    mock.patch.object(auth, "info"), \
+                    mock.patch.object(auth, "ok"), \
+                    mock.patch("bol.network.clock_is_unsynchronized",
+                               return_value=False):
+                self.assertFalse(auth.xbl_preauth(self.access_secret))
+                message = auth.xbl_preauth_error_message()
+
+        self.assertIn(
+            "xbl_preauth: xsts-achievements HTTP 401 (XErr 0x8015DC0B)",
+            warnings)
+        self.assertIn("country or region", message)
+        self.assertIn("0x8015DC0B", message)
+        self.assertNotIn("Xbox profile", message)
+
+    def test_known_xerr_codes_get_their_own_advice(self):
+        for code, words in ((2148916227, "suspended"),
+                            (2148916229, "family settings"),
+                            (2148916233, "no Xbox profile"),
+                            (2148916234, "terms of use")):
+            with self.subTest(code=code):
+                auth._clear_xbl_preauth_diagnostic()
+                auth._record_xbl_preauth_diagnostic(
+                    "xsts-achievements",
+                    auth._xbl_response_error(
+                        _Response(401, {"XErr": code}))[0],
+                    401, code)
+                with mock.patch("bol.network.clock_is_unsynchronized",
+                                return_value=False):
+                    message = auth.xbl_preauth_error_message()
+                self.assertIn(words, message)
+                self.assertIn("0x%08X" % code, message)
+
+    def test_unknown_xerr_keeps_the_generic_advice_and_names_the_code(self):
+        auth._clear_xbl_preauth_diagnostic()
+        self.addCleanup(auth._clear_xbl_preauth_diagnostic)
+        auth._record_xbl_preauth_diagnostic(
+            "xsts-achievements", "account", 401, 2148916299)
+        with mock.patch("bol.network.clock_is_unsynchronized",
+                        return_value=False):
+            message = auth.xbl_preauth_error_message()
+        self.assertTrue(message.startswith(
+            auth._XBL_PREAUTH_MESSAGES["account"]))
+        self.assertIn("0x8015DC4B", message)
+
     def test_child_account_error_gets_age_family_guidance(self):
         expiry = "2999-01-01T00:00:00Z"
         failure = {
@@ -107,6 +185,43 @@ class PreauthFailureDiagnosticTests(unittest.TestCase):
         self.assertEqual(diagnostic["error_code"], 2148916238)
         self.assertIn("family", auth.xbl_preauth_error_message())
 
+    def test_unreachable_token_refresh_is_reported_as_a_network_failure(self):
+        """Being offline must not read as 'Xbox Live rejected this account'."""
+
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(auth, "DATA", Path(td)), \
+                    mock.patch.object(auth, "warn"), \
+                    mock.patch.object(auth, "info"), \
+                    mock.patch.object(auth, "ok"):
+                self.assertFalse(
+                    auth.xbl_preauth("", refresh_unreachable=True))
+
+        diagnostic = auth.xbl_preauth_diagnostic()
+        self.assertEqual(diagnostic["stage"], "microsoft-token")
+        self.assertEqual(diagnostic["category"], "network")
+        self.assertIn("Internet connection", auth.xbl_preauth_error_message())
+
+    def test_a_rejected_token_asks_for_a_new_sign_in(self):
+        """Microsoft refusing the saved token is not an Xbox profile problem:
+        Xbox Live was never reached (#331)."""
+
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(auth, "DATA", Path(td)), \
+                    mock.patch.object(auth, "warn"), \
+                    mock.patch.object(auth, "info"), \
+                    mock.patch.object(auth, "ok"):
+                self.assertFalse(auth.xbl_preauth(""))
+
+        diagnostic = auth.xbl_preauth_diagnostic()
+        self.assertEqual(diagnostic["stage"], "microsoft-token")
+        self.assertEqual(diagnostic["category"], "signin")
+        with mock.patch("bol.network.clock_is_unsynchronized",
+                        return_value=True):
+            message = auth.xbl_preauth_error_message()
+        self.assertIn("Sign out in the launcher, sign in again", message)
+        self.assertNotIn("Xbox profile", message)
+        self.assertNotIn("clock", message)
+
     def test_accessor_returns_a_copy(self):
         self.run_failure(OSError("offline"))
         diagnostic = auth.xbl_preauth_diagnostic()
@@ -114,6 +229,48 @@ class PreauthFailureDiagnosticTests(unittest.TestCase):
 
         self.assertNotEqual(
             auth.xbl_preauth_diagnostic()["message"], self.response_secret)
+
+
+class ClockSkewGuidanceTests(unittest.TestCase):
+    """A drifted clock is rejected exactly like an unusable Xbox account."""
+
+    def setUp(self):
+        auth._clear_xbl_preauth_diagnostic()
+        self.addCleanup(auth._clear_xbl_preauth_diagnostic)
+
+    @staticmethod
+    def _message(category, unsynchronized):
+        auth._record_xbl_preauth_diagnostic("user-auth", category)
+        with mock.patch("bol.network.clock_is_unsynchronized",
+                        return_value=unsynchronized):
+            return auth.xbl_preauth_error_message()
+
+    def test_account_rejection_names_the_clock_when_it_is_adrift(self):
+        message = self._message("account", True)
+
+        self.assertIn("Xbox profile", message)
+        self.assertIn("clock", message)
+        self.assertIn("timedatectl set-ntp true", message)
+
+    def test_no_clock_advice_when_the_clock_is_fine(self):
+        message = self._message("account", False)
+
+        self.assertIn("Xbox profile", message)
+        self.assertNotIn("clock", message)
+
+    def test_network_failures_keep_their_own_advice(self):
+        """A dead network is not a clock problem, however adrift the clock."""
+
+        message = self._message("network", True)
+
+        self.assertIn("DNS", message)
+        self.assertNotIn("clock", message)
+
+    def test_a_failing_clock_probe_never_breaks_the_message(self):
+        auth._record_xbl_preauth_diagnostic("user-auth", "account")
+        with mock.patch("bol.network.clock_is_unsynchronized",
+                        side_effect=OSError("no timedatectl")):
+            self.assertIn("Xbox profile", auth.xbl_preauth_error_message())
 
 
 if __name__ == "__main__":

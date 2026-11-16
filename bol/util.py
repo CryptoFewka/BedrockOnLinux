@@ -3,11 +3,14 @@
 
 import http.client
 import fcntl
+import hashlib
 import json
 import os
 import shlex
+import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -19,8 +22,10 @@ from .config import (
     APP,
     CACHE,
     DATA,
+    FLATPAK_APP_ID,
     GAMES,
     LOGS,
+    PRETTY,
     PROTON_DIR,
     SETTINGS,
     UMU_DIR,
@@ -106,23 +111,154 @@ def save_settings(s):
             os.close(lock_fd)
 
 
-def apply_custom_env(env, custom_env):
-    """Merge KEY=VALUE tokens from a space-separated string into env."""
+# Compatibility variables the launcher configures itself from Settings. The
+# Advanced custom-environment field is applied last and deliberately keeps the
+# final word over them, but overriding one silently replaces a supported
+# setting: a bad value then crashes the game at every launch with nothing
+# naming the cause. Issue #134 shows what that costs — the reporter wiped the
+# whole installation three times chasing it.
+LAUNCHER_OWNED_ENV = (
+    "PROTON_ENABLE_WAYLAND",
+    "WINE_DISABLE_VULKAN_OPWR",
+    "PROTON_PREFER_SDL",
+    "PROTON_DISABLE_HIDRAW",
+    "PROTON_NO_STEAMINPUT",
+    "PROTON_NO_WM_DECORATION",
+    "PROTON_USE_WINED3D",
+    "PROTON_LOG",
+    "PROTON_LOG_DIR",
+    # ntsync is Wine 11's fast synchronization path and fsync (engine patch
+    # 0014) the only fallback when the kernel lacks it. A stale global export
+    # of either must not silently serialise every Minecraft worker thread
+    # behind the wineserver; the Advanced custom-environment field remains
+    # the supported way to turn them off.
+    "PROTON_NO_NTSYNC",
+    "PROTON_NO_FSYNC",
+)
+
+# The Settings control which configures a launcher-owned variable properly,
+# for the ones a user is likely to reach for by hand.
+LAUNCHER_OWNED_ENV_ALTERNATIVE = {
+    "PROTON_USE_WINED3D": "the Legacy compatibility renderer in Settings",
+    "PROTON_LOG": "Advanced diagnostics in Settings",
+    "PROTON_LOG_DIR": "Advanced diagnostics in Settings",
+}
+
+
+def _custom_env_pairs(custom_env, quiet=False):
+    """KEY=VALUE pairs declared by a custom-environment string."""
     if not custom_env or not str(custom_env).strip():
-        return
+        return []
     try:
         tokens = shlex.split(str(custom_env).strip())
     except ValueError as e:
-        warn(f"Custom environment variables ignored — invalid syntax ({e}). "
-             "Check for a missing closing quote.")
-        return
+        if not quiet:
+            warn(f"Custom environment variables ignored — invalid syntax "
+                 f"({e}). Check for a missing closing quote.")
+        return []
+    pairs = []
     for token in tokens:
         if "=" not in token:
             continue
         key, _, value = token.partition("=")
         key = key.strip()
         if key:
-            env[key] = value
+            pairs.append((key, value))
+    return pairs
+
+
+def custom_env_keys(custom_env):
+    """Variable names the custom-environment field would set.
+
+    Inspection only — never reports a syntax error, so that reading the field
+    to explain a crash cannot double up the warning ``apply_custom_env``
+    already emits when it applies the same string.
+    """
+    return [key for key, _ in _custom_env_pairs(custom_env, quiet=True)]
+
+
+def custom_env_map(custom_env):
+    """The KEY=VALUE pairs the custom-environment field would set.
+
+    Inspection only, like ``custom_env_keys``: never reports a syntax error,
+    so reading the field to explain a performance or crash symptom cannot
+    double up the warning ``apply_custom_env`` already emits.
+    """
+    return dict(_custom_env_pairs(custom_env, quiet=True))
+
+
+def launcher_owned_overrides(custom_env):
+    """Launcher-owned variables the custom-environment field overrides."""
+    found = []
+    for key in custom_env_keys(custom_env):
+        if key in LAUNCHER_OWNED_ENV and key not in found:
+            found.append(key)
+    return found
+
+
+def apply_custom_env(env, custom_env):
+    """Merge KEY=VALUE tokens from a space-separated string into env."""
+    for key, value in _custom_env_pairs(custom_env):
+        env[key] = value
+
+
+def steam_app_id(environ=None):
+    """The numeric Steam application ID this launch inherited, or None.
+
+    Steam exports one for its own games and one it generates for every
+    non-Steam shortcut a user adds, and everything downstream keys off that
+    32-bit number: gamescope's focus list, the overlay, the screenshot
+    manager. ``SteamGameId`` is deliberately not consulted as a fallback —
+    a non-Steam shortcut carries a 64-bit composite there, which is a
+    different identifier and would be wrong everywhere the app ID is wanted.
+    """
+    source = os.environ if environ is None else environ
+    value = str(source.get("SteamAppId", "")).strip()
+    if not (value.isascii() and value.isdigit()):
+        return None
+    return value if int(value) else None
+
+
+def launcher_command(*arguments, environ=None, argv=None,
+                     info_path=Path("/.flatpak-info"), which=None):
+    """Return a command line the user can actually run for this installation.
+
+    ``bedrock-on-linux`` only exists on PATH for the distribution packages. An
+    AppImage, a portable zipapp and the Flatpak all have to be invoked through
+    their own entry point, so printing the bare program name told those users
+    to run a command their shell cannot find (issue #136).
+    """
+    source = os.environ if environ is None else environ
+    args = " ".join(shlex.quote(str(item)) for item in arguments)
+
+    def command(*parts):
+        line = " ".join(parts)
+        return f"{line} {args}".rstrip()
+
+    if source.get("FLATPAK_ID") or Path(info_path).is_file():
+        app_id = str(source.get("FLATPAK_ID") or "").strip() or FLATPAK_APP_ID
+        return command("flatpak", "run", shlex.quote(app_id))
+
+    # AppImage mounts itself at a temporary path; APPIMAGE is the real file.
+    appimage = str(source.get("APPIMAGE") or "").strip()
+    if appimage:
+        candidate = Path(appimage).expanduser()
+        if candidate.is_file():
+            return command(shlex.quote(str(candidate)))
+
+    installed = (which or shutil.which)(APP)
+    if installed:
+        return command(APP)
+
+    # Portable zipapps and an uninstalled checkout run from an explicit path.
+    entry = ((argv if argv is not None else sys.argv) or [""])[0]
+    try:
+        launcher = Path(entry).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return command(APP)
+    if entry and launcher.is_file() and launcher.suffix != ".py":
+        return command(shlex.quote(str(launcher)))
+    return command(APP)
 
 
 def http_json(url, timeout=10):
@@ -349,6 +485,17 @@ def mc_releases(fetch_all=True, ignore_cache=False):
         for m in matches:
             parts = [int(x) if x else 0 for x in m]
             if parts[0] > 10:
+                # Article titles often carry a "YYYY.MM.DD"-style release
+                # date alongside the real version (e.g. "1.19.0, released
+                # 2023.05.01"). Without a ceiling, a 4+ digit year gets
+                # misread as an old-style "<major>.<minor>" version and
+                # reinterpreted as e.g. (1, 2023, 5, 1) -- which is high
+                # enough to pass the "recent version" filter below and lets
+                # a stale article slip back into the list. Minecraft's own
+                # version components never reach 1000, so anything at or
+                # above that is a date, not a version, and is dropped.
+                if parts[0] > 999:
+                    continue
                 parts = [1, parts[0], parts[1], parts[2]]
             res.append(tuple(parts))
         return res
@@ -400,3 +547,76 @@ def _screen_wh(runner=None):
     bol.x11.primary_output_size for how the primary monitor is found."""
     from .x11 import primary_output_size
     return primary_output_size(runner)
+
+
+def _screen_refresh_hz(runner=None):
+    """Fastest refresh rate an active output drives, or None. See
+    bol.x11.primary_output_refresh_hz for why it is the fastest one."""
+    from .x11 import primary_output_refresh_hz
+    return primary_output_refresh_hz(runner)
+
+
+def sha256_file(path):
+    """SHA-256 of a file, read in blocks so a multi-gigabyte engine fits."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def path_exists(path):
+    """Like exists(), but also true for a dangling symlink."""
+    path = Path(path)
+    return path.exists() or path.is_symlink()
+
+
+def remove_path(path):
+    """Remove a file, symlink or tree without following a directory symlink."""
+    path = Path(path)
+    try:
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.exists():
+            shutil.rmtree(path)
+    except FileNotFoundError:
+        pass
+
+
+def env_flag(value):
+    """Whether an environment or settings string opts in."""
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def sudo_invoker(environ=None, euid=None):
+    """The account that started this as root through sudo or doas, or None.
+
+    Root alone is not the question: a container that runs everything as
+    root has no one else to be. Elevated from an account, the launcher
+    reads root's data instead of that account's -- `sudo ... doctor` found
+    no GPU incident to acknowledge because the marker was in the user's
+    data, not root's (#299) -- or, where sudo keeps HOME, leaves files only
+    root can change in the user's own.
+    """
+    source = os.environ if environ is None else environ
+    if (os.geteuid() if euid is None else euid) != 0:
+        return None
+    for key in ("SUDO_USER", "DOAS_USER"):
+        name = str(source.get(key) or "").strip()
+        if name and name != "root":
+            return name
+    return None
+
+
+def refuse_sudo(environ=None, euid=None):
+    """Stop before anything is read or written as root for someone else."""
+    source = os.environ if environ is None else environ
+    invoker = sudo_invoker(source, euid)
+    if invoker is None or env_flag(source.get("BOL_ALLOW_ROOT")):
+        return
+    die(f"Run {PRETTY} as {invoker}, without sudo. As root it uses root's "
+        "copy of the game, the sign-ins and the safety records instead of "
+        "yours, or leaves files only root can change among yours, and it "
+        "would start the game as root. Nothing in it needs root: the one "
+        "system password prompt, at the first Store sign-in, asks for "
+        "itself. BOL_ALLOW_ROOT=1 overrides this.")

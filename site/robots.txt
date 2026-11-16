@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://wyze3306.github.io/BedrockOnLinux/sitemap.xml

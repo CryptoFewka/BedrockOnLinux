@@ -1,7 +1,6 @@
 """Install and validate the reviewed prebuilt WineGDK engine."""
 # SPDX-License-Identifier: MIT
 
-import hashlib
 import os
 import posixpath
 import shutil
@@ -24,7 +23,9 @@ from .proton import patch_proton
 from .util import (
     download,
     load_settings,
+    remove_path,
     save_settings,
+    sha256_file,
 )
 
 def _extract_archive(archive, destination: Path):
@@ -79,21 +80,13 @@ def _extract_archive(archive, destination: Path):
         archive.extractall(destination, members=members)
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
 def _verify_engine_archive(path: Path):
     expected = WINEGDK_ARCHIVE_SHA256.strip().lower()
     if len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
         raise ValueError(
             "launcher has no valid SHA-256 pin for engine revision %s" %
             WINEGDK_BUILD_REV)
-    actual = _sha256_file(path)
+    actual = sha256_file(path)
     if actual != expected:
         raise ValueError(
             "engine archive SHA-256 mismatch (expected %s, got %s)" %
@@ -119,17 +112,6 @@ def _wire_winegdk():
     with managed_engine_lock(PROTON_DIR):
         patch_proton(WINEGDK_OUT, strict=False)
     return WINEGDK_OUT
-
-
-def _remove_path(path: Path):
-    """Remove a file/symlink/tree without following a directory symlink."""
-    try:
-        if path.is_symlink() or path.is_file():
-            path.unlink()
-        elif path.exists():
-            shutil.rmtree(path)
-    except FileNotFoundError:
-        pass
 
 
 def _validate_engine_candidate(root: Path):
@@ -178,7 +160,7 @@ def _recover_interrupted_engine_swap_locked():
 
     if active_valid:
         try:
-            _remove_path(backup)
+            remove_path(backup)
         except OSError as exc:
             warn("Could not remove stale game-engine rollback: %s" % exc)
         return
@@ -191,7 +173,7 @@ def _recover_interrupted_engine_swap_locked():
     displaced = WINEGDK_OUT.with_name(
         "." + WINEGDK_OUT.name + ".interrupted-invalid")
     if displaced.exists() or displaced.is_symlink():
-        _remove_path(displaced)
+        remove_path(displaced)
     if active_exists:
         WINEGDK_OUT.replace(displaced)
     try:
@@ -204,7 +186,7 @@ def _recover_interrupted_engine_swap_locked():
     else:
         if displaced.exists() or displaced.is_symlink():
             try:
-                _remove_path(displaced)
+                remove_path(displaced)
             except OSError as exc:
                 warn("Recovered the game engine but could not remove the "
                      "invalid interrupted tree: %s" % exc)
@@ -220,7 +202,7 @@ def _activate_engine_locked(candidate: Path):
         if not WINEGDK_OUT.exists():
             backup.replace(WINEGDK_OUT)
         else:
-            _remove_path(backup)
+            remove_path(backup)
 
     had_current = WINEGDK_OUT.exists() or WINEGDK_OUT.is_symlink()
     if had_current:
@@ -231,20 +213,52 @@ def _activate_engine_locked(candidate: Path):
         # rename(2) is atomic on this filesystem.  Nevertheless remove a path
         # left by an exotic filesystem before putting the known-good tree back.
         if WINEGDK_OUT.exists() or WINEGDK_OUT.is_symlink():
-            _remove_path(WINEGDK_OUT)
+            remove_path(WINEGDK_OUT)
         if had_current and (backup.exists() or backup.is_symlink()):
             backup.replace(WINEGDK_OUT)
         raise
     else:
         if backup.exists() or backup.is_symlink():
             try:
-                _remove_path(backup)
+                remove_path(backup)
             except OSError as exc:
                 # The candidate is already atomically active. Cleanup failure
                 # must not be reported as a rejected install (or make setup
                 # die); recovery will validate the active tree and retry this
                 # harmless stale rollback on the next invocation.
                 warn("Could not remove old game-engine rollback: %s" % exc)
+
+
+def _prune_stale_engine_archives(keep):
+    """Drop the cached archives of every engine revision but ``keep``.
+
+    Each revision is an ~860 MB download kept in the cache, and nothing ever
+    removed one once the launcher pinned the next: a machine that followed
+    native13 through native17 carried 3.4 GiB of archives no launcher would
+    open again. An update needs room for the new archive *and* its 2.5 GiB
+    unpacked tree before the old tree is let go, so on a nearly full disk
+    those leftovers were the difference between updating and a launcher that
+    refuses its own engine. Only engine archives named for another revision
+    go, partial downloads included.
+    """
+    removed = freed = 0
+    for stale in CACHE.glob("GDK-Proton-xuser-*.tar.gz*"):
+        if stale.name in (keep, keep + ".part"):
+            continue
+        if not stale.name.endswith((".tar.gz", ".tar.gz.part")):
+            continue
+        try:
+            size = stale.stat().st_size
+            remove_path(stale)
+        except OSError as exc:
+            warn(f"Could not remove the cached archive of an older game "
+                 f"engine ({stale.name}): {exc}")
+            continue
+        removed += 1
+        freed += size
+    if removed:
+        info(f"Removed {removed} cached archive(s) of older game engines "
+             f"({freed / 1024 ** 3:.1f} GiB).")
 
 
 def _install_prebuilt_winegdk(progress=None, force=False):
@@ -305,8 +319,9 @@ def _install_prebuilt_winegdk_locked(progress=None, force=False):
         if force:
             # A release asset may have been corrected under the same filename;
             # --force must not silently reinstall the stale cached bytes.
-            _remove_path(archive)
-            _remove_path(archive.with_suffix(archive.suffix + ".part"))
+            remove_path(archive)
+            remove_path(archive.with_suffix(archive.suffix + ".part"))
+        _prune_stale_engine_archives(asset)
         if not archive.exists():
             info("Downloading the game engine (prebuilt, one-time) …")
             try:
@@ -333,7 +348,7 @@ def _install_prebuilt_winegdk_locked(progress=None, force=False):
     except Exception as e:
         warn(f"Prebuilt engine rejected ({e}) — keeping the installed engine.")
         if not local_archive:
-            _remove_path(archive)        # retry corrected bytes next time
+            remove_path(archive)        # retry corrected bytes next time
         return False
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

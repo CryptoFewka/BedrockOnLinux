@@ -1,0 +1,355 @@
+From: BedrockOnLinux contributors
+Subject: [PATCH] xgameruntime: stop faking XStore answers to a signed-in title
+
+Nothing implements the Microsoft Store behind the XStore composite, but its
+two implemented queries answered as though something did.  The game-license
+query completed with a hard-coded license and the associated-products query
+completed with a zeroed result, which reaches the caller as S_OK plus a null
+product-query handle.  A signed-in Minecraft reads that as a store that
+answered, marks its offer repository loaded, and then walks the containers the
+enumeration was supposed to fill; the first null one faults on the main thread
+while the menu is still assembling (issue #171).
+
+The asynchronous form of those answers is unsound on its own.  The blocks the
+title hands those two slots carry a task queue handle that belongs to neither
+this DLL's XTaskQueue registry nor the native GDK threading sidecar, so the
+completion cannot reach the dispatcher the title drains, and XAsyncBegin writes
+its bookkeeping into a block whose owner we cannot account for.
+
+Report E_GAMESTORE_NETWORK_ERROR from both queries and their result getters
+instead.  That needs no task queue, leaves the caller's block untouched, and
+puts store code on a path it already handles: the title retries a few times and
+then carries on with the store disabled.
+
+While in the same area, make XAsync honest about foreign task queues.  A handle
+this DLL does not own may still belong to the native sidecar, which is where
+QueryApiImpl sends CLSID_XThreadingImpl; duplicate it there and drive work,
+completion and close through the implementation that owns it, instead of
+silently moving the operation onto a thread-pool queue of our own.  Handles
+neither implementation claims still fall back to the process queue, now with a
+warning that says which implementation refused them.
+
+diff --git a/dlls/xgameruntime/GDKComponent/System/Threading/XAsync.c b/dlls/xgameruntime/GDKComponent/System/Threading/XAsync.c
+index 5174f14f0b8..3619c844edf 100644
+--- a/dlls/xgameruntime/GDKComponent/System/Threading/XAsync.c
++++ b/dlls/xgameruntime/GDKComponent/System/Threading/XAsync.c
+@@ -34,6 +34,44 @@ static inline struct async_state *impl_from_IAsyncState( IAsyncState *iface )
+     return CONTAINING_RECORD( iface, struct async_state, IAsyncState_iface );
+ }
+ 
++/* The queue an async state runs on is either one of ours or one the native GDK
++ * threading sidecar owns; the two implementations cannot dispatch each other's
++ * handles, so every queue operation has to pick the matching one. */
++static HRESULT SubmitStateCallback( struct async_state *stateImpl, XTaskQueuePort port,
++        UINT32 delayInMs, PVOID context, XTaskQueueCallback *callback )
++{
++    IXThreadingImpl *native;
++
++    if ( !stateImpl->queueIsNative )
++        return XTaskQueueSubmitDelayedCallback( stateImpl->queue, port, delayInMs,
++                context, callback );
++
++    if (!(native = WineGDKGetNativeThreading()))
++    {
++        ERR( "native threading implementation is gone, cannot dispatch queue %p\n",
++             stateImpl->queue );
++        return E_UNEXPECTED;
++    }
++    return IXThreadingImpl_XTaskQueueSubmitDelayedCallback( native, stateImpl->queue,
++            port, delayInMs, context, callback );
++}
++
++static void CloseStateQueue( struct async_state *stateImpl )
++{
++    IXThreadingImpl *native;
++
++    if ( !stateImpl->queue ) return;
++
++    if ( stateImpl->queueIsNative )
++    {
++        if ((native = WineGDKGetNativeThreading()))
++            IXThreadingImpl_XTaskQueueCloseHandle( native, stateImpl->queue );
++    }
++    else XTaskQueueCloseHandle( stateImpl->queue );
++
++    stateImpl->queue = NULL;
++}
++
+ static HRESULT WINAPI selfProviderOperation( XAsyncOp op, const XAsyncProviderData* data )
+ {
+     XAsyncWork* work;
+@@ -99,7 +137,7 @@ static ULONG WINAPI async_state_Release( IAsyncState *iface )
+ 
+         if ( cleanup != CleanupLocation_CleanedUp && impl->providerCallback )
+             impl->providerCallback( Cleanup, &impl->providerData );
+-        XTaskQueueCloseHandle( impl->queue );
++        CloseStateQueue( impl );
+         DeleteCriticalSection( &impl->cs );
+         impl->signature = 0;
+         free( impl );
+@@ -408,8 +446,26 @@ static HRESULT AllocStateNoCompletion( XAsyncBlock* asyncBlock, AsyncBlockIntern
+         }
+         else
+         {
+-            WARN( "asyncBlock queue %p is not a Wine XTaskQueue, using process queue\n", queue );
+-            queue = NULL;
++            /* QueryApiImpl routes CLSID_XThreadingImpl to the native GDK
++             * sidecar, so the queue the title passed in is a native handle.
++             * Keep the completion on it.  Titles give async calls the queue
++             * whose completion port they dispatch themselves (Minecraft
++             * drains it from the game thread), so running the callback on a
++             * thread-pool queue of ours instead would execute it concurrently
++             * with the game loop and tear the state it touches. */
++            IXThreadingImpl *native = WineGDKGetNativeThreading();
++            HRESULT qhr = native ? IXThreadingImpl_XTaskQueueDuplicateHandle(
++                    native, queue, &stateImpl->queue ) : E_NOINTERFACE;
++
++            if ( SUCCEEDED( qhr ) && stateImpl->queue )
++                stateImpl->queueIsNative = TRUE;
++            else
++            {
++                WARN( "asyncBlock queue %p belongs to neither task queue implementation "
++                      "(native duplicate 0x%08lx), using process queue\n", queue, qhr );
++                stateImpl->queue = NULL;
++                queue = NULL;
++            }
+         }
+     }
+ 
+@@ -570,7 +626,7 @@ static HRESULT SignalCompletion( IAsyncState *state )
+     if ( stateImpl->providerData.async->callback != NULL )
+     {
+         state->lpVtbl->AddRef( state );
+-        hr = XTaskQueueSubmitDelayedCallback( stateImpl->queue, Completion, 0, (PVOID)state, CompletionCallback );
++        hr = SubmitStateCallback( stateImpl, Completion, 0, (PVOID)state, CompletionCallback );
+ 
+         if ( FAILED( hr ) )
+         {
+@@ -999,8 +1055,9 @@ HRESULT XAsyncSchedule( XAsyncBlock* asyncBlock, UINT32 delayInMs )
+ 
+     ReleaseInternalGuard( impl );
+ 
+-    TRACE( "submitting to queue %p, Work port, delay %d\n", stateImpl->queue, delayInMs );
+-    hr = XTaskQueueSubmitDelayedCallback( stateImpl->queue, Work, delayInMs, (PVOID)state, WorkerCallback );
++    TRACE( "submitting to %s queue %p, Work port, delay %d\n",
++           stateImpl->queueIsNative ? "native" : "Wine", stateImpl->queue, delayInMs );
++    hr = SubmitStateCallback( stateImpl, Work, delayInMs, (PVOID)state, WorkerCallback );
+     TRACE( "XTaskQueueSubmitDelayedCallback returned 0x%08lx\n", hr );
+ 
+     if ( FAILED( hr ) )
+diff --git a/dlls/xgameruntime/GDKComponent/System/Threading/XAsync.h b/dlls/xgameruntime/GDKComponent/System/Threading/XAsync.h
+index 665927c957e..d3ad8364fc7 100644
+--- a/dlls/xgameruntime/GDKComponent/System/Threading/XAsync.h
++++ b/dlls/xgameruntime/GDKComponent/System/Threading/XAsync.h
+@@ -116,6 +116,7 @@ struct async_state
+     XAsyncBlock providerAsyncBlock;
+     XAsyncBlock* userAsyncBlock;
+     XTaskQueueHandle queue;
++    BOOLEAN queueIsNative;
+     CRITICAL_SECTION cs;
+     CONDITION_VARIABLE cv;
+     BOOLEAN waitSatisfied;
+diff --git a/dlls/xgameruntime/GDKComponent/System/XStore.c b/dlls/xgameruntime/GDKComponent/System/XStore.c
+index 47a187bad3a..11b6028dae1 100644
+--- a/dlls/xgameruntime/GDKComponent/System/XStore.c
++++ b/dlls/xgameruntime/GDKComponent/System/XStore.c
+@@ -1,6 +1,6 @@
+ /*
+  * XStore composite stub for {0dd112ac-7c24-448c-b92b-3960fb5bd30c}
+- * Uses proper XAsync pattern via the native threading DLL.
++ * No Microsoft Store service backs it; queries report a store error.
+  */
+ 
+ #include "../../private.h"
+@@ -31,95 +31,51 @@ static HRESULT WINAPI store_CreateContext( void *iface, void *user, void **conte
+     return S_OK;
+ }
+ 
+-/* --- XStore license async provider (proper XAsync pattern) --- */
+-
+-static HRESULT CALLBACK store_license_provider( XAsyncOp op, const XAsyncProviderData *data )
+-{
+-    if (!data) return E_POINTER;
+-
+-    switch (op)
+-    {
+-        case Begin:
+-            return XAsyncSchedule( data->async, 0 );
+-        case DoWork:
+-            TRACE( "license DoWork\n" );
+-            XAsyncComplete( data->async, S_OK, 144 );
+-            break;
+-        case GetResult:
+-        {
+-            /* XStoreGameLicense: skuStoreId[64], isActive, isTrialOwned, isDiscLicense, isTrial,
+-               trialTimeRemaining(4), trialUniqueId[64], expirationDate(8) */
+-            char *p = (char *)data->buffer;
+-            memcpy( p, "9NBLGGH2JHXJ", 13 );  /* skuStoreId */
+-            p[64] = 1;  /* isActive = true */
+-            p[65] = 0;  /* isTrialOwnedByThisUser = false */
+-            p[66] = 0;  /* isDiscLicense = false */
+-            p[67] = 0;  /* isTrial = false */
+-            /* trialTimeRemainingInSeconds at offset 68 = 0 */
+-            /* trialUniqueId at offset 72 = empty */
+-            /* expirationDate at offset 136 = 0 (no expiry) */
+-            break;
+-        }
+-        case Cleanup:
+-        case Cancel:
+-            break;
+-    }
+-    return S_OK;
+-}
++/* --- XStore queries ---
++ *
++ * There is no Microsoft Store service behind this composite: it exists so the
++ * title finds an XStore object at all, and the reconstructed vtable is the only
++ * description we have of its slots.  Both queries used to answer asynchronously
++ * with fabricated success - a hard-coded license and, for the product catalog,
++ * a zeroed buffer, which reaches the caller as S_OK plus a null query handle.
++ *
++ * Neither is safe.  A signed-in title reads that as "the store answered", marks
++ * its offer repository loaded and then walks containers the enumeration was
++ * supposed to fill, faulting on the first null one (bug #171).  The async form
++ * is worse still: the block those calls receive carries a task queue handle
++ * that belongs to neither this DLL's XTaskQueue nor the native GDK threading
++ * sidecar, so the completion cannot be dispatched where the title expects it
++ * and XAsyncBegin writes its bookkeeping into a block we cannot account for.
++ *
++ * Answer with a store error instead.  It needs no queue, touches nothing the
++ * title owns, and puts store code on a path it already has to handle. */
+ 
+ static HRESULT WINAPI store_QueryGameLicenseAsync( void *iface, void *context, void *asyncBlock )
+ {
+-    HRESULT hr;
+     TRACE( "iface %p, context %p, asyncBlock %p\n", iface, context, asyncBlock );
+-    hr = XAsyncBegin( asyncBlock, NULL, store_QueryGameLicenseAsync, "XStoreQueryGameLicenseAsync", store_license_provider );
+-    TRACE( "XAsyncBegin returned 0x%08lx\n", hr );
+-    return hr;
++    WARN( "no store service available, failing the game-license query\n" );
++    return E_GAMESTORE_NETWORK_ERROR;
+ }
+ 
+ static HRESULT WINAPI store_QueryGameLicenseResult( void *iface, void *asyncBlock, void *license )
+ {
+     TRACE( "iface %p, asyncBlock %p, license %p\n", iface, asyncBlock, license );
+-    return XAsyncGetResult( asyncBlock, store_QueryGameLicenseAsync, 144, license, NULL );
+-}
+-
+-/* --- XStore associated products async provider --- */
+-
+-static HRESULT CALLBACK store_products_provider( XAsyncOp op, const XAsyncProviderData *data )
+-{
+-    if (!data) return E_POINTER;
+-
+-    switch (op)
+-    {
+-        case Begin:
+-            return XAsyncSchedule( data->async, 0 );
+-        case DoWork:
+-            TRACE( "products DoWork\n" );
+-            XAsyncComplete( data->async, S_OK, sizeof(void*) );
+-            break;
+-        case GetResult:
+-            memset( data->buffer, 0, data->bufferSize );
+-            break;
+-        case Cleanup:
+-        case Cancel:
+-            break;
+-    }
+-    return S_OK;
++    return E_GAMESTORE_NETWORK_ERROR;
+ }
+ 
+ /* XStoreQueryAssociatedProductsAsync(this, storeContext, productKinds, maxItems, asyncBlock) */
+ static HRESULT WINAPI store_QueryAssociatedProductsAsync( void *iface, void *context, UINT32 kinds, UINT32 maxItems, void *asyncBlock )
+ {
+-    HRESULT hr;
+     TRACE( "iface %p, context %p, kinds %u, maxItems %u, asyncBlock %p\n", iface, context, kinds, maxItems, asyncBlock );
+-    hr = XAsyncBegin( asyncBlock, NULL, store_QueryAssociatedProductsAsync, "XStoreQueryAssociatedProductsAsync", store_products_provider );
+-    TRACE( "XAsyncBegin returned 0x%08lx\n", hr );
+-    return hr;
++    WARN( "no store service available, failing the product query\n" );
++    return E_GAMESTORE_NETWORK_ERROR;
+ }
+ 
+ static HRESULT WINAPI store_QueryAssociatedProductsResult( void *iface, void *asyncBlock, void **result )
+ {
+-    TRACE( "asyncBlock %p\n", asyncBlock );
+-    return XAsyncGetResult( asyncBlock, store_QueryAssociatedProductsAsync, sizeof(void*), result, NULL );
++    TRACE( "iface %p, asyncBlock %p, result %p\n", iface, asyncBlock, result );
++    if (result) *result = NULL;
++    return E_GAMESTORE_NETWORK_ERROR;
+ }
+ 
+ /* --- Per-slot stubs --- */
+diff --git a/dlls/xgameruntime/main.c b/dlls/xgameruntime/main.c
+index e0d7ee14071..b2503527208 100644
+--- a/dlls/xgameruntime/main.c
++++ b/dlls/xgameruntime/main.c
+@@ -30,6 +30,8 @@ static INIT_ONCE xgameruntime_threading_init_once = INIT_ONCE_STATIC_INIT;
+ static HRESULT xgameruntime_threading_init_result = E_NOTIMPL;
+ static SRWLOCK native_process_task_queue_lock = SRWLOCK_INIT;
+ static LONG native_process_task_queue_ready;
++static INIT_ONCE native_threading_impl_once = INIT_ONCE_STATIC_INIT;
++static IXThreadingImpl *native_threading_impl;
+ 
+ HRESULT WINAPI DllCanUnloadNow(void)
+ {
+@@ -116,6 +118,40 @@ done:
+     ReleaseSRWLockExclusive( &native_process_task_queue_lock );
+ }
+ 
++static BOOL CALLBACK acquire_native_threading_once( INIT_ONCE *once,
++        void *parameter, void **context )
++{
++    IXThreadingImpl *threading = NULL;
++    QueryApiImpl_ext query_api;
++
++    UNREFERENCED_PARAMETER( once );
++    UNREFERENCED_PARAMETER( parameter );
++    UNREFERENCED_PARAMETER( context );
++
++    if (!xgameruntime_threading) return TRUE;
++
++    query_api = (QueryApiImpl_ext)GetProcAddress( xgameruntime_threading,
++            "QueryApiImpl" );
++    if (query_api && SUCCEEDED( query_api( &CLSID_XThreadingImpl,
++            &IID_IXThreadingImpl, (void **)&threading ) ))
++    {
++        /* Held for the lifetime of the process: task queues created by the
++         * title outlive individual async operations, and this reference is
++         * what lets us hand their completions back to the right dispatcher. */
++        native_threading_impl = threading;
++        TRACE( "cached native threading implementation %p\n", threading );
++    }
++    return TRUE;
++}
++
++IXThreadingImpl *WineGDKGetNativeThreading( void )
++{
++    if (!InitOnceExecuteOnce( &native_threading_impl_once,
++            acquire_native_threading_once, NULL, NULL ))
++        return NULL;
++    return native_threading_impl;
++}
++
+ static BOOL CALLBACK initialize_native_threading_once( INIT_ONCE *once,
+         void *parameter, void **context )
+ {
+diff --git a/dlls/xgameruntime/private.h b/dlls/xgameruntime/private.h
+index df47cb902d9..65fdc19956e 100644
+--- a/dlls/xgameruntime/private.h
++++ b/dlls/xgameruntime/private.h
+@@ -68,6 +68,11 @@ typedef struct _INITIALIZE_OPTIONS
+ HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, void **out );
+ HRESULT WineGDKLoadGameConfig( void );
+ 
++/* QueryApiImpl hands CLSID_XThreadingImpl to the native GDK sidecar, so every
++ * task queue the title owns is a native handle.  Components that keep their own
++ * XAsync state need the same implementation back to drive those queues. */
++IXThreadingImpl *WineGDKGetNativeThreading( void );
++
+ /* Identity read from MicrosoftGame.Config.  This is deliberately separate
+  * from the launcher's OAuth client id and refresh-token cache. */
+ extern UINT32 winegdk_game_title_id;

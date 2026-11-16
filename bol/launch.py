@@ -1,6 +1,8 @@
 """bol.launch — launching Minecraft through Proton/umu."""
 # SPDX-License-Identifier: MIT
 
+import concurrent.futures
+import math
 import os
 import shlex
 import shutil
@@ -11,6 +13,7 @@ from pathlib import Path
 from .auth import (
     account_epoch_is_current,
     msa_refresh,
+    msa_signed_in,
     msa_save_for_account_epoch,
     msa_session_snapshot,
     wine_apply_winegdk_prereqs,
@@ -19,32 +22,116 @@ from .auth import (
     xbl_preauth_diagnostic,
     xbl_preauth_error_message,
 )
+from . import (
+    discord,
+    fullscreen_fix,
+    gameevents,
+    instances,
+    mods,
+    msal_flights,
+    packcache,
+    presence as xbl_presence,
+    saves,
+    slr_locales,
+    supervision,
+    virtual_desktop,
+    xodus,
+)
+from .branding import apply_branding
 from .config import CONTENT, DATA, HOME, LOGS, WINEGDK_BUILD_REV
 from .deps import ensure_login_deps
-from .fixups import _install_cryptbase_in_prefix, bump_stack_reserve
-from .gameinput import install_gameinput
-from .gamesetup import diagnose
+from .dgc import dgc_warning_message, intel_dgpus_on_legacy_driver
+from .gpus import apply_gpu_choice, hybrid_gpu_problem
+from .fixups import (
+    _install_cryptbase_in_prefix,
+    bump_stack_reserve,
+    hide_signin_button,
+)
+from .gameinput import builtin_gameinput_override, install_gameinput
+from .games import (build_version, edition_title, game_executable, is_bedrock,
+                    selected_edition, uses_xbox_live)
+from .gamesetup import (LICENCE_REFUSED, LICENCE_SERVICE_REFUSED,
+                        LICENCE_UNREACHABLE, STORE_SESSION_REFUSED, diagnose)
 from .gpu_safety import (
+    acknowledge_gpu_crash_command,
     arm_gpu_launch,
     disarm_gpu_launch,
+    in_gamescope_session,
     mark_gpu_wrapper_returned,
     require_safe_graphics_session,
     retire_idle_current_boot_marker,
 )
+from .hidraw import (keep_non_controllers_off_hidraw,
+                     playstation_pads_through_sdl)
+from .inject import start_auto_inject
+from .leftovers import LeftoverReaper
 from .log import BolError, die, info, ok, warn
+from .ntsync import inproc_sync_problem
+from .perfcheck import (
+    find_options_file,
+    frame_rate_is_unlimited,
+    performance_problems,
+    read_game_options,
+    vsync_is_on,
+)
 from .prefix import (
     active_prefix,
+    boot_failure_message,
     boot_prefix,
+    game_frame_limit,
     launch_lock,
     patch_options,
     prefix_processes,
     proton_umu_cmd,
+    restore_game_frame_limits,
+    restore_truncated_game_options,
+    seed_default_servers,
+    set_aside_game_frame_limit,
+    snapshot_game_options,
 )
+from .profiles import current_profile_info
 from .proton import custom_proton, patch_proton, proton_path
-from .util import _screen_wh, apply_custom_env, load_settings
+from .swapguard import guard_game_command
+from .util import (
+    _screen_refresh_hz,
+    _screen_wh,
+    apply_custom_env,
+    custom_env_map,
+    env_flag,
+    LAUNCHER_OWNED_ENV,
+    LAUNCHER_OWNED_ENV_ALTERNATIVE,
+    launcher_owned_overrides,
+    load_settings,
+    steam_app_id,
+)
 from .vkd3d import prepare_universal_vkd3d
+from .waylanddrv import engine_wayland_driver_problem
+from .wine_registry import reg_delete, reg_sz, update_prefix_registry
 from .winegdk import ensure_winegdk
+from .x11 import tag_steam_game_windows
 
+
+# Completes both "Minecraft starts in …" sentences below. Keep the wording in
+# one place: it is the answer to "why can I not play without signing in?".
+_OFFLINE_MODE_NOTICE = (
+    "offline mode — single-player worlds and LAN play work, while Realms, "
+    "servers, the Marketplace and Xbox friends stay unavailable until "
+    "Xbox Live sign-in succeeds."
+)
+
+# Minecraft Education's sign-in is the game's own (#351): a Microsoft 365
+# school or work account, in a window the game opens, never the Xbox Live
+# account the launcher links.
+EDUCATION_SIGNIN_NOTICE = (
+    "Minecraft Education signs in with your school or work account in a "
+    "window of its own once it starts; the Xbox account linked here is not "
+    "used for it."
+)
+
+# Asks Minecraft to open Bedrock Editor instead of the game (#286): the
+# protocol activation a Windows shortcut to "minecraft:?Editor=true" makes,
+# handed to the executable as its argument.
+EDITOR_URI = "minecraft://creator/?Editor=true"
 
 _SONY_STEAM_INPUT_HIDRAW_IDS = ",".join((
     "0x054C/0x05C4",  # DualShock 4
@@ -69,14 +156,412 @@ def _prepare_graphics_engine():
     return variant
 
 
+def _vkd3d_config_options(env):
+    """The vkd3d options currently declared, in their declared order."""
+    return [item.strip() for item in
+            env.get("VKD3D_CONFIG", "").replace(";", ",").split(",")
+            if item.strip()]
+
+
 def _require_vkd3d_config(env, option):
     """Add one vkd3d option without discarding user-provided options."""
-    options = [item.strip() for item in
-               env.get("VKD3D_CONFIG", "").replace(";", ",").split(",")
-               if item.strip()]
+    options = _vkd3d_config_options(env)
     if option not in options:
         options.append(option)
     env["VKD3D_CONFIG"] = ",".join(options)
+
+
+def _forbid_vkd3d_config(env, option):
+    """Drop one vkd3d option without discarding user-provided options."""
+    options = [item for item in _vkd3d_config_options(env) if item != option]
+    if options:
+        env["VKD3D_CONFIG"] = ",".join(options)
+    else:
+        env.pop("VKD3D_CONFIG", None)
+
+
+def _configure_ray_tracing(env, settings):
+    """Hand DXR to Minecraft, or hide it, per the Settings switch.
+
+    vkd3d-proton reports the ray tracing tier by itself once the driver
+    exposes the Vulkan ray tracing extensions, so "on" is not something to
+    declare: it is making sure nothing declares the opposite, an inherited
+    ``VKD3D_CONFIG=nodxr`` in particular. Only "off" needs a positive
+    statement, which is why the vkd3d option exists in that direction alone.
+
+    Turning it off hides Minecraft's *Ray Traced* graphics mode. It leaves
+    *Vibrant Visuals* alone: that pipeline is deferred rendering, not ray
+    tracing, and runs on GPUs that have no DXR at all.
+    """
+    if settings.get("ray_tracing", True):
+        _forbid_vkd3d_config(env, "nodxr")
+        return
+    _require_vkd3d_config(env, "nodxr")
+    info("Ray tracing is off in Settings — Minecraft's Ray Traced graphics "
+         "mode stays unavailable this launch.")
+
+
+# Renderer setting values that hand Direct3D to WineD3D.
+_WINED3D_RENDERERS = {"opengl", "wined3d", "legacy"}
+
+
+def _renders_through_wined3d(settings):
+    """Whether this launch hands Direct3D, D3D12 included, to WineD3D.
+
+    Proton then leaves vkd3d-proton out of the prefix altogether. The
+    custom-environment field has the last word over the Renderer setting, as
+    it does at launch, and is read the way Proton reads it: any value but
+    empty or "0" turns it on. An inherited variable does not count, since
+    _configure_runtime_compat drops it.
+    """
+    settings = settings or {}
+    custom = custom_env_map(settings.get("custom_env") or "")
+    if "PROTON_USE_WINED3D" in custom:
+        return custom["PROTON_USE_WINED3D"] not in ("", "0")
+    renderer = str(settings.get("renderer", "auto")).strip().lower()
+    return renderer in _WINED3D_RENDERERS
+
+
+def _warn_injection_on_wined3d(settings):
+    """Say once per launch that injected clients draw nothing on WineD3D.
+
+    Flarial and the clients like it draw their menu and HUD by hooking the
+    game's Direct3D 12 swap chain. The Legacy compatibility renderer runs the
+    game on Direct3D 11 through WineD3D, so they inject and load, and nothing
+    of theirs appears (#291).
+    """
+    settings = settings or {}
+    if not settings.get("injector_auto_enable", False):
+        return False
+    if not _renders_through_wined3d(settings):
+        return False
+    warn("Automatic DLL injection is on with the Legacy compatibility "
+         "renderer. Clients such as Flarial draw their menu and HUD through "
+         "Direct3D 12, which Legacy does not use, so they load without "
+         "showing anything. Turn Legacy off in Settings if this GPU has "
+         "Vulkan 1.3.")
+    return True
+
+
+def _requested_frame_rate(environ=None):
+    """What ``BOL_FRAME_RATE`` asks for: a rate, 0 for uncapped, or None.
+
+    None means "not set", which leaves the automatic behaviour below in
+    charge. Anything unparsable is treated the same way rather than failing a
+    launch over a typo in an environment variable.
+    """
+    raw = str((os.environ if environ is None else environ)
+              .get("BOL_FRAME_RATE", "")).strip().lower()
+    if not raw:
+        return None
+    if raw in ("0", "off", "no", "false", "none", "unlimited"):
+        return 0.0
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if math.isinf(value) and value > 0:
+        # "inf" reads as a number to Python and means no cap.
+        return 0.0
+    if not math.isfinite(value):
+        warn("BOL_FRAME_RATE=%s is not a number of frames per second — "
+             "ignored." % raw)
+        return None
+    return value if value > 0 else 0.0
+
+
+def _vsync_holds_limit(limit, options, refresh_probe=None):
+    """The refresh rate that already holds Minecraft to ``limit``, or None.
+
+    With vsync on, the game presents no faster than the display refreshes, so
+    a limit at or above the fastest display's refresh rate is one vsync keeps
+    by itself. Half a frame per second of slack lets 60 stand for a display
+    driven at 59.94 or 60.05 Hz. A display that cannot be measured answers
+    None, and the launcher then holds the limit itself as before.
+    """
+    if not vsync_is_on(options):
+        return None
+    probe = _screen_refresh_hz if refresh_probe is None else refresh_probe
+    try:
+        refresh = probe()
+    except Exception:
+        return None
+    if not refresh or refresh <= 0 or refresh > limit + 0.5:
+        return None
+    return refresh
+
+
+# How far under the display's refresh rate the launcher paces a game that
+# vsync would otherwise pace (see _configure_frame_rate_limit). The cap has to
+# stay under the rate the display really runs at, and the one RandR reports
+# can be a little off: 59.95 Hz for gamescope's 60.00 Hz output, 60 for a
+# 59.94 Hz panel. Each refresh the game misses shows its last frame twice:
+# once every 8 s at 60 Hz, every 3.5 s at 144 Hz.
+_PACE_UNDER_REFRESH = 0.002
+
+
+def _rate_under_refresh(refresh):
+    """The frame rate, to the hundredth, that keeps just under ``refresh``."""
+    return math.floor(refresh * (1.0 - _PACE_UNDER_REFRESH) * 100.0) / 100.0
+
+
+def _configure_frame_rate_limit(env, settings=None, prefix=None, environ=None,
+                                refresh_probe=None, xwayland=False):
+    """Pace Minecraft's frames with a limiter that sleeps instead of spinning.
+
+    Minecraft's own *Max Framerate* waits for each frame's deadline by polling
+    for window messages, and under Wine every empty poll is a sched_yield
+    between two getrusage calls. The main thread — the one that builds every
+    frame in Bedrock — then sits at a full core doing nothing, most of it in
+    the kernel: 99% of a core in the menu (#173), and 99% again in a loaded
+    world at 60 FPS with vsync on, about 70 points of it kernel time, since
+    with the cap below the display's refresh rate the present call never has
+    to wait. vkd3d-proton's limiter sleeps
+    until the deadline instead, so when the player has set a limit the
+    launcher holds that same rate through it, and the game's own limiter is
+    set aside for the session (see _set_aside_game_frame_limit). Nothing the
+    player chose changes: the frame rate is theirs, only the wait is cheaper.
+
+    That limiter is not free either: it ends every wait spinning, for a
+    millisecond plus a sixth of the time left, so its thread holds a fifth of
+    a core at 60 FPS — measured at 22% in the menu, against 6% for the game's
+    own main thread (#202). When vsync is on and the player's limit is no
+    lower than the fastest display's refresh rate, vsync already holds the
+    game to that limit, so only the game's own limiter is set aside and no
+    other takes its place: the same 60.0 FPS on a 60 Hz display, and that
+    thread back under 2%.
+
+    Not under Xwayland, though: on a Wayland desktop, or in gamescope. There
+    the swap chain's present-wait completes as soon as Xwayland passes the
+    frame on, not when it is shown, so neither the game's own frame latency
+    of one (it calls SetMaximumFrameLatency(1)) nor vkd3d-proton's latency
+    frames can see the frames queued behind it. With vsync alone each frame
+    reached the screen about four refreshes after the game presented it:
+    139 ms from a mouse movement to the moved picture at 60 Hz, measured in
+    gamescope against its composited output (#202). Paced just under the
+    refresh rate the queue stays empty, and the same movement shows in 75 ms,
+    still 74 ms a minute and a half later. So under Xwayland, with vsync on
+    and no limit of the player's below the refresh rate, the launcher holds
+    the game at the display's rate less _PACE_UNDER_REFRESH, and pays the
+    limiter's spin for it; the *Limit frame rate to the display* switch in
+    Settings turns that off. On a plain X11 server, where that queue was not
+    measured, vsync keeps the game alone as before (docs/INPUT-LATENCY.md).
+
+    With no limit at all — vsync off and *Max Framerate* on Unlimited —
+    nothing paces the render loop, and the main menu, the cheapest frame in
+    the game, then runs into four figures of FPS and takes most of the GPU to
+    display a still image (#150). That case is capped at the refresh rate of
+    the fastest display attached, so nobody loses a frame they could have
+    seen. The *Limit the frame rate to the display* switch in Settings turns
+    that cap off; it is on by default, because the uncapped menu is a bug
+    report and not a preference.
+
+    ``BOL_FRAME_RATE`` outranks both, since it is the only one that can name
+    a rate: 0 never caps and leaves the game to pace itself, a number always
+    caps at it, whatever the game and the switch say. Callers pass
+    ``environ`` with the Advanced custom-environment field overlaid, since
+    that field is where it is documented and it is applied too late in the
+    launch to be visible here. A ``VKD3D_FRAME_RATE`` set by hand, in either
+    place, is an answer already and is left alone.
+
+    The caps above are whole frames per second, rounded up. That is not
+    cosmetic: Proton turns VKD3D_FRAME_RATE into DXVK's dxgi.maxFrameRate,
+    which takes whole numbers only and reads one carrying a decimal point as
+    no limit at all, so a 143.85 Hz display has to be asked for as 144 — and
+    rounding up rather than down is what keeps the cap from landing just
+    under the rate the display is actually driving. The pace under the
+    refresh rate has to land just under it, so it keeps its decimals, and
+    _deliver_frame_rate_limit hands it to vkd3d-proton by another way.
+
+    None of this applies to the Legacy compatibility renderer: Proton leaves
+    vkd3d-proton out of the prefix for it, so nothing would read the limit,
+    and setting the game's own limiter aside would leave the session with no
+    limit at all (#314). The game paces itself there, as it always did.
+    """
+    source = os.environ if environ is None else environ
+    requested = _requested_frame_rate(source)
+    if requested == 0.0:
+        return None
+    if _renders_through_wined3d(settings):
+        if requested:
+            warn("BOL_FRAME_RATE has no effect with the Legacy "
+                 "compatibility renderer, which runs without vkd3d-proton. "
+                 "Set Max Framerate in Minecraft's video settings instead.")
+        return None
+    if (env.get("VKD3D_FRAME_RATE", "").strip()
+            or str(source.get("VKD3D_FRAME_RATE", "")).strip()):
+        # An inherited limit is already an explicit answer to this question.
+        return None
+
+    if requested is not None:
+        limit = math.ceil(requested)
+        info("BOL_FRAME_RATE limits Minecraft to %d FPS." % limit)
+        env["VKD3D_FRAME_RATE"] = str(limit)
+        return limit
+
+    options_path = find_options_file(prefix)
+    options = read_game_options(options_path)
+    own = game_frame_limit(options_path)
+    pace = xwayland and (settings or {}).get("limit_frame_rate", True)
+    if own:
+        refresh = _vsync_holds_limit(own, options, refresh_probe)
+        if refresh and pace:
+            return _pace_under_refresh(env, refresh, own)
+        if refresh:
+            info("Minecraft's Max Framerate is %d FPS and vsync already holds "
+                 "it to this display's %.2f Hz, so the launcher only turns "
+                 "the game's own limiter off for the session (under Wine it "
+                 "holds a whole CPU core) and puts it back when the game "
+                 "closes. In game it reads Unlimited meanwhile."
+                 % (own, refresh))
+            return own
+        info("Minecraft's Max Framerate is %d FPS. The game waits for each "
+             "frame by polling for window messages, which under Wine holds "
+             "a whole CPU core, so the launcher holds the same %d FPS "
+             "instead and puts the setting back when the game closes — in "
+             "game it reads Unlimited meanwhile." % (own, own))
+        env["VKD3D_FRAME_RATE"] = str(own)
+        return own
+
+    if pace and vsync_is_on(options):
+        probe = _screen_refresh_hz if refresh_probe is None else refresh_probe
+        try:
+            refresh = probe()
+        except Exception:
+            refresh = None
+        # Vsync still paces the game when the display cannot be measured.
+        if not refresh or refresh <= 0:
+            return None
+        return _pace_under_refresh(env, refresh)
+    if not (settings or {}).get("limit_frame_rate", True):
+        return None
+    if not frame_rate_is_unlimited(options):
+        return None
+    probe = _screen_refresh_hz if refresh_probe is None else refresh_probe
+    try:
+        refresh = probe()
+    except Exception:
+        # A display that cannot be measured must cost the cap, never the
+        # launch.
+        refresh = None
+    if not refresh or refresh <= 0:
+        # Without a refresh rate there is no defensible number to pick, and
+        # inventing one would cap a display we never measured.
+        warn("Minecraft has vsync off and Max Framerate on Unlimited, so "
+             "nothing limits how fast it draws — the main menu alone can "
+             "take most of the GPU. The launcher could not read any "
+             "display's refresh rate to cap it; set Max Framerate in Video "
+             "settings, or BOL_FRAME_RATE=<fps>.")
+        return None
+    limit = math.ceil(refresh)
+    info("Nothing in Minecraft's settings limits the frame rate (vsync off, "
+         "Max Framerate on Unlimited), so the launcher caps it at %d FPS for "
+         "this display's %.2f Hz — frames past that are never shown, and the "
+         "menu alone would otherwise take most of the GPU. Turn off 'Limit "
+         "the frame rate to the display' in Settings ▸ Advanced to render "
+         "uncapped." % (limit, refresh))
+    env["VKD3D_FRAME_RATE"] = str(limit)
+    return limit
+
+
+def _draws_through_xwayland(backend, wayland_display, own_gamescope,
+                            environ=None):
+    """Whether the game's X11 window reaches the screen through Xwayland.
+
+    It does as an X11 client of a Wayland desktop, of the gamescope the
+    launcher starts, or of the gamescope session it runs in, such as Steam's
+    Game Mode, which gives X11 clients no WAYLAND_DISPLAY. winewayland draws
+    to the compositor directly.
+    """
+    if backend == "wayland":
+        return False
+    return bool(wayland_display) or bool(own_gamescope) or \
+        in_gamescope_session(os.environ if environ is None else environ)
+
+
+def _pace_under_refresh(env, refresh, own=None):
+    """Pace a vsync'd game just under ``refresh`` (see the caller)."""
+    rate = _rate_under_refresh(refresh)
+    aside = ""
+    if own:
+        aside = (" Its own Max Framerate of %d FPS is turned off for the "
+                 "session and put back when the game closes." % own)
+    info("Vsync holds Minecraft to this display's %.2f Hz, but under "
+         "Xwayland each frame then waits several refreshes before it is "
+         "shown. The launcher paces the game at %.2f FPS instead, just under "
+         "the display, so each frame is shown at the next refresh: about "
+         "60 ms less between moving the mouse and seeing it at 60 Hz.%s Turn "
+         "off 'Limit frame rate to the display' in Settings ▸ Advanced to "
+         "leave it to vsync." % (refresh, rate, aside))
+    env["VKD3D_FRAME_RATE"] = "%.2f" % rate
+    return own or rate
+
+
+def _deliver_frame_rate_limit(env, prefix=None):
+    """Hand vkd3d-proton a frame-rate limit with decimals intact.
+
+    Proton takes VKD3D_FRAME_RATE out of the environment it starts Wine with
+    and passes it on as DXVK's dxgi.maxFrameRate, a whole number, so a value
+    such as 59.88 becomes no limit at all. Wine also adds the prefix's
+    HKCU\\Environment to the environment of the processes it starts, which
+    Proton never sees; vkd3d-proton reads its VKD3D_FRAME_RATE there with
+    decimals, and that value outranks the one DXGI passes it.
+
+    So a VKD3D_FRAME_RATE that is not a whole number moves out of ``env``
+    into the prefix, whoever set it. Every other launch removes the value,
+    so a pace chosen for one session never outlives it into the next. The
+    prefix must be stopped. Returns the rate written, or None.
+    """
+    rate = str(env.get("VKD3D_FRAME_RATE", "")).strip()
+    exact = bool(rate) and not rate.isdigit()
+    change = (reg_sz("Environment", "VKD3D_FRAME_RATE", rate) if exact
+              else reg_delete("Environment", "VKD3D_FRAME_RATE"))
+    try:
+        update_prefix_registry(
+            active_prefix() if prefix is None else prefix, user=[change])
+    except Exception as exc:
+        if not exact:
+            return None
+        # Through Proton it would mean no limit at all; vsync still paces.
+        env.pop("VKD3D_FRAME_RATE", None)
+        warn("The frame-rate limit of %s FPS could not be written into the "
+             "Wine prefix (%s), so this session runs without it."
+             % (rate, type(exc).__name__))
+        return None
+    if not exact:
+        return None
+    env.pop("VKD3D_FRAME_RATE", None)
+    return rate
+
+
+def _set_aside_game_frame_limit(prefix=None):
+    """Switch Minecraft's own limiter off once the launcher paces the frames.
+
+    Two limiters at the same rate are not one too many but one too slow: the
+    game spins on its own deadline before it ever presents, so vkd3d-proton's
+    sleep would never be reached. Called only once nothing can still be
+    writing options.txt and before its copy is taken, so the copy is of the
+    file the game will really start from. Failing is harmless: the game then
+    paces itself, exactly as it always has.
+    """
+    return set_aside_game_frame_limit(
+        find_options_file(active_prefix() if prefix is None else prefix),
+        prefix_idle=True)
+
+
+def _keep_game_out_of_swap(cmd, env):
+    """Start the game in a scope the kernel may not swap (see bol.swapguard).
+
+    A desktop short of memory otherwise pages the game out first — it is
+    what was touched least recently — and every page then comes back through
+    a major fault on the thread that needs it, mid-frame.
+    """
+    guarded, applied = guard_game_command(cmd, env)
+    if applied:
+        info("Minecraft's memory stays in RAM for this session: when memory "
+             "runs short the kernel swaps other programs, not the game "
+             "(BOL_ALLOW_GAME_SWAP=1 turns this off).")
+    return guarded
 
 
 def _steam_input_available(environ=None):
@@ -105,6 +590,170 @@ def _is_steam_deck(environ=None, product_name_path=None):
         return False
 
 
+# Long enough for a cold Steam Deck to reach the menu, short enough that a
+# launch which never opens a window still reports why before the player quits.
+_STEAM_WINDOW_TAG_DEADLINE = 180.0
+
+
+def _steam_game_window_tagger(env, exe, environ=None, single_window=None,
+                              deadline=_STEAM_WINDOW_TAG_DEADLINE,
+                              clock=time.time, tag=None):
+    """A callable that gives Minecraft's window this session's Steam identity.
+
+    Steam Game Mode presents whichever window gamescope can attribute to the
+    application Steam launched, and gamescope attributes a window either from
+    its ``STEAM_GAME`` property or by walking the owning process up to Steam's
+    reaper. Out of the Flatpak neither route reaches Minecraft: the game is
+    started through the Flatpak portal, so its process tree no longer leads
+    back to that reaper, and this engine is built from Wine rather than
+    Proton's fork, which is what sets ``STEAM_GAME``. The window is mapped and
+    rendering while gamescope considers only Steam focusable, and that reaches
+    the player as a game that is audible but never appears (#199).
+
+    Returns None when there is nothing to do, and otherwise a callable that
+    makes one attempt per call and reports True once there is no point in
+    calling it again. It keeps watching after the first success, because Wine
+    builds a new X window whenever the game changes what kind of window it
+    wants, and a replacement starts out with no identity of its own again.
+    """
+    app_id = steam_app_id(environ)
+    display = str(env.get("DISPLAY") or "").strip()
+    if not app_id or not display or env.get("PROTON_ENABLE_WAYLAND") == "1":
+        return None
+    if single_window is None:
+        single_window = single_window_session()
+    if not single_window:
+        return None
+    # Wine names a window's class after the executable it runs, lowercased.
+    wm_class = Path(exe).name.lower()
+    stamp = tag_steam_game_windows if tag is None else tag
+    started = clock()
+    tagged = set()
+    reported = set()
+
+    def attempt():
+        try:
+            fresh = stamp(app_id, wm_class, display=display, skip=tagged)
+        except Exception as error:
+            warn("Could not give the game window this session's Steam "
+                 "application ID (%s). If Minecraft stays invisible in Game "
+                 "Mode, this is why." % type(error).__name__)
+            return True
+        if fresh:
+            tagged.update(fresh)
+            if "tagged" not in reported:
+                reported.add("tagged")
+                info("Minecraft's window now carries Steam application ID %s, "
+                     "so Game Mode can bring it to the front." % app_id)
+        elif (not tagged and "missing" not in reported
+                and clock() - started >= deadline):
+            reported.add("missing")
+            warn("No Minecraft window appeared on this session's display, so "
+                 "none could be given Steam application ID %s. In Game Mode "
+                 "the game keeps running without ever being shown." % app_id)
+        return False
+
+    return attempt
+
+
+def _warn_custom_env_overrides(custom_env):
+    """Name the launcher settings the Advanced field is overriding.
+
+    That field is applied last and keeps the final word by design, so this
+    never blocks or rewrites it. It only makes the override visible: an
+    unsupported value there crashes the game at every launch with nothing
+    pointing at the field, and the reporter of issue #134 wiped their whole
+    installation three times before connecting the two.
+    """
+    for key in launcher_owned_overrides(custom_env):
+        alternative = LAUNCHER_OWNED_ENV_ALTERNATIVE.get(key)
+        warn("Custom environment variable %s overrides what Settings "
+             "configures%s. If the game crashes or misbehaves, clear it from "
+             "the Advanced custom-environment field before reinstalling "
+             "anything."
+             % (key,
+                "; the supported control is " + alternative
+                if alternative else ""))
+
+
+def _warn_if_dgc_unavailable(environ=None):
+    """Pre-launch heads-up for Intel dGPUs that cannot expose DGC under i915.
+
+    GPU-free (sysfs only), and managed-engine only: a custom Proton may not
+    use the DGC-only vkd3d this advisory is about. Advisory, not a block;
+    BOL_SKIP_DGC_CHECK=1 silences it.
+    """
+    source = os.environ if environ is None else environ
+    if custom_proton() or source.get("BOL_SKIP_DGC_CHECK") == "1":
+        return
+    cards = intel_dgpus_on_legacy_driver()
+    if cards:
+        warn(dgc_warning_message(cards))
+
+
+def _warn_if_inproc_sync_unavailable(settings, environ=None):
+    """Pre-launch heads-up when Wine has no fast synchronization path.
+
+    Upstream Wine 11 dropped esync/fsync. Without the kernel ntsync backend,
+    or the engine's fsync fallback (patch 0014) where the kernel has
+    futex_waitv, every Win32 wait is a wineserver round-trip and Minecraft's
+    worker threads end up serialised behind it — the "the game runs on one
+    thread" performance reports. File/stat inspection and an empty
+    futex_waitv call only, no Wine process and no ioctl. Advisory, not a
+    block; BOL_SKIP_NTSYNC_CHECK=1 silences it.
+
+    PROTON_NO_NTSYNC and PROTON_NO_FSYNC are read from the Advanced
+    custom-environment field rather than the host environment: an inherited
+    copy is dropped as a launcher-owned variable, so only the field can
+    actually disable a fast path.
+    """
+    source = os.environ if environ is None else environ
+    if source.get("BOL_SKIP_NTSYNC_CHECK") == "1":
+        return
+    problem = inproc_sync_problem(
+        proton_path(),
+        environ=custom_env_map(settings.get("custom_env") or ""))
+    if problem:
+        warn(problem)
+
+
+def _warn_if_performance_degraded(environ=None):
+    """Pre-launch heads-up for the ordinary causes of "the game lags".
+
+    Exhausted memory, a full data directory, windowed vsync on a compositing
+    desktop and an extreme render distance all cost frame rate without
+    leaving anything in a Wine or vkd3d log, so they get reported as engine
+    or GPU faults. Naming them here costs two /proc reads, one statvfs and a
+    parse of Minecraft's own options.txt — no Wine process, no GPU.
+    Advisory, not a block; BOL_SKIP_PERF_CHECK=1 silences it.
+    """
+    source = os.environ if environ is None else environ
+    if source.get("BOL_SKIP_PERF_CHECK") == "1":
+        return
+    for problem in performance_problems(active_prefix(), DATA, environ=source):
+        warn(problem)
+
+
+def _resolve_input_backend(backend, host_wayland, engine_root):
+    """The graphics backend to really launch with.
+
+    ``BOL_INPUT=wayland`` asks Wine for a native Wayland window. An engine
+    whose winewayland cannot load fails its PROCESS_ATTACH and opens no window
+    at all, which reaches the user as "the game does not start" and reads like
+    a display or GPU fault (issue #180). The driver is opt-in and XWayland is
+    the supported path anyway, so name the real cause and take XWayland rather
+    than starting a launch that cannot succeed. A missing WAYLAND_DISPLAY is
+    left to the caller, which reports it where it configures the X11 session.
+    """
+    if backend != "wayland" or not host_wayland:
+        return backend
+    problem = engine_wayland_driver_problem(engine_root)
+    if not problem:
+        return backend
+    warn(problem + " Using X11/XWayland for this launch.")
+    return "x11"
+
+
 def _configure_runtime_compat(env, settings, backend, host_wayland,
                               diagnostics=False, host_env=None,
                               steam_deck=None):
@@ -116,17 +765,7 @@ def _configure_runtime_compat(env, settings, backend, host_wayland,
     source = os.environ if host_env is None else host_env
     # Drop inherited compatibility flags; Advanced custom values are applied
     # last and remain the supported override.
-    for name in (
-        "PROTON_ENABLE_WAYLAND",
-        "WINE_DISABLE_VULKAN_OPWR",
-        "PROTON_PREFER_SDL",
-        "PROTON_DISABLE_HIDRAW",
-        "PROTON_NO_STEAMINPUT",
-        "PROTON_NO_WM_DECORATION",
-        "PROTON_USE_WINED3D",
-        "PROTON_LOG",
-        "PROTON_LOG_DIR",
-    ):
+    for name in LAUNCHER_OWNED_ENV:
         env.pop(name, None)
 
     if backend == "x11":
@@ -137,7 +776,9 @@ def _configure_runtime_compat(env, settings, backend, host_wayland,
             env["WINE_DISABLE_VULKAN_OPWR"] = "1"
 
     # GDK-Proton disables Steam Input under Wine-Wayland; HID filtering there
-    # would leave no usable controller.
+    # would leave no usable controller. Both variables are read by Proton's
+    # own wine, so they only reach a custom engine: the managed engine's
+    # winebus takes the registry option bol.hidraw writes instead (#57).
     if backend != "wayland" and _steam_input_available(source):
         # Hide only Sony raw interfaces when Steam supplies its virtual pad.
         env["PROTON_DISABLE_HIDRAW"] = _SONY_STEAM_INPUT_HIDRAW_IDS
@@ -151,7 +792,7 @@ def _configure_runtime_compat(env, settings, backend, host_wayland,
         env["PROTON_NO_WM_DECORATION"] = "1"
 
     renderer = str(settings.get("renderer", "auto")).strip().lower()
-    if renderer in {"opengl", "wined3d", "legacy"}:
+    if renderer in _WINED3D_RENDERERS:
         # Fallback for GPUs below modern DXVK's Vulkan requirement.
         env["PROTON_USE_WINED3D"] = "1"
 
@@ -168,6 +809,43 @@ def _configure_runtime_compat(env, settings, backend, host_wayland,
         # Avoid Proton's heavyweight debug log during normal play.
         env["WINEDEBUG"] = "-all"
 
+    # vkd3d-proton is silent by default, so "the game does not detect my ray
+    # tracing hardware" (#153) arrives with no way to tell whether the game
+    # was ever offered DXR, at which tier, and which ExecuteIndirect path it
+    # got. Its info level answers all three in about two dozen lines at device
+    # creation and logs nothing per frame, so ask for it on every launch --
+    # this is the graphics equivalent of what the launcher already reads back
+    # for synchronisation and the Wayland driver. `bol.raytracing` parses it.
+    env["VKD3D_DEBUG"] = "info"
+
+
+def _configure_gpu(env, settings, environ=None):
+    """Put the game on the graphics card chosen in Settings (#275).
+
+    With no choice, a laptop about to start the game on its integrated GPU
+    beside a discrete one is told where the choice is: nothing else would
+    tell the player why the game runs at a fraction of what the machine can
+    do. ``environ`` carries the custom-environment field, whose variables are
+    an answer already.
+    """
+    try:
+        gpu = apply_gpu_choice(env, settings)
+    except Exception as exc:
+        warn(f"Could not apply the graphics card chosen in Settings ({exc}); "
+             "Minecraft starts on the system's default one.")
+        return None
+    if gpu is not None:
+        info(f"Minecraft renders on the {gpu.name} "
+             "(Settings ▸ Advanced ▸ Graphics card).")
+        return gpu
+    try:
+        advice = hybrid_gpu_problem(settings, environ)
+    except Exception:
+        advice = None
+    if advice:
+        warn(advice)
+    return None
+
 
 def _configure_graphics_cache(env, managed_engine):
     """Keep managed-engine shader caches across Minecraft version changes."""
@@ -177,6 +855,26 @@ def _configure_graphics_cache(env, managed_engine):
     cache.mkdir(parents=True, exist_ok=True, mode=0o700)
     env["VKD3D_SHADER_CACHE_PATH"] = str(cache)
     env["DXVK_SHADER_CACHE_PATH"] = str(cache)
+
+
+def _collect_xcurl_log(game_dir):
+    """Move the session's XCurl request log to where the other logs are.
+
+    With Advanced diagnostics on, the XCurl shim writes one line per HTTP
+    request the game makes -- curl's result, the HTTP status, the URL, and
+    the bodies of the social and Realms answers -- into xcurl.log beside the
+    DLL, in the game's folder: where nobody looks for a log, and where it
+    grows by every session. It is what tells an online feature that fails
+    with "check your internet connection" apart from one the service
+    refused (the Realms Hub's screenshot upload, #163; greyed-out Realms,
+    #313). Each session's now lands in the logs folder instead.
+    """
+    source = Path(game_dir) / "xcurl.log"
+    try:
+        if source.is_file():
+            source.replace(LOGS / "xcurl.log")
+    except OSError as exc:
+        warn(f"Could not move the XCurl request log ({exc}).")
 
 
 def _clear_previous_proton_logs():
@@ -209,13 +907,23 @@ def _prefix_stably_idle_after_wrapper(timeout=10.0, interval=0.1,
         time.sleep(min(max(0.0, interval), remaining))
 
 
-def _prepare_launch_engine():
-    """Make the selected engine safe before any Wine process is executed."""
+def _prepare_launch_engine(engine_in_use=False):
+    """Make the selected engine safe before any Wine process is executed.
+
+    ``engine_in_use``: another profile's game is running on it right now.
+    That engine is prepared, or the game would not be up, and rewriting it
+    under a running game is the one thing that must not happen: it is used
+    as it is. The check that this profile's own prefix is idle stays.
+    """
     running = prefix_processes(active_prefix())
     if running:
         die("The BedrockOnLinux Wine prefix is already active "
             f"({len(running)} process(es)). Close Minecraft or use the "
             "explicit 'Force stop Minecraft' action before launching again.")
+    if engine_in_use:
+        info("Another profile is playing: the engine it runs on is used as "
+             "it is.")
+        return None
     managed_engine = not custom_proton()
     if managed_engine:
         ensure_winegdk()
@@ -224,91 +932,371 @@ def _prepare_launch_engine():
     return _prepare_graphics_engine()
 
 
-def _launch_once(lock_fds=()):
-    s = load_settings()
-    gd = s.get("game_dir")
-    if not gd or not Path(gd, "Minecraft.Windows.exe").exists():
-        die("No game — choose a Minecraft version first.")
-    if not proton_path():
-        die("GDK-Proton missing — run Install / Update.")
-    # Engine preparation is GPU-free and may repair state from an older build.
-    _prepare_launch_engine()
-    # Only completed, idle wrappers can retire a current-boot marker.
-    retire_idle_current_boot_marker()
-    require_safe_graphics_session()
-
-    account, account_epoch = msa_session_snapshot()
-    tok = account.get("refresh_token")
+def _start_msa_refresh(tok):
+    """Begin trading ``tok`` for a fresh token; a future, or None."""
     if not tok:
-        die("No Microsoft account linked — click 'Sign in' first.")
+        return None
+    pool = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="msa-refresh")
     try:
-        fresh = msa_refresh(tok)
+        return pool.submit(msa_refresh, tok)
+    finally:
+        pool.shutdown(wait=False)
+
+
+def _finish_msa_refresh(refresh, tok, account_epoch):
+    """(fresh, token to use, refresh_unreachable) once ``refresh`` is done."""
+    if refresh is None:
+        return None, tok, False
+    fresh = None
+    # A transport failure here is the offline case, not a rejected account.
+    refresh_unreachable = False
+    try:
+        fresh = refresh.result()
     except Exception as e:
-        fresh = None
+        refresh_unreachable = True
         warn(f"Token refresh skipped ({e}) — using cached token.")
     if fresh:
         if not msa_save_for_account_epoch(
                 {"refresh_token": fresh["refresh_token"],
                  "obtained": int(time.time())}, account_epoch):
-            die("The Microsoft account changed during launch; no stale token "
-                "was stored. Click PLAY again after signing in.")
+            die("The Microsoft account changed during launch; no stale "
+                "token was stored. Click PLAY again after signing in.")
         tok = fresh["refresh_token"]
-    if not boot_prefix():
-        die("Could not initialise the managed Wine prefix safely.")
-    wine_apply_winegdk_prereqs()
-    _install_cryptbase_in_prefix()
+    return fresh, tok, refresh_unreachable
+
+
+def _selected_game(settings):
+    """(edition entry, game folder, executable path) for the selected build.
+
+    The entry is None for a Bedrock build outside the managed folder; the
+    executable is None when nothing that would start is there.
+    """
+    gd = settings.get("game_dir")
+    edition = selected_edition(settings)
+    exe = game_executable(gd, edition) if gd else None
+    if exe is not None and not exe.is_file():
+        exe = None
+    return edition, gd, exe
+
+
+def _prepare_bedrock_session(settings, frame_limit):
+    """Minecraft's own files, put right before it starts; its saves edition.
+
+    Every step here reads or writes something of Bedrock's -- options.txt,
+    the worlds, the server list, the resource pack cache -- so none of it
+    runs for another title.
+    """
+    # Repair a settings file a previous crash cut off before the game reads
+    # it, hand its frame limit to the launcher's limiter when that one paces
+    # the session — or put back one an interrupted session set aside when
+    # nothing does — then keep a copy of what the game is about to start
+    # rewriting (#175). Safe to declare idle: _prepare_launch_engine()
+    # refused to get this far with a live prefix and the game has not been
+    # started yet, so nothing that writes options.txt can be running,
+    # whatever wineboot left behind.
+    restore_truncated_game_options(prefix_idle=True)
+    # Before anything the game reads is changed for this session: Preview
+    # gets a copy of the stable game's data if it has none of its own, and a
+    # build other than the last one to open this data gets a backup of it
+    # first. A launch never fails over a backup; it says so instead.
     try:
-        install_gameinput(active_prefix(), Path(gd))
-    except Exception as e:
-        warn(f"GameInput check failed ({e}) — continuing.")
-    if not wine_reg_set_refresh_token(tok):
-        die("Could not write the Microsoft login token into the Wine prefix. "
-            "The offline registry was left unchanged; use Repair and try "
-            "again.")
-    access = (fresh or {}).get("access_token")
-    ensure_login_deps()
-    if not xbl_preauth(access or "", account_epoch):
-        detail = xbl_preauth_error_message()
-        diagnostic = xbl_preauth_diagnostic() or {}
-        stage = diagnostic.get("stage")
-        suffix = f" (stage: {stage})" if stage else ""
-        die(
-            "Could not prepare a complete Xbox Live multiplayer session"
-            + suffix + ". "
-            + (detail or
-               "Check the Microsoft account/network connection and try again.")
-        )
-    exe = str(CONTENT / "Minecraft.Windows.exe")
-    bump_stack_reserve(Path(exe))
+        edition, _version = saves.before_launch(settings)
+    except Exception as exc:
+        edition = None
+        warn(f"Your worlds and settings could not be backed up before this "
+             f"launch ({type(exc).__name__}: {exc}).")
+    # Server resource packs left behind by newer versions of themselves: the
+    # prefix's Temp is never cleaned under Wine. The game is not running yet.
+    try:
+        removed, freed = packcache.prune(active_prefix())
+        if removed:
+            info(f"Removed {removed} outdated server resource pack "
+                 f"version{'s' if removed != 1 else ''} "
+                 f"({freed / 2 ** 20:.0f} MB) from the game's cache.")
+    except Exception as exc:
+        warn(f"The game's resource pack cache could not be tidied "
+             f"({type(exc).__name__}: {exc}).")
+    if frame_limit:
+        _set_aside_game_frame_limit()
+    else:
+        # A Max Framerate an interrupted session set aside goes back now:
+        # nothing holds it this session, and the game would otherwise start
+        # with no limit at all (#314).
+        restore_game_frame_limits(prefix_idle=True)
+    snapshot_game_options()
+    # The Servers tab is read from disk at startup, so the servers this
+    # launcher ships with have to be in the list before the game opens it.
+    seed_default_servers(prefix_idle=True)
+    # The account travelled into the prefix before this was called, so the
+    # game signs itself in; the in-game button reaches a sign-in the
+    # engine does not implement and only ever fails (#227/#228).
+    info("Starting Minecraft … your account is already linked; "
+         "join your server from the Servers tab.")
+    return edition
+
+
+def _session_backend(env, use_gamescope):
+    """How this session's game reaches the screen (bol.instances)."""
+    if use_gamescope:
+        return instances.BACKEND_GAMESCOPE
+    if env.get("PROTON_ENABLE_WAYLAND") == "1":
+        return instances.BACKEND_WAYLAND
+    return instances.BACKEND_X11
+
+
+class _InstanceSession:
+    """This session's entry in the list of running games, while it lasts."""
+
+    def __init__(self, record=None, keeper=None):
+        self.record = record
+        self.keeper = keeper
+
+    def close(self):
+        if self.keeper is not None:
+            self.keeper.stop()
+        if self.record is not None:
+            instances.unregister(self.record.id)
+
+
+def _open_instance(proc, env, exe, game_dir, edition_entry, title, hidden,
+                   use_gamescope):
+    """Record the game that has just started, and keep it hidden if asked.
+
+    Never fails a launch: the list is for the launcher's windows and the
+    command line, and the game runs without it.
+    """
+    try:
+        profile = current_profile_info()
+        backend = _session_backend(env, use_gamescope)
+        record = instances.register(
+            profile=profile.get("name") or "Default",
+            slug=profile.get("slug") or "default",
+            home=DATA, prefix=active_prefix(), game_pid=proc.pid,
+            title=title, edition=(edition_entry or {}).get("id") or "",
+            version=build_version(game_dir) or "", game_dir=game_dir,
+            hidden=hidden, backend=backend,
+            display=env.get("DISPLAY") or "",
+            wm_class=Path(exe).name.lower())
+    except Exception as error:
+        warn("This session could not be added to the list of running "
+             "instances (%s); the game itself is not affected."
+             % type(error).__name__)
+        return _InstanceSession()
+    if hidden and not record.can_hide:
+        warn("This instance was asked to start hidden, but its window cannot "
+             "be hidden: " + (
+                 "it runs inside its own gamescope."
+                 if backend == instances.BACKEND_GAMESCOPE else
+                 "it draws through Wine's Wayland driver. Use the X11 input "
+                 "backend (the default) for hidden instances."
+                 if backend == instances.BACKEND_WAYLAND else
+                 "there is no X display."))
+    elif hidden:
+        info("This instance runs hidden: its window stays off the screen "
+             f"until it is shown from the Profiles page or with "
+             f"'instances show {record.id}'.")
+    keeper = instances.WindowKeeper(record.id)
+    keeper.start()
+    return _InstanceSession(record, keeper)
+
+
+def _launch_once(lock_fds=(), on_started=None, notices=None, editor=False,
+                 hidden=False):
+    s = load_settings()
+    edition_entry, gd, game_exe = _selected_game(s)
+    if not gd or game_exe is None:
+        die("No game — choose a Minecraft version first.")
+    # Everything the launcher does to Minecraft itself -- its options.txt,
+    # its HBUI, LeviLamina, the Editor, the server list, world backups, the
+    # PlayFab pre-auth, Xbox presence under Minecraft's title -- is Bedrock's.
+    # Another title of the family gets the engine, the prefix, the GPU and
+    # input setup, and nothing else.
+    bedrock = is_bedrock(edition_entry)
+    title = "Minecraft" if bedrock else edition_entry["name"]
+    if editor and not bedrock:
+        die(f"Bedrock Editor is part of Minecraft for Windows, not of "
+            f"{title}.")
+    if not proton_path():
+        die("GDK-Proton missing — run Install / Update.")
+    # Other profiles may be playing (bol.prefix.SessionLocks). The engine
+    # they run on, and the build's own files when one of them runs this very
+    # build, are then used as they are instead of being written to.
+    joined = not getattr(lock_fds, "sole", True)
+    build_in_use = joined and instances.game_dir_in_use(gd, exclude_home=DATA)
+    if build_in_use:
+        info("Another profile is running this build: its game files are "
+             "used as that session prepared them (mods, title screen).")
+    # Engine preparation is GPU-free and may repair state from an older build.
+    if joined:
+        _prepare_launch_engine(engine_in_use=True)
+    else:
+        _prepare_launch_engine()
+    # GPU-free advisory: an Intel dGPU on i915 cannot expose the DGC the
+    # menu needs; warn before the cryptic page fault instead of after it.
+    _warn_if_dgc_unavailable()
+    # Same idea for the synchronization fast path: name the cause of the
+    # "runs on one thread" stutter before the game starts, not after.
+    _warn_if_inproc_sync_unavailable(s)
+    # And for the causes that are not the engine at all: no memory left, no
+    # disk left, windowed vsync, a render distance past the main thread.
+    _warn_if_performance_degraded()
+    # Only completed, idle wrappers can retire a current-boot marker.
+    retire_idle_current_boot_marker()
+    require_safe_graphics_session()
+
+    xbox_live = uses_xbox_live(gd)
+    account, account_epoch = msa_session_snapshot()
+    # Nothing of the Xbox account goes near a game that does not use it: no
+    # token in its prefix, no Xbox pre-auth, no presence (#351).
+    tok = account.get("refresh_token") if xbox_live else None
+    # The token refresh is a round trip to Microsoft that nothing below needs
+    # until the Xbox pre-auth: it runs while the prefix is prepared.
+    refresh = _start_msa_refresh(tok)
+    try:
+        if not boot_prefix():
+            die(boot_failure_message("Minecraft was not started"))
+        wine_apply_winegdk_prereqs()
+        _install_cryptbase_in_prefix()
+        try:
+            install_gameinput(active_prefix(), Path(gd))
+        except Exception as e:
+            warn(f"GameInput check failed ({e}) — continuing.")
+        try:
+            keep_non_controllers_off_hidraw(active_prefix())
+            playstation_pads_through_sdl(active_prefix())
+        except Exception as e:
+            warn(f"HID device check failed ({e}); continuing.")
+    finally:
+        # Collected even when a step above failed: Microsoft may already have
+        # handed out a new refresh token, and it must not be dropped.
+        fresh, tok, refresh_unreachable = _finish_msa_refresh(
+            refresh, tok, account_epoch)
+    # Xbox Live is required for Realms, servers, the Marketplace and Friends —
+    # never for the game itself. Neither a missing account nor an unreachable
+    # Xbox Live may keep single-player and LAN worlds from starting (#160).
+    online = False
+    if not xbox_live:
+        info(EDUCATION_SIGNIN_NOTICE)
+    elif not tok:
+        warn("No Microsoft account is linked, so Minecraft starts in "
+             + _OFFLINE_MODE_NOTICE + " Use 'Sign in' to add one."
+             if bedrock else
+             f"No Microsoft account is linked, so {title} cannot sign in to "
+             "Xbox Live. Use 'Sign in' to add one.")
+    elif not bedrock:
+        # The account goes into the prefix for the engine's XUser, which is
+        # how a GDK title signs in. The pre-auth below is not: it mints
+        # Minecraft's PlayFab and multiplayer tokens, which are Minecraft's
+        # own and would only send another title chasing them.
+        if not wine_reg_set_refresh_token(tok):
+            die("Could not write the Microsoft login token into the Wine "
+                "prefix. The offline registry was left unchanged; use Repair "
+                "and try again.")
+        ensure_login_deps()
+    else:
+        if not wine_reg_set_refresh_token(tok):
+            die("Could not write the Microsoft login token into the Wine "
+                "prefix. The offline registry was left unchanged; use Repair "
+                "and try again.")
+        ensure_login_deps()
+        online = xbl_preauth((fresh or {}).get("access_token") or "",
+                             account_epoch,
+                             refresh_unreachable=refresh_unreachable)
+        if not online:
+            detail = xbl_preauth_error_message()
+            diagnostic = xbl_preauth_diagnostic() or {}
+            stage = diagnostic.get("stage")
+            suffix = f" (stage: {stage})" if stage else ""
+            warn(
+                "Could not prepare a complete Xbox Live multiplayer session"
+                + suffix + ". "
+                + (detail or
+                   "Check the Microsoft account/network connection and try "
+                   "again.")
+                + " Minecraft starts in " + _OFFLINE_MODE_NOTICE
+            )
+    exe = str(CONTENT / game_exe.relative_to(gd))
+    # A Microsoft Store package keeps the executable encrypted at rest, so
+    # there is no PE header on disk to edit and no image for Wine to open. Both
+    # are handled after Xodus decrypts it into anonymous memory, below.
+    encrypted_exe = xodus.exe_is_encrypted(Path(exe))
+    # The 16 MB stack reserve (#27) is for Minecraft's own executable, which
+    # Education's plaintext one is too; another title keeps its own.
+    if not build_in_use and not encrypted_exe and (
+            bedrock or edition_title(edition_entry) == "education"):
+        bump_stack_reserve(Path(exe))
+    if bedrock and not build_in_use:
+        # Bedrock's own title screen; Education's sign-in button is the only
+        # way into that game, and its menus are not Bedrock's.
+        hide_signin_button(Path(gd))
+        # Linux splashes on the title screen, partner servers under Featured
+        # Servers: re-applied each launch, since a game update brings the
+        # vanilla files back.
+        apply_branding(Path(gd))
     cmd, env = proton_umu_cmd(exe)
     # Required by the menu's indirect root-CBV updates (#27/#29/#30).
     _require_vkd3d_config(env, "force_raw_va_cbv")
+    _configure_ray_tracing(env, s)
     diag = (s.get("diagnostics", False) or os.environ.get("BOL_DIAG") == "1")
     xlog = os.environ.get("BOL_XCURL_LOG")
     if xlog == "1" or (xlog is None and diag):
         env["XCURL_LOG"] = "1"
+    # Achievements are graded by Xbox Live from the events the game writes;
+    # the engine records them and the session forwards them (#152).
+    event_title = gameevents.prepare(env, s, gd, online)
     # Disable incompatible VR/AGS paths; retain native cryptbase with fallback.
     overrides = ["cryptbase=n,b", "vrclient=", "vrclient_x64=", "openvr_api=",
                  "wineopenxr=", "amd_ags_x64="]
+    # Wine's builtin GameInput steals the game's mouse from a client that
+    # loads it (#281, #359); the native redist does the game's input.
+    gameinput_override = builtin_gameinput_override(active_prefix())
+    if gameinput_override:
+        overrides.append(gameinput_override)
+    if not custom_proton():
+        # The managed engine ships no Wine Mono (native24): nothing it runs
+        # is .NET, and a stray load of the CLR would otherwise open Wine's
+        # "install Mono" dialog in front of the game instead of failing.
+        overrides.append("mscoree=")
     cur = os.environ.get("WINEDLLOVERRIDES", "")
     if cur:
         overrides.append(cur)
     env["WINEDLLOVERRIDES"] = ";".join(overrides)
+    # LeviLamina, when this build has it and mods are on: its loader goes in
+    # front of the game, or comes out when they are off (bol.mods).
+    if bedrock and build_in_use:
+        mods.join_launch(Path(gd), env)
+    elif bedrock:
+        mods.prepare_launch(Path(gd), env)
     # WindowsAppRuntime framework MSIX cannot install under Wine.
     env["MICROSOFT_WINDOWSAPPRUNTIME_BOOTSTRAP_INITIALIZE_SHOWUI"] = "0"
     env["MICROSOFT_WINDOWSAPPRUNTIME_BOOTSTRAP_INITIALIZE_FAILFAST"] = "0"
     env["MICROSOFT_WINDOWSAPPRUNTIME_DEPLOYMENT_INITIALIZE_ONERRORSHOWUI"] = "0"
-    # Azure rejects Wine's TLS 1.3 ClientHello; force TLS 1.2 for this process.
-    prio = DATA / "etc" / "gnutls-no-tls13.cfg"
-    if not prio.exists():
-        prio.parent.mkdir(parents=True, exist_ok=True)
-        prio.write_text("[priorities]\nSYSTEM = NORMAL:-VERS-TLS1.3:%COMPAT\n")
-    env["GNUTLS_SYSTEM_PRIORITY_FILE"] = str(prio)
-    env["GNUTLS_SYSTEM_PRIORITY_FAIL_ON_INVALID"] = "0"
+    # Do NOT set GNUTLS_SYSTEM_PRIORITY_FILE. A previous workaround pointed it
+    # at a "[priorities]\nSYSTEM = NORMAL:-VERS-TLS1.3:%COMPAT" file to force
+    # TLS 1.2, but inside the Flatpak it does the opposite: the runtime's
+    # GnuTLS default priority is not "@SYSTEM", so the file's SYSTEM override
+    # never applies, while the mere presence of the variable makes Wine's
+    # secur32 (set_priority in schannel_gnutls.c) skip its own version-capped
+    # priority string and use raw GnuTLS defaults — negotiating TLS 1.3, which
+    # this Wine's schannel does not support. Result: every in-game WinHTTP TLS
+    # connection to Xbox/Azure edges died post-handshake (0x2746 resets /
+    # 0x80090304 fatal alerts), the XSAPI RTA WebSocket could never connect,
+    # MPSD session writes lacked the required "connection" member, and Friends
+    # worlds failed with the misleading "world is full" error (issue #48).
+    # Wine's own schannel priority already caps at TLS 1.2, achieving what the
+    # workaround intended. Verified with tools/winhttp-rta-probe.c: with the
+    # variable set, 58/66 probes fail (rta.xboxlive.com 100%); without it,
+    # 66/66 succeed.
+    env.pop("GNUTLS_SYSTEM_PRIORITY_FILE", None)
+    env.pop("GNUTLS_SYSTEM_PRIORITY_FAIL_ON_INVALID", None)
     preauth = DATA / "winegdk-preauth" / "device.json"
-    if preauth.exists():
+    # Only a payload pre-auth just vouched for is handed to the engine: an
+    # expired or account-mismatched one would send it chasing a sign-in that
+    # cannot complete instead of settling into offline mode.
+    if online and preauth.exists():
         env["WINEGDK_PREAUTH_DEVICE"] = "Z:" + str(preauth).replace("/", "\\")
-    rp = s.get("xsts_rp")
+    rp = s.get("xsts_rp") if bedrock else None
     if rp:
         host = s.get("xsts_rp_host") or "b980a380.minecraft.playfabapi.com"
         san = "".join(c.upper() if c.isalnum() else "_" for c in host)
@@ -330,10 +1318,24 @@ def _launch_once(lock_fds=()):
         backend = "x11"
     elif want_gamescope and not shutil.which("gamescope"):
         warn("BOL_GAMESCOPE is set but gamescope isn't installed — ignored.")
+    backend = _resolve_input_backend(backend, bool(wl), proton_path())
     _configure_runtime_compat(
         env, s, backend, bool(wl), diagnostics=diag,
     )
+    # The Advanced custom-environment field is applied at the end of this
+    # function, far too late to be read here, so overlay it explicitly: it is
+    # where BOL_FRAME_RATE is documented, and the supported way to set it.
+    # The limiter takes over Minecraft's own Max Framerate, read from its
+    # options.txt; another title has no such file, and its own setting.
+    frame_limit = _configure_frame_rate_limit(
+        env, s, active_prefix(),
+        environ={**os.environ,
+                 **custom_env_map(s.get("custom_env") or "")},
+        xwayland=_draws_through_xwayland(backend, wl, use_gamescope)) \
+        if bedrock else None
     _configure_graphics_cache(env, managed_engine=not custom_proton())
+    _configure_gpu(env, s, environ={**os.environ,
+                                    **custom_env_map(s.get("custom_env") or "")})
     disp = os.environ.get("DISPLAY")
     if backend == "wayland" and wl:
         env["PROTON_ENABLE_WAYLAND"] = "1"
@@ -363,8 +1365,18 @@ def _launch_once(lock_fds=()):
         elif wl:
             warn("Wayland session without X DISPLAY — install XWayland (or set "
                  "BOL_INPUT=wayland to use winewayland).")
+    game_args = [EDITOR_URI] if editor else []
+    if editor:
+        info("Opening Bedrock Editor instead of the game.")
+    if encrypted_exe:
+        # Must wrap before gamescope: gamescope has to stay outermost so it
+        # owns the compositor the game renders into.
+        cmd = xodus.wrap_encrypted_launch(cmd, Path(gd), DATA / "run", env=env,
+                                          game_args=game_args)
+    else:
+        cmd = cmd + game_args
     if use_gamescope:
-        if gs_opt and gs_opt.strip().lower() not in ("1", "yes", "on", "true"):
+        if gs_opt and not env_flag(gs_opt):
             gs_argv = ["gamescope"] + shlex.split(gs_opt)
         else:
             gs_argv = ["gamescope", "-f"]
@@ -377,19 +1389,61 @@ def _launch_once(lock_fds=()):
         die("The Microsoft account changed before the game process started. "
             "Minecraft was not started; click PLAY again.")
     apply_custom_env(env, s.get("custom_env") or "")
+    _warn_custom_env_overrides(s.get("custom_env") or "")
+    # After the custom environment, which can change LANG or keep
+    # pressure-vessel's own locale generation: a host without en_US.UTF-8 or
+    # without the player's locale gets the copy built at the first launch,
+    # instead of 3 to 6 seconds of locale generation at every one.
+    slr_locales.configure(env)
+    # Outermost of all, so the scope holds everything above it, gamescope
+    # included; and after the custom environment, where its opt-out lives.
+    if joined:
+        # The guard only makes sense where the game fits in RAM beside the
+        # desktop (#314), and that was measured for one game, not several.
+        info("Another instance is running: this one is left free to swap.")
+    else:
+        cmd = _keep_game_out_of_swap(cmd, env)
     # Prevent diagnosis from attributing stale Proton logs to this launch.
     _clear_previous_proton_logs()
-    info("Starting Minecraft … sign in with Microsoft in-game, then "
-         "join your server from the Servers tab.")
+    # After the custom environment, so a limit with decimals set there gets
+    # through Proton as well; for every title, so a pace a Bedrock session
+    # left in the prefix never reaches another one.
+    _deliver_frame_rate_limit(env)
+    edition = None
+    if bedrock:
+        edition = _prepare_bedrock_session(s, frame_limit)
+    else:
+        info(f"Starting {title} …")
+    # Everything this session writes to the shared game and engine files is
+    # written: other profiles may start beside it from here on.
+    if hasattr(lock_fds, "share"):
+        lock_fds.share()
     glog = open(LOGS / "minecraft.log", "w")
+    # Everything above that writes a settings file has written it by now, so
+    # what is written after this is the game's.
+    session_started = time.time()
+    signed_out = False
     rc = None
     hits = []
     gpu_marker_token = None
     game_returned = False
+    presence = discord.Session()
+    xbl = xbl_presence.Session()
+    game_events = gameevents.Forwarder()
+    instance = _InstanceSession()
     try:
+        # From here until the teardown below has dealt with the marker, a
+        # SIGTERM or SIGHUP waits for the game instead of killing the
+        # launcher on the spot. Powering off with Minecraft open did that:
+        # the game closed two seconds later, but nothing was left to clear
+        # its marker, and the next boot refused PLAY (bol/supervision.py).
+        supervision.begin_session()
         # A hard reboot leaves this marker so the next launch fails closed.
         gpu_marker_token = arm_gpu_launch()
         try:
+            if supervision.stop_requested_for() is not None:
+                raise BolError("The launcher was asked to stop before "
+                               "Minecraft started.")
             popen_options = {
                 "env": env,
                 "cwd": str(CONTENT),
@@ -412,19 +1466,135 @@ def _launch_once(lock_fds=()):
                      "GPU safety marker failed (%s)." %
                      type(marker_error).__name__)
             raise
+        # Before the hook below: a window that steps aside for the game may
+        # look the session up straight away.
+        instance = _open_instance(proc, env, exe, gd, edition_entry, title,
+                                  hidden, use_gamescope)
+        if on_started is not None:
+            # The caller owns a window that may have to step aside for the
+            # game's own; never let that bookkeeping abort a running launch.
+            try:
+                on_started()
+            except Exception as hook_error:
+                warn("The launcher could not step aside for the game window "
+                     "(%s)." % type(hook_error).__name__)
+        # Auto-injection belongs to the launch and not to whoever asked for
+        # it: a direct-launch shortcut and Game Mode both come through
+        # `bol play`, which has no GUI worker to hang the watcher off.
+        try:
+            if bedrock:
+                _warn_injection_on_wined3d(s)
+                start_auto_inject(s)
+        except Exception as inject_error:
+            warn("Automatic DLL injection could not be started (%s)."
+                 % type(inject_error).__name__)
+        # Education's sign-in goes to Windows' account broker, which Wine
+        # lacks, unless MSAL's flight for it is turned off in the game (#351).
+        if edition_title(edition_entry) == "education":
+            try:
+                prefix = active_prefix()
+                msal_flights.start(
+                    exe, lambda: prefix_processes(prefix),
+                    lambda: proc.poll() is None)
+            except Exception as flight_error:
+                warn("The Minecraft Education sign-in watcher could not be "
+                     "started (%s)." % type(flight_error).__name__)
+        # Started in fullscreen, the game keeps a frame the size of its
+        # maximized window until it is resized once its menu is up (#283).
+        try:
+            if bedrock:
+                fullscreen_fix.start(environ={
+                    **os.environ,
+                    **custom_env_map(s.get("custom_env") or "")})
+        except Exception as nudge_error:
+            warn("The fullscreen resize watcher could not be started (%s)."
+                 % type(nudge_error).__name__)
+        # In Wine's virtual desktop, minimizing the game leaves the desktop
+        # on screen unless the launcher minimizes it too (#189). Gamescope
+        # runs the game on an X server of its own, out of this one's reach.
+        try:
+            virtual_desktop.start(
+                s, display=None if use_gamescope else env.get("DISPLAY"))
+        except Exception as bridge_error:
+            warn("The virtual desktop bridge could not be started (%s)."
+                 % type(bridge_error).__name__)
         started = time.time()
+        # Say on Discord what is being played, for as long as it is played:
+        # the launcher is found by word of mouth, and this is it saying its
+        # own name. Settings turns it off, and it never affects the game.
+        presence = discord.start_session(s, started_at=started) \
+            if bedrock else discord.Session()
+        # And say it on Xbox Live, which is the half that other players act
+        # on: nothing in the game publishes presence under Wine, so without
+        # this the account reads "Offline" to its own dressing room and to
+        # every friend, and no one can join or invite it (#238, #243).
+        if online and bedrock:
+            xbl = xbl_presence.start_session(s)
+            xbl_presence.warn_if_unavailable(xbl, s)
+        game_events = gameevents.start_session(event_title)
         announced = False
+        # There is no window yet to give Steam's identity to, so this watches
+        # for one on the same tick that waits on the game process rather than
+        # adding a thread of its own.
+        tag_game_window = None if use_gamescope else \
+            _steam_game_window_tagger(env, exe)
+        stop_announced = False
+        # The game's WebView2 leaves an updater running that never exits
+        # under Wine, and the wrapper waits for it: without this, closing
+        # Minecraft does not end the session.
+        reaper = LeftoverReaper(active_prefix())
         while True:
             try:
                 rc = proc.wait(timeout=1)
                 game_returned = True
                 break
             except subprocess.TimeoutExpired:
+                try:
+                    reaper.tick()
+                except Exception:
+                    pass
+                waited = supervision.stop_requested_for()
+                if waited is not None:
+                    # Asked to stop. Whatever asked usually stopped the game
+                    # too, so it is about to return; see it do so, so its
+                    # marker can be cleared below.
+                    if not stop_announced:
+                        stop_announced = True
+                        warn("The launcher was asked to stop while Minecraft "
+                             "runs. Waiting up to "
+                             f"{supervision.STOP_GRACE_S} s for the game to "
+                             "close, so its GPU safety record can be "
+                             "cleared.")
+                    if waited >= supervision.STOP_GRACE_S:
+                        warn("Minecraft did not close within "
+                             f"{supervision.STOP_GRACE_S} s of the stop "
+                             "request. Its GPU safety record stays, as for "
+                             "any session that did not return.")
+                        break
+                    continue
+                if tag_game_window is not None and tag_game_window():
+                    tag_game_window = None
                 if not announced and time.time() - started > 8:
                     announced = True
-                    ok("Minecraft is running — close the game window to come "
+                    ok(f"{title} is running — close the game window to come "
                        "back here.")
     finally:
+        instance.close()
+        stopping = supervision.stop_requested_for() is not None
+        # First: the teardown below can take a while, and nobody should be
+        # left showing as in-game through it. When the launcher was asked to
+        # stop, it has a shutdown's time budget and the network may already
+        # be down: neither waits, and the record that matters is the GPU
+        # marker below. Both are daemon threads.
+        if stopping:
+            presence.stop(timeout=0)
+            xbl.stop(timeout=0)
+            gameevents.stop_session(game_events, timeout=0)
+        else:
+            presence.stop()
+            xbl.stop()
+            gameevents.stop_session(game_events)
+        prefix_idle = None
         if game_returned and gpu_marker_token:
             try:
                 wrapper_returned_recorded = mark_gpu_wrapper_returned(
@@ -437,24 +1607,48 @@ def _launch_once(lock_fds=()):
                 warn("Minecraft returned, but its GPU marker could not record "
                      "the completed wrapper phase. A failed teardown will "
                      "require explicit Doctor acknowledgement.")
-            if not _prefix_stably_idle_after_wrapper():
+            prefix_idle = _prefix_stably_idle_after_wrapper()
+            if not prefix_idle:
                 warn("The UMU wrapper returned while Wine/Minecraft processes "
                      "still appear live. The GPU safety marker was retained; "
                      "force-stop the remaining processes and inspect the "
                      "driver before acknowledging the incident.")
             elif not disarm_gpu_launch(gpu_marker_token):
                 warn("Minecraft returned, but its GPU safety marker could not "
-                     "be cleared. Run 'bedrock-on-linux doctor "
-                     "--acknowledge-gpu-crash' after checking the driver.")
+                     f"be cleared. Run '{acknowledge_gpu_crash_command()}' "
+                     "after checking the driver.")
         glog.close()
-        patch_options()
+        # All three rewrite the file Minecraft keeps its settings in, so none
+        # may run while the game could still be saving to it (#175).
+        if prefix_idle is None and stopping and not game_returned:
+            # The game outlived the stop grace: it is still running, and
+            # ten more seconds of scanning would only say so.
+            prefix_idle = False
+        if prefix_idle is None:
+            prefix_idle = _prefix_stably_idle_after_wrapper()
+        # Read before the lines below rewrite a settings file themselves.
+        signed_out = bool(bedrock and tok and game_returned
+                          and saves.ran_signed_out(edition, session_started))
+        if bedrock:
+            restore_truncated_game_options(prefix_idle=prefix_idle)
+            patch_options(prefix_idle=prefix_idle)
+            restore_game_frame_limits(prefix_idle=prefix_idle)
         logs = sorted(LOGS.glob("steam-*.log"),
                       key=lambda p: p.stat().st_mtime if p.exists() else 0)
         if logs:
             logs[-1].replace(LOGS / "proton.log")
             for old in logs[:-1]:
                 old.unlink(missing_ok=True)
+        if env.get("XCURL_LOG") == "1":
+            _collect_xcurl_log(Path(gd))
         ok(f"Game closed (exit {rc}).")
+        if signed_out:
+            # "My worlds stayed on the old version": a build that did not
+            # sign in shows the signed-out profile, and nothing else says
+            # where everything went.
+            warn(saves.SIGNED_OUT_NOTICE)
+            if notices is not None:
+                notices.append(saves.SIGNED_OUT_NOTICE)
         hits = diagnose()
     # Diagnose only; never reset or relaunch a GPU process automatically.
     broken = any("prefix broken" in h.lower() for h in hits)
@@ -480,10 +1674,79 @@ def _launch_once(lock_fds=()):
         warn("The Wine prefix may be broken. Automatic reset/relaunch is "
              "disabled for GPU safety; use the explicit Repair action, then "
              "click PLAY once.")
+    # Microsoft refused the licence, so the game never started. As one line
+    # among the diagnosis in a log the player does not have open, that left
+    # the launcher looking as if PLAY had done nothing at all (#280): end the
+    # launch as the failure it is, which the window shows in a dialog and a
+    # launcher-free shortcut as a desktop notification.
+    if LICENCE_REFUSED in hits:
+        raise BolError(LICENCE_REFUSED)
+    if LICENCE_UNREACHABLE in hits:
+        raise BolError(LICENCE_UNREACHABLE)
+    if STORE_SESSION_REFUSED in hits:
+        raise BolError(STORE_SESSION_REFUSED)
+    refused = next((h for h in hits
+                    if h.startswith(LICENCE_SERVICE_REFUSED)), None)
+    if refused:
+        raise BolError(refused)
     return rc
 
 
-def launch():
-    """Run exactly one guarded launch for each user action."""
-    with launch_lock() as lock_fds:
-        return _launch_once(lock_fds)
+def launch(on_started=None, notices=None, editor=False, hidden=False):
+    """Run exactly one guarded launch for each user action.
+
+    ``on_started`` is called once the game process exists, before the wait on
+    it. A launcher window uses it to get out of the game's way in a session
+    that shows one window at a time. ``notices``, when given, is a list that
+    collects what the session left the player to know, for a window to show
+    rather than leave in the log. ``editor`` opens Bedrock Editor instead of
+    the game. ``hidden`` keeps the game's window off the screen until it is
+    shown (bol.instances).
+
+    Other profiles may be playing at the same time: each has its own prefix
+    and its own lock, and the shared game files are held together.
+    """
+    try:
+        with launch_lock(join=True) as lock_fds:
+            return _launch_once(lock_fds, on_started=on_started,
+                                notices=notices, editor=editor,
+                                hidden=hidden)
+    finally:
+        # The session's teardown is over and its locks are released: a stop
+        # signal it held for the game ends the process now.
+        supervision.end_session()
+
+
+def direct_launch_readiness():
+    """First-run steps a launcher-free shortcut cannot perform on its own.
+
+    A shortcut that skips the window has nowhere to show a device code or a
+    version picker, so name what is still missing when one is created rather
+    than letting the first click fail silently. Cheap and offline: settings
+    and token files only, no network and no Wine process.
+    """
+    pending = []
+    _edition, game_dir, game_exe = _selected_game(load_settings())
+    if not game_dir or game_exe is None:
+        pending.append(
+            "No Minecraft version is installed yet. Open the launcher once "
+            "and install one; the shortcut only starts a prepared "
+            "installation.")
+    if not msa_signed_in():
+        pending.append(
+            "No Microsoft account is linked yet. Sign in from the launcher "
+            "once; a shortcut has nowhere to display the Microsoft device "
+            "code.")
+    return pending
+
+
+def single_window_session(environ=None):
+    """Whether the session shows one application window at a time.
+
+    Steam Game Mode is that session: Gamescope presents a single window, so
+    the launcher's own stands between Steam and the game — the game stays
+    audible but never appears (#130). The answer is for the launcher to step
+    aside while the game runs, not for it to be skipped: starting the
+    launcher must open the launcher, in Game Mode as everywhere else.
+    """
+    return in_gamescope_session(os.environ if environ is None else environ)

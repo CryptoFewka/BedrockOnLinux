@@ -23,6 +23,23 @@ def gameinput_redist_ok(prefix: Path):
                           "/GameInputRedistService.exe").exists())
 
 
+def builtin_gameinput_override(prefix: Path):
+    """The DLL override that keeps Wine's builtin gameinput.dll out of the
+    game, or None while the native redist is not there to stand in for it.
+
+    The game never needs the builtin: it loads GameInputRedist.dll through
+    RedistDir, and the redist imports no gameinput.dll of its own. An
+    injected client does load it -- Flarial through its SDL input layer --
+    and the builtin's mouse reader opens a DirectInput mouse on whatever
+    window is in the foreground. Injected while the game has the focus, as
+    an automatic injection always is, that window is the game's, and the
+    reader takes the game's raw mouse input from it: the cursor moves and
+    nothing in the game reacts (#281, #359). From the launcher's button the
+    focus is on the launcher, which is why a manual injection kept the mouse.
+    """
+    return "gameinput=d" if gameinput_redist_ok(Path(prefix)) else None
+
+
 def _msi_embedded_cab(msi: bytes):
     """Return the embedded MSZip CAB bytes from an MSI, parsing the OLE
     compound-file container in pure Python (no msiexec, no host tools). The
@@ -142,6 +159,57 @@ def _pe_kind(data: bytes):
     return "dll" if struct.unpack_from("<H", data, pe + 22)[0] & 0x2000 else "exe"
 
 
+_VS_FIXEDFILEINFO = struct.pack("<I", 0xFEEF04BD)
+
+
+def _pe_file_version(data: bytes):
+    """A PE image's FileVersion from its VS_FIXEDFILEINFO, e.g. (2, 2, 26100,
+    6106); None when the image carries no version resource."""
+    at = data.find(_VS_FIXEDFILEINFO)
+    if at < 0 or at + 16 > len(data):
+        return None
+    high, low = struct.unpack_from("<II", data, at + 8)
+    return (high >> 16, high & 0xFFFF, low >> 16, low & 0xFFFF)
+
+
+def _bundled_redist_version(msi_path: Path):
+    """The version of the GameInput redist a game package carries, or None.
+    The redist itself is the largest DLL in the MSI, as in
+    _extract_gameinput_redist."""
+    cab = _msi_embedded_cab(msi_path.read_bytes())
+    dlls = sorted((d for _, d in _cab_payload(cab) if _pe_kind(d) == "dll"),
+                  key=len, reverse=True)
+    return _pe_file_version(dlls[0]) if dlls else None
+
+
+def _redist_outdated(prefix: Path, msi_path: Path):
+    """True when the game ships a newer GameInput redist than the prefix has.
+
+    A prefix keeps the redist it was first given, for every Minecraft build
+    after it. On Windows the game's installer brings the machine's GameInput
+    up to the version the build was made against; here nothing did, so a
+    build that needs the newer one found an older redist answering instead,
+    and the devices it reads through GameInput -- the camera's mouse
+    movement and every controller -- never reached it (#300). A redist newer
+    than the game's is left alone: GameInput keeps older callers working.
+    """
+    if not msi_path.exists():
+        return False
+    try:
+        bundled = _bundled_redist_version(msi_path)
+    except (OSError, ValueError, IndexError, struct.error, zlib.error):
+        return False
+    if bundled is None:
+        return False
+    try:
+        installed = _pe_file_version(
+            (prefix / "drive_c/Program Files/Microsoft GameInput/x64"
+                      "/GameInputRedist.dll").read_bytes())
+    except OSError:
+        installed = None
+    return installed is None or bundled > installed
+
+
 def _extract_gameinput_redist(msi_path: Path, prefix: Path):
     """Install the GameInput redist by EXTRACTING the MSI's CAB ourselves and
     placing the files + registry — no Windows Installer, so the RtlGenRandom
@@ -223,16 +291,21 @@ def install_gameinput(prefix: Path, game_dir: Path):
             "Re-run 'Install / Update' to initialise it first."
         )
     require_prefix_idle(prefix, "install Microsoft GameInput offline")
-    if gameinput_redist_ok(prefix):
-        _set_gameinput_registry(prefix)
-        return
     msi = game_dir / "Installers" / "GameInputRedist.msi"
-    if not msi.exists():
+    if gameinput_redist_ok(prefix):
+        if not _redist_outdated(prefix, msi):
+            _set_gameinput_registry(prefix)
+            return
+        info("Updating Microsoft GameInput to the version this Minecraft "
+             "build ships …")
+    elif not msi.exists():
         warn("GameInputRedist.msi missing from the game package — native "
              "GameInput not installed; the in-game mouse and controller "
              "will not work (Wine's builtin GameInput has no mouse backend).")
         return
-    info("Installing Microsoft GameInput (native redist — in-game mouse) …")
+    else:
+        info("Installing Microsoft GameInput (native redist — in-game "
+             "mouse) …")
     try:
         if _extract_gameinput_redist(msi, prefix) \
                 and _set_gameinput_registry(prefix):

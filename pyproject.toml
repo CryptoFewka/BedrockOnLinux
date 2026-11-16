@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools >= 77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bedrock-on-linux"
+description = "GNU/Linux Installer for Minecraft Bedrock"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+dynamic = ["version"]
+# What bol.deps installs on first start when it is missing (GUI_DEPS,
+# LOGIN_DEPS). With any of it missing, the launcher fetches its own pinned
+# GUI stack into its data directory, behind what this installed. PySide6 rather than
+# PySide6-Essentials: that is the name distributions package it under.
+dependencies = [
+  "PySide6",
+  "cryptography",
+  "python-xlib",
+]
+classifiers = [
+  "Programming Language :: Python"
+]
+
+[tool.setuptools]
+packages = ["bol"]
+
+# DLL injection, the fullscreen fix and the virtual desktop bridge extract
+# their .exe from the package (bol/inject.py, bol/fullscreen_fix.py,
+# bol/virtual_desktop.py);
+# setuptools leaves out every non-Python file it is not told about.
+[tool.setuptools.package-data]
+bol = ["injector.exe", "fullscreen-nudge.exe", "desktop-bridge.exe", "levi-loader.dll", "partners/*"]
+
+[project.urls]
+Homepage = "https://wyze3306.github.io/BedrockOnLinux/"
+Repository = "https://github.com/Wyze3306/BedrockOnLinux"
+"Bug Tracker" = "https://github.com/Wyze3306/BedrockOnLinux/issues"
+Changelog = "https://github.com/Wyze3306/BedrockOnLinux/blob/main/CHANGELOG.md"
+
+[tool.setuptools.dynamic]
+version = {attr = "bol.config.VERSION"}
+
+[project.scripts]
+# The one entry point of every packaging: `optiscaler` is not a bol.cli
+# subcommand, and its bootstrap runs first.
+bedrock-on-linux = "bol.__main__:main"
+
+[tool.setuptools.data-files]
+"share/applications" = ["data/bedrock-on-linux.desktop"]
+"share/icons/hicolor/256x256/apps" = ["data/bedrock-on-linux.png"]

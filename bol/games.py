@@ -1,398 +1,438 @@
-"""bol.games — Minecraft version listing, download and selection."""
+"""bol.games — Minecraft edition listing, installation and selection."""
 # SPDX-License-Identifier: MIT
 
-import hashlib
 import json
+import os
 import re
 import shutil
-import zipfile
+import time
 from pathlib import Path
 
-from .config import CACHE, CONTENT, GAMES, GAME_ARCHIVE_REPO
+from . import wustore, xodus
+from .config import CACHE, CONTENT, GAMES
 from .log import BolError, die, info, ok, warn
-from .util import download, gh_releases, load_settings, save_settings
+from .util import load_settings, save_settings
 
 
-_ASSET_METADATA = ".bedrock-on-linux-asset.json"
+_INSTALL_METADATA = ".bedrock-on-linux-install.json"
 
 
-def list_mc_versions(include_beta=True):
+def prune_legacy_game_archives(cache=None):
+    """Delete the Minecraft archives launchers before 2.1 kept in the cache.
+
+    Until Minecraft came from Microsoft through Xodus, every version was
+    downloaded as a zip of well over a gigabyte -- "Microsoft.MinecraftUWP_
+    1.26.4403.0_x64__8wekyb3d8bbwe.zip" -- and kept in the cache once it was
+    extracted. Nothing has read one since, and nothing removed them either,
+    so an install that followed a few versions carried gigabytes of them
+    (#289). Returns the bytes freed.
+    """
+    folder = Path(cache or CACHE)
+    try:
+        candidates = sorted(folder.iterdir())
+    except OSError:
+        return 0
+    removed = freed = 0
+    for path in candidates:
+        name = path.name.lower()
+        if "minecraft" not in name or not name.endswith((".zip", ".zip.part")):
+            continue
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            size = path.stat().st_size
+            path.unlink()
+        except OSError as exc:
+            warn(f"Could not remove {path.name}, a Minecraft archive an "
+                 f"earlier version of the launcher downloaded: {exc}")
+            continue
+        removed += 1
+        freed += size
+    if removed:
+        info(f"Removed {removed} Minecraft archive(s) an earlier version of "
+             f"the launcher downloaded ({freed / 1024 ** 3:.1f} GiB).")
+    return freed
+
+
+def list_editions(include_beta=True):
+    """The Minecraft editions available for installation."""
+    return [entry for entry in xodus.list_editions()
+            if include_beta or not entry["beta"]]
+
+
+def edition_title(edition_entry):
+    """The game an edition installs: "bedrock", "dungeons", "legends", ...
+
+    None -- a build imported from elsewhere, or one from before the move to
+    the Store -- is Bedrock, as is an entry that predates the key: those were
+    the only kind there was.
+    """
+    if not edition_entry:
+        return "bedrock"
+    return str(edition_entry.get("title") or "bedrock")
+
+
+def is_bedrock(edition_entry):
+    """Whether everything the launcher does to Minecraft itself applies."""
+    return edition_title(edition_entry) == "bedrock"
+
+
+def edition_exe(edition_entry):
+    """The executable that marks a build of this edition (see xodus.game_root).
+
+    None means the package's own MicrosoftGame.config names it.
+    """
+    if not edition_entry or "exe" not in edition_entry:
+        return xodus.BEDROCK_EXE
+    return edition_entry["exe"]
+
+
+def selected_edition(settings=None):
+    """The edition of the build the launcher would start next, or None."""
+    settings = load_settings() if settings is None else settings
+    return edition_for_dir((settings.get("game_dir") or "").strip() or None)
+
+
+def game_executable(game_dir, edition_entry=None):
+    """The executable to start in ``game_dir``, or None when none is known."""
+    return xodus.game_executable(game_dir, edition_exe(edition_entry))
+
+
+def version_dir(edition_id, version):
+    return GAMES / edition_id / version
+
+
+def list_versions(edition_id, ignore_cache=False, offline_ok=True):
+    """Installable builds for an edition, newest first.
+
+    Each entry gains ``installed``: whether that exact build is already on
+    disk, which is what lets switching back to a build you already have cost
+    nothing. ``ignore_cache`` bypasses the 12-hour cache on the build index,
+    for when a build known to be out is not showing up yet.
+
+    The builds on disk are listed whether or not the index names them: it is
+    a third party's, it stops listing builds, and it can be out of reach. A
+    build installed here starts either way, so it stays one to pick. With
+    ``offline_ok`` an index out of reach leaves just those; without, it is an
+    error, for a caller that is about to download.
+    """
+    on_disk = _installed_versions(edition_id)
+    store = (xodus.edition(edition_id) or {}).get("catalogue") == "store"
+    try:
+        catalogue = _catalogue(edition_id, ignore_cache)
+    except Exception as exc:
+        if not (offline_ok and on_disk):
+            raise
+        warn(f"The list of Minecraft builds could not be read ({exc}); "
+             "showing the builds already installed.")
+        catalogue = []
     out = []
-    for r in gh_releases(GAME_ARCHIVE_REPO, fetch_all=True):
-        tag = r["tag_name"]
-        m = re.search(r"(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?", tag)
-        if not m:
-            continue
-
-        major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        build = int(m.group(4)) if m.group(4) else 0
-
-        is_beta = bool(r.get("prerelease"))
-        if is_beta:
-            if (major, minor, patch, build) < (1, 21, 120, 21):
-                continue
-            if not include_beta:
-                continue
-        else:
-            if (major, minor, patch, build) < (1, 21, 120, 0):
-                continue
-
-        asset = next((
-            candidate for candidate in r.get("assets", [])
-            if str(candidate.get("name", "")).lower().endswith(".zip")
-            and "minecraft" in str(candidate.get("name", "")).lower()
-        ), None)
-        if not asset or not asset.get("browser_download_url"):
-            continue
-
-        out.append({
-            "tag": tag,
-            "beta": is_beta,
-            "url": asset["browser_download_url"],
-            "name": asset["name"],
-            "size": asset.get("size", 0),
-            "asset_id": asset.get("id"),
-            "asset_digest": asset.get("digest"),
-            "asset_updated_at": asset.get("updated_at"),
-        })
+    for entry in catalogue:
+        entry = dict(entry)
+        entry["installed"] = entry["version"] in on_disk
+        if store and entry["installed"]:
+            # "current" is a folder name; what it holds has a real number.
+            entry["build"] = build_version(
+                version_dir(edition_id, entry["version"]))
+        out.append(entry)
+    listed = {entry["version"] for entry in out}
+    out.extend({"version": version, "urls": [], "installed": True}
+               for version in on_disk - listed)
+    out.sort(key=lambda entry: xodus.version_key(entry["version"]),
+             reverse=True)
     return out
 
 
-def _game_root(dest):
-    """Folder of a complete extracted build (exe + appxmanifest), else None
-    (a bare exe with no manifest means a truncated extract → reinstall)."""
-    if not dest.exists():
+def from_windows_update(edition):
+    """Whether an edition comes from Windows Update rather than Xodus."""
+    return (edition or {}).get("source") == "windows-update"
+
+
+def _catalogue(edition_id, ignore_cache=False):
+    """The builds the edition's own source lists, newest first."""
+    edition = xodus.edition(edition_id)
+    if from_windows_update(edition):
+        return wustore.version_catalogue(edition, ignore_cache=ignore_cache)
+    return xodus.version_catalogue(edition_id, ignore_cache=ignore_cache)
+
+
+def edition_for_dir(game_dir):
+    """The edition a game folder holds, or None when it cannot be told.
+
+    A build the launcher installed is named by its folder,
+    games/<edition>/<version>/; any other copy by the package identity in its
+    manifest -- an Education build dropped in by hand is still Education.
+    """
+    if not game_dir:
         return None
-    for exe in dest.rglob("Minecraft.Windows.exe"):
-        if any((exe.parent / m).exists()
-               for m in ("appxmanifest.xml", "AppxManifest.xml")):
-            return exe.parent
+    folder = Path(game_dir).expanduser()
+    parts = _managed_parts(folder) or ()
+    if len(parts) >= 2 and xodus.edition(parts[0]):
+        return xodus.edition(parts[0])
+    for name in ("AppxManifest.xml", "appxmanifest.xml"):
+        try:
+            text = (folder / name).read_text(errors="ignore")
+        except OSError:
+            continue
+        match = re.search(r'<Identity[^>]*\bName="([^"]+)"', text)
+        if not match:
+            return None
+        return next((entry for entry in xodus.list_editions()
+                     if entry.get("family", "").split("_")[0]
+                     == match.group(1)), None)
     return None
 
 
-def _path_exists(path):
-    return path.exists() or path.is_symlink()
+def uses_xbox_live(game_dir):
+    """Whether the game in ``game_dir`` signs in through Xbox Live.
+
+    Every Bedrock build does, and it is the one this launcher's account,
+    pre-auth and UI patches are for; Minecraft Education signs in with a
+    school or work account of its own and must be left alone by all three.
+    """
+    edition = edition_for_dir(game_dir)
+    return edition is None or edition.get("xbox_live", True)
 
 
-def _remove_path(path):
-    if path.is_symlink() or path.is_file():
-        path.unlink(missing_ok=True)
-    elif path.exists():
-        shutil.rmtree(path)
+def _installed_versions(edition_id):
+    """The builds of an edition that are complete on disk, by version."""
+    try:
+        folders = list((GAMES / edition_id).iterdir())
+    except OSError:
+        return set()
+    exe = edition_exe(xodus.edition(edition_id))
+    return {folder.name for folder in folders
+            if folder.is_dir() and not folder.is_symlink()
+            and _game_root(folder, exe) is not None}
 
 
-def _asset_record(ver):
-    """Stable release-asset identity, or None for legacy/custom callers."""
+def installed_versions(edition_id):
+    """The builds of an edition that are on disk now, by version.
 
-    digest = str(ver.get("asset_digest") or "").strip().lower()
-    if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
-        digest = ""
-    asset_id = ver.get("asset_id")
-    updated = str(ver.get("asset_updated_at") or "").strip()
-    if asset_id is None and not digest and not updated:
+    For a caller that marks them in a list: read from the folders each time,
+    so a build downloaded or removed since the catalogue was loaded shows.
+    """
+    return _installed_versions(edition_id)
+
+
+def _game_root(dest, exe=xodus.BEDROCK_EXE):
+    """Folder of a complete installed build (exe + appxmanifest), else None
+    (a bare exe with no manifest means a truncated install → reinstall).
+
+    The shape is decided in bol.xodus, which is what writes the directory and
+    has to tell a finished download from one that installed nothing. What is
+    added here is the other way a folder can look complete and not be one: a
+    Store build whose encrypted package went missing cannot be decrypted, so
+    it is not something to launch — it is something to download again, and
+    saying so is what gives PLAY a way to repair it (issue #216)."""
+    root = xodus.game_root(dest, exe)
+    if root is None or xodus.lost_package_cache(root, exe):
         return None
-    return {
-        "schema": 1,
-        "tag": str(ver.get("tag") or ""),
-        "name": str(ver.get("name") or ""),
-        "size": int(ver.get("size") or 0),
-        "asset_id": str(asset_id) if asset_id is not None else "",
-        "digest": digest,
-        "updated_at": updated,
+    return root
+
+
+def _install_record(dest):
+    try:
+        return json.loads(
+            (Path(dest) / _INSTALL_METADATA).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return {}
+
+
+def _write_install_record(dest, edition, version, url):
+    record = {
+        "schema": 2,
+        "edition": edition["id"],
+        "product": edition["product"],
+        "version": version,
+        "source_url": url,
+        "xodus_rev": xodus.effective_rev(),
+        "installed": int(time.time()),
     }
-
-
-def _write_asset_record(game_target, record):
-    if record is None:
-        return
-    target = Path(game_target) / _ASSET_METADATA
+    target = Path(dest) / _INSTALL_METADATA
     staged = target.with_name("." + target.name + ".tmp")
     try:
         staged.write_text(
             json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n",
-            encoding="utf-8",
-        )
+            encoding="utf-8")
         staged.replace(target)
     finally:
         staged.unlink(missing_ok=True)
 
 
-def _installed_asset_is_current(game_target, record):
-    if record is None:
-        return True
-    path = Path(game_target) / _ASSET_METADATA
+def _configured_legacy_root():
+    """A complete install configured before the move to the Store, or None.
+
+    Anything under GAMES/<edition>/ belongs to the new layout and is handled
+    by the ordinary path; this is only about the copy an upgrade inherits.
+    """
+    configured = (load_settings().get("game_dir") or "").strip()
+    if not configured:
+        return None
+    path = Path(configured)
     try:
-        current = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, ValueError):
-        return False
-    return current == record
+        # Legacy installs also live under GAMES, as GAMES/<version-tag>/, so
+        # what marks the new layout is the edition id, not the parent.
+        owner = path.resolve().relative_to(GAMES.resolve()).parts[0]
+    except (ValueError, IndexError, OSError):
+        owner = None
+    if owner and xodus.edition(owner):
+        return None
+    return _game_root(path)
 
 
-def _verify_asset_digest(path, record):
-    expected = (record or {}).get("digest", "")
-    if not expected:
-        return
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1 << 20), b""):
-            digest.update(chunk)
-    actual = digest.hexdigest()
-    if actual != expected.removeprefix("sha256:"):
+def _build_name(edition, version):
+    """"Minecraft for Windows 1.26.63.1"; a Store-only title by name alone."""
+    if not version or version == xodus.STORE_BUILD:
+        return edition["name"]
+    return f"{edition['name']} {version}"
+
+
+def install_game(edition, version=None, progress=None, force=False):
+    """Install one build of one edition through Xodus.
+
+    Each build lives in its own folder, so going back to a build already on
+    disk costs nothing and the delta cache Xodus keeps beside it stays valid.
+    ``xodus-cli streaming`` is itself incremental and atomic -- it compares
+    local segment hashes against the package, fetches only what changed and
+    commits with a rename -- so there is deliberately no staging dance here.
+    """
+    wanted = str(version or "").strip()
+    exe = edition_exe(edition)
+    if wanted and not force:
+        # A build already on disk needs nothing from the index of builds: it
+        # starts with the index out of reach, and stays the build the player
+        # picked once the index stops listing it, instead of being swapped
+        # for the newest one with a download nobody asked for.
+        root = _game_root(version_dir(edition["id"], wanted), exe)
+        if root:
+            info(f"{_build_name(edition, wanted)} already installed")
+            return root
+    catalogue = list_versions(edition["id"], offline_ok=False)
+    if not catalogue:
         raise BolError(
-            "Minecraft archive SHA-256 mismatch; the downloaded asset was "
-            "not activated."
-        )
+            f"No {edition['name']} build is listed. Check the network "
+            "connection and try again.")
+    entry = next((c for c in catalogue if c["version"] == wanted), None)
+    if entry is None:
+        if wanted:
+            warn(f"{edition['name']} {wanted} is no longer listed; using "
+                 f"{catalogue[0]['version']} instead.")
+        entry = catalogue[0]
 
-
-def _recover_interrupted_game_refresh(archive, target, refresh, staging):
-    """Resolve an interrupted two-path game/cache activation.
-
-    A process can die between the game and cache renames. Candidate paths mean
-    activation did not finish, so restore the rollback copies. With no
-    candidates, two validated active paths mean activation finished and only
-    rollback cleanup was interrupted.
-    """
-    archive_backup = archive.with_name("." + archive.name + ".rollback")
-    game_backup = target.with_name("." + target.name + ".rollback")
-    candidates_present = _path_exists(refresh) or _path_exists(staging)
-    backups_present = (
-        _path_exists(archive_backup) or _path_exists(game_backup)
-    )
-    if not candidates_present and not backups_present:
-        return
-
-    active_complete = (
-        zipfile.is_zipfile(archive) and _game_root(target) is not None
-    )
-    if backups_present and not candidates_present and active_complete:
-        # Both candidates reached their active names; only cleanup was cut
-        # short. Keep the new pair and retire the old rollback paths.
-        _remove_path(archive_backup)
-        _remove_path(game_backup)
-        return
-
-    # In every other interrupted state, prefer the known-old rollback pair.
-    # Without a backup, keep an active path: ``refresh`` can exist before
-    # ``staging`` is created, so a missing staging name alone does not prove
-    # that the game candidate was promoted. Deleting the active game in that
-    # ambiguous download/activation window would lose a valid installation.
-    if _path_exists(archive_backup):
-        _remove_path(archive)
-        archive_backup.replace(archive)
-
-    if _path_exists(game_backup):
-        _remove_path(target)
-        game_backup.replace(target)
-
-    _remove_path(refresh)
-    _remove_path(staging)
-    _remove_path(archive_backup)
-    _remove_path(game_backup)
-
-
-def _activate_game_refresh(staged_archive, archive, staged_game, target):
-    """Activate a validated archive and game tree, restoring both on error."""
-    archive_backup = archive.with_name("." + archive.name + ".rollback")
-    game_backup = target.with_name("." + target.name + ".rollback")
-
-    # Recover a path left between the two renames of an earlier swap. A backup
-    # alongside a complete active path is only stale cleanup residue.
-    for active, backup in (
-            (archive, archive_backup), (target, game_backup)):
-        if _path_exists(backup):
-            if _path_exists(active):
-                _remove_path(backup)
-            else:
-                backup.replace(active)
-
-    had_archive = _path_exists(archive)
-    had_game = _path_exists(target)
-    archive_backed_up = False
-    game_backed_up = False
-    try:
-        # Keep both known-good paths until the candidates have been fully
-        # downloaded, extracted and validated. The archive is activated last.
-        if had_game:
-            target.replace(game_backup)
-            game_backed_up = True
-        staged_game.replace(target)
-
-        if had_archive:
-            archive.replace(archive_backup)
-            archive_backed_up = True
-        staged_archive.replace(archive)
-    except Exception as exc:
-        rollback_errors = []
-        for active, backup, had_active, backed_up in (
-                (archive, archive_backup, had_archive, archive_backed_up),
-                (target, game_backup, had_game, game_backed_up)):
-            try:
-                # If there was no old path, restore its exact absence. If the
-                # old path was moved aside, discard any candidate before
-                # putting the backup back.
-                if backed_up or not had_active:
-                    if _path_exists(active):
-                        _remove_path(active)
-                if backed_up:
-                    if not _path_exists(backup):
-                        raise OSError(f"rollback backup missing: {backup}")
-                    backup.replace(active)
-            except Exception as rollback_exc:
-                rollback_errors.append(f"{active}: {rollback_exc}")
-        if rollback_errors:
-            detail = "; ".join(rollback_errors)
-            raise BolError(
-                f"Minecraft archive activation failed: {exc}; "
-                f"rollback errors: {detail}"
-            ) from exc
-        raise
-    else:
-        for backup in (archive_backup, game_backup):
-            if _path_exists(backup):
-                try:
-                    _remove_path(backup)
-                except OSError as exc:
-                    # Both validated candidates are already active. Keep the
-                    # harmless rollback for recovery instead of rejecting them.
-                    warn(f"Could not remove Minecraft rollback {backup}: "
-                         f"{exc}")
-
-
-def download_game(ver, progress=None, force=False):
-    """Install one release-archive entry.
-
-    ``force`` refreshes the archive as well as the extracted game.  Microsoft
-    can roll out a platform hotfix without changing the user-facing Bedrock
-    version, so reusing a same-named cached archive forever can leave this
-    client on an older internal build.  The refresh is downloaded alongside
-    the existing cache entry and replaces it only after a complete download.
-    """
-    GAMES.mkdir(parents=True, exist_ok=True)
-    dest = GAMES / ver["tag"]
-    zp = CACHE / ver["name"]
-    refresh = zp.with_name(zp.name + ".refresh")
-    staging = dest.with_name("." + dest.name + ".refresh")
-    _recover_interrupted_game_refresh(zp, dest, refresh, staging)
-    root = _game_root(dest)
-    asset_record = _asset_record(ver)
-    if (root and not force
-            and not _installed_asset_is_current(dest, asset_record)):
-        # GitHub assets can be replaced while retaining the release tag. An
-        # older install has no marker, so refresh it once and record the exact
-        # asset thereafter.
-        force = True
-        info(
-            f"Minecraft {ver['tag']} asset changed or predates verified "
-            "asset tracking; refreshing automatically."
-        )
+    dest = version_dir(edition["id"], entry["version"])
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    root = _game_root(dest, exe)
     if root and not force:
-        info(f"Minecraft {ver['tag']} already installed")
+        info(f"{_build_name(edition, entry['version'])} already installed")
         return root
-    if (not force and zp.exists()
-            and (asset_record or {}).get("digest")):
-        try:
-            _verify_asset_digest(zp, asset_record)
-        except BolError:
-            # A release asset may be replaced without changing its filename.
-            # With no complete active game there is nothing to preserve, and
-            # retaining the now-invalid cache would make every retry fail
-            # before download() gets a chance to fetch the replacement.
-            _remove_path(zp)
-            info(
-                f"Cached Minecraft {ver['tag']} archive no longer matches "
-                "the published asset; downloading it again."
-            )
-    if force:
-        refresh_part = refresh.with_suffix(refresh.suffix + ".part")
-        _remove_path(refresh)
-        _remove_path(refresh_part)
-        _remove_path(staging)
-        preserve_transaction = False
-        info(f"Refreshing Minecraft {ver['tag']} archive "
-             f"(~{ver['size']>>20} Mio) …")
-        try:
-            download(
-                ver["url"],
-                refresh,
-                f"Minecraft {ver['tag']}",
-                progress,
-            )
-            _verify_asset_digest(refresh, asset_record)
-            staging.mkdir(parents=True)
-            with zipfile.ZipFile(refresh) as z:
-                z.extractall(staging)
-            staged_root = _game_root(staging)
-            if not staged_root:
-                die("Minecraft.Windows.exe missing from the archive.")
-            relative_root = staged_root.relative_to(staging)
-            _write_asset_record(staging, asset_record)
-            info(f"{'Reinstalling' if root else 'Installing'} Minecraft "
-                 f"{ver['tag']} …")
-            # Once activation starts, a rollback failure must leave at least
-            # one candidate path as a durable interrupted-transaction signal.
-            # The next invocation can then prefer the known-old rollback pair
-            # instead of mistaking two merely valid paths for a committed pair.
-            preserve_transaction = True
-            try:
-                _activate_game_refresh(refresh, zp, staging, dest)
-            except BolError:
-                # _activate_game_refresh wraps an incomplete rollback in
-                # BolError. Retain the candidate which tells recovery to roll
-                # back rather than commit the syntactically valid mixed pair.
-                raise
-            except Exception:
-                # Ordinary activation errors were rolled back completely by
-                # _activate_game_refresh, so their candidates are disposable.
-                preserve_transaction = False
-                raise
-            else:
-                preserve_transaction = False
-        finally:
-            # Download/extract failures have not touched active data, so their
-            # candidates are disposable. After an activation exception they
-            # are recovery state and must survive until the next invocation.
-            _remove_path(refresh_part)
-            if not preserve_transaction:
-                _remove_path(refresh)
-                _remove_path(staging)
-        root = dest / relative_root
-        ok(f"Minecraft {ver['tag']} installed")
-        return root
-    elif not zp.exists():
-        info(f"Downloading Minecraft {ver['tag']} "
-             f"(~{ver['size']>>20} Mio) …")
-        download(ver["url"], zp, f"Minecraft {ver['tag']}", progress)
+
+    # A build installed before the move to the Store lives outside
+    # GAMES/<edition>/<version>/ and cannot be reached by this path. It is
+    # still a complete, working game and it is the one the player has, so keep
+    # it as the fallback rather than stranding them with nothing to launch.
+    fallback = (None if root or not is_bedrock(edition)
+                else _configured_legacy_root())
+
+    if from_windows_update(edition):
+        info(f"{'Reinstalling' if root else 'Installing'} {edition['name']} "
+             f"{entry['version']} — this downloads it from Microsoft's "
+             "Windows Update servers …")
+        url = (entry.get("package") or {}).get("moniker") or edition["product"]
+    else:
+        info(f"{'Reinstalling' if root else 'Installing'} "
+             f"{_build_name(edition, entry['version'])} — this downloads it "
+             "from Microsoft with your own account …")
+        # Every mirror the index lists, not just the first: they carry the
+        # same package, so a truncated body from one is retryable on the next.
+        url = entry["urls"][0] if entry["urls"] else edition["product"]
     try:
-        _verify_asset_digest(zp, asset_record)
-    except BolError:
-        # This non-transactional path is used only when no complete game is
-        # active. Never retain a freshly downloaded archive whose published
-        # digest failed, otherwise all later retries would reuse it forever.
-        _remove_path(zp)
+        if from_windows_update(edition):
+            wustore.install(edition, entry, dest, progress)
+        else:
+            # xodus.install's defaults are Bedrock's; another title names the
+            # executable that marks its build, and itself in what goes wrong.
+            extra = ({} if is_bedrock(edition)
+                     else {"exe": exe, "title": edition["name"]})
+            xodus.install(entry["urls"], dest, progress, **extra)
+    except xodus.NotSignedIn:
+        # Actionable, and only the caller can act: never fold this into the
+        # fallback below, or the launcher quietly keeps starting the old build
+        # instead of offering the sign-in that would install this one.
         raise
-    info(f"{'Reinstalling' if root else 'Installing'} Minecraft "
-         f"{ver['tag']} …")
-    if dest.exists():
-        shutil.rmtree(dest)
-    dest.mkdir(parents=True)
-    with zipfile.ZipFile(zp) as z:
-        z.extractall(dest)
-    root = _game_root(dest)
+    except BolError as exc:
+        if fallback is None:
+            raise
+        warn(f"Could not download {_build_name(edition, entry['version'])} "
+             f"({exc}) — starting the copy already installed. It predates the "
+             "switch to the Microsoft Store, so it stays on its own build "
+             "until the download works.")
+        return fallback
+    root = _game_root(dest, exe)
     if not root:
-        die("Minecraft.Windows.exe missing from the archive.")
-    _write_asset_record(dest, asset_record)
-    ok(f"Minecraft {ver['tag']} installed")
+        die(f"{exe or 'The game executable'} missing after installing "
+            f"{_build_name(edition, entry['version'])}.")
+    _write_install_record(dest, edition, entry["version"], url)
+    shown = entry["version"]
+    if not is_bedrock(edition):
+        # Bedrock packs its own numbering into the package version, so only
+        # another title's package says its build outright.
+        shown = build_version(root) or shown
+    ok(f"{_build_name(edition, shown)} installed")
+    _mention_other_builds(edition["id"], entry["version"])
     return root
+
+
+def _human_size(size):
+    value = float(size or 0)
+    for unit in ("B", "KiB", "MiB"):
+        if value < 1024:
+            return f"{value:.0f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GiB"
+
+
+def _mention_other_builds(edition_id, version):
+    """Say what the builds this download did not replace are taking up.
+
+    Each build has a folder of its own, so a download never removes the one
+    it follows. That is deliberate -- it is what makes going back instant --
+    and it was completely invisible: nothing said the old build was still
+    there, so a few version changes quietly became 10 GiB and the launcher
+    read as "it keeps downloading Minecraft over and over" (issue #214).
+    Saying it here turns that into a number and a place to act on it.
+    """
+    try:
+        others = [build for build in installed_builds()
+                  if build["managed"] and not (build["edition"] == edition_id
+                                               and build["version"] == version)]
+    except OSError:
+        return
+    if not others:
+        return
+    total = sum(build["size"] or 0 for build in others)
+    info(f"{len(others)} other Minecraft build"
+         f"{'s are' if len(others) != 1 else ' is'} still installed, taking "
+         f"{_human_size(total)}. Remove the ones you are finished with in "
+         "Settings ▸ Versions — worlds and settings are kept.")
 
 
 def use_game_dir(folder):
     folder = Path(folder).expanduser().resolve()
-    if not (folder / "Minecraft.Windows.exe").exists():
+    owner = edition_for_dir(folder)
+    if not is_bedrock(owner):
+        # Another title of the family, in the folder install_game() wrote:
+        # what marks it is the executable its own package declares.
+        root = xodus.game_root(folder, edition_exe(owner))
+        if root is None:
+            die(f"{owner['name']} is not installed in {folder}.")
+        folder = root
+    elif not (folder / "Minecraft.Windows.exe").exists():
         cands = list(folder.rglob("Minecraft.Windows.exe"))
         if not cands:
             die(f"Minecraft.Windows.exe not found in {folder} (nor in "
-                f"its subfolders). Choose an extracted version folder, "
-                f"or use '① Minecraft version'.")
+                f"its subfolders). Choose an installed edition folder, "
+                f"or use '① Minecraft edition'.")
         best = max(cands, key=lambda e: _vt(mc_version_str(e.parent) or "0"))
         folder = best.parent
         info(f"Minecraft found: {folder} "
@@ -402,18 +442,259 @@ def use_game_dir(folder):
     CONTENT.symlink_to(folder)
     s = load_settings()
     s["game_dir"] = str(folder)
-    # Remember the version actually selected so the picker and auto-select
-    # default to the version you last played (else the latest) — never a stale
-    # one. games/<tag>/ gives the exact release tag; fall back to the manifest.
+    # Remember what was selected so the picker and auto-select default to what
+    # you last played. games/<edition>/<version>/ names both outright; a folder
+    # from outside the managed tree names neither, and keeping the previous
+    # choice there would silently reinstall over an imported copy.
     try:
-        ver = folder.relative_to(GAMES.resolve()).parts[0]
+        parts = folder.relative_to(GAMES.resolve()).parts
     except ValueError:
-        ver = None
-    ver = ver or mc_version_str(folder)
-    if ver:
-        s["mc_version"] = ver
+        parts = ()
+    if len(parts) >= 2 and xodus.edition(parts[0]):
+        s["mc_edition"] = parts[0]
+        s["mc_version"] = parts[1]
+    else:
+        # An imported copy still reports its build, for display and bug reports.
+        version = mc_version_str(folder)
+        if version:
+            s["mc_version"] = version
     save_settings(s)
     return folder
+
+
+# ------------------------------------------------------------ installed builds
+
+# Every build is downloaded into its own folder, which is what makes going
+# back to one already on disk instant -- and what makes them pile up: three
+# builds tried out is three copies of a 2.5 GiB game, and until this section
+# existed nothing but `rm -rf` ever removed one (issue #214).
+#
+# Nothing the player made is in there. Worlds, settings, screenshots, skins
+# and packs live in the Wine prefix, under the account that made them (see
+# bol.content), and the prefix belongs to the profile rather than to any one
+# build -- so removing a build removes the game and none of what was played
+# with it. That sentence belongs wherever the launcher offers the removal:
+# "delete this version" reads like "delete my worlds" to anyone who has not
+# been told otherwise.
+
+
+def _dir_size(path):
+    """Bytes the tree under ``path`` holds, unreadable parts skipped."""
+    total = 0
+    stack = [str(path)]
+    while stack:
+        try:
+            entries = list(os.scandir(stack.pop()))
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(entry.path)
+                elif entry.is_file(follow_symlinks=False):
+                    total += entry.stat(follow_symlinks=False).st_size
+            except OSError:
+                continue
+    return total
+
+
+def _managed_parts(path):
+    """``path`` as its parts under GAMES, or None when it is outside it.
+
+    Resolved on both sides, so a symlinked data directory -- which is what
+    "Storage ▸ Browse…" leaves behind -- is still recognised as the managed
+    tree rather than treated as somewhere the launcher must not touch.
+    """
+    try:
+        return Path(path).resolve().relative_to(GAMES.resolve()).parts
+    except (OSError, ValueError):
+        return None
+
+
+def _selected_root():
+    """The build folder the launcher would start next, or None."""
+    configured = (load_settings().get("game_dir") or "").strip()
+    if not configured:
+        return None
+    try:
+        return Path(configured).expanduser().resolve()
+    except OSError:
+        return None
+
+
+def _holds(folder, path):
+    """Whether ``path`` is ``folder`` or something inside it."""
+    if path is None:
+        return False
+    try:
+        path.relative_to(Path(folder).resolve())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _build_entry(folder, edition_entry, version, selected, with_size=True):
+    exe = edition_exe(edition_entry)
+    root = xodus.game_root(folder, exe)
+    record = _install_record(folder)
+    managed = _managed_parts(folder) is not None
+    if not is_bedrock(edition_entry) or version == xodus.STORE_BUILD:
+        # The folder of a Store-only title is named "current"; the build in
+        # it has a number of its own, and that is the one worth showing.
+        version = build_version(root or folder) or version
+    return {
+        "edition": edition_entry["id"] if edition_entry else None,
+        "title": edition_title(edition_entry),
+        "name": edition_entry["name"] if edition_entry else "Minecraft",
+        "version": version or mc_version_str(root or folder) or "unknown",
+        "path": Path(folder),
+        "size": _dir_size(folder) if with_size else None,
+        # Complete *and* decryptable: a Store build whose package went missing
+        # still has an exe and a manifest and cannot be started (#216), and
+        # the only thing to do with it is download it again.
+        "playable": _game_root(folder, exe) is not None,
+        "in_use": _holds(folder, selected),
+        "installed_at": record.get("installed"),
+        # Only what the launcher itself downloaded is the launcher's to
+        # delete; a folder the player imported stays theirs.
+        "managed": managed,
+        # In the tree the launcher owns, but not under an edition: an install
+        # from before the move to the Store. It is a real build and the one
+        # some players still have, so it is listed and removable like the
+        # rest -- it just cannot be downloaded again from here.
+        "legacy": managed and edition_entry is None,
+    }
+
+
+def installed_builds(with_size=True):
+    """Every Minecraft build on disk, newest first.
+
+    Covers the three shapes a build can have here: the managed layout
+    (``games/<edition>/<version>/``), the one an install from before the move
+    to the Store left behind (``games/<version>/``), and a copy the player
+    pointed the launcher at from somewhere else -- listed so the one in use is
+    always shown, and marked unmanaged so nothing offers to delete it.
+
+    ``with_size=False`` skips walking each build, for callers that only need
+    to know what is there.
+    """
+    selected = _selected_root()
+    editions = {entry["id"]: entry for entry in list_editions(True)}
+    out, seen = [], set()
+    try:
+        top = sorted(GAMES.iterdir())
+    except OSError:
+        top = []
+    for entry in top:
+        if not entry.is_dir() or entry.is_symlink():
+            continue
+        edition_entry = editions.get(entry.name)
+        if edition_entry is not None:
+            try:
+                builds = sorted(entry.iterdir())
+            except OSError:
+                continue
+            exe = edition_exe(edition_entry)
+            for build in builds:
+                if (not build.is_dir()
+                        or xodus.game_root(build, exe) is None):
+                    continue
+                out.append(_build_entry(build, edition_entry, build.name,
+                                        selected, with_size))
+                seen.add(build.resolve())
+            continue
+        # The pre-Store layout: games/<version>/, with no edition above it.
+        if xodus.game_root(entry) is not None:
+            out.append(_build_entry(entry, None, entry.name, selected,
+                                    with_size))
+            seen.add(entry.resolve())
+    if selected is not None and _game_root(selected) is not None and not any(
+            _holds(build["path"], selected) for build in out):
+        out.append(_build_entry(selected, None, None, selected, with_size))
+    out.sort(key=lambda build: xodus.version_key(build["version"]),
+             reverse=True)
+    return out
+
+
+def remove_build(path):
+    """Delete one downloaded build and return the bytes that frees.
+
+    Worlds, settings and screenshots are not in there -- see the note at the
+    top of this section -- so this takes the download and nothing else. What
+    it does have to take with it is the *selection*: the launcher starts
+    whatever ``game_dir`` names, and a setting left pointing at a folder that
+    is gone turns the next PLAY into a launch failure instead of the download
+    it should be.
+    """
+    from .prefix import _mc_running
+
+    folder = Path(path).expanduser()
+    try:
+        folder = folder.resolve()
+    except OSError as exc:
+        raise BolError(f"Could not remove {path}: {exc}") from exc
+    parts = _managed_parts(folder)
+    # One or two components: games/<version>/ or games/<edition>/<version>/.
+    # Anything else is GAMES itself, a folder deeper inside a build, or --
+    # the one that would really hurt -- games/<edition>/, which holds every
+    # build of that edition and has exactly the depth of the pre-Store
+    # layout. A delete aimed at any of those is a bug, not a request.
+    if (not parts or len(parts) > 2
+            or (len(parts) == 1 and xodus.edition(parts[0]))):
+        raise BolError(
+            f"{folder} is not a Minecraft build this launcher downloaded, so "
+            "it will not be removed. Delete it yourself if you are sure.")
+    if not folder.is_dir():
+        raise BolError(f"There is no build in {folder} to remove.")
+    # And it has to look like a build: a game inside it, the record the
+    # installer wrote, or the encrypted package a download leaves. Whatever
+    # else has found its way in there is not this function's to delete.
+    if not (xodus.game_root(folder) or xodus.game_root(folder, None)
+            or xodus.has_package_cache(folder)
+            or (folder / _INSTALL_METADATA).exists()):
+        raise BolError(
+            f"{folder} holds no Minecraft build, so it will not be removed.")
+    if _mc_running():
+        raise BolError(
+            "Minecraft is running. Close the game, then remove the build.")
+
+    selected = _selected_root()
+    freed = _dir_size(folder)
+    shutil.rmtree(folder)
+    if _holds(folder, selected):
+        # The launcher runs the game through this symlink, so it goes with
+        # the folder it points into.
+        try:
+            if CONTENT.is_symlink():
+                CONTENT.unlink()
+        except OSError:
+            pass
+        settings = load_settings()
+        settings.pop("game_dir", None)
+        save_settings(settings)
+    return freed
+
+
+_IDENTITY_VERSION = re.compile(
+    r'<Identity\b[^>]*?\bVersion\s*=\s*"(\d+(?:\.\d+){1,3})"', re.I | re.S)
+
+
+def build_version(game_dir):
+    """The package version a build declares, as written ("1.17.0.0").
+
+    Bedrock packs its own numbering into that field (see mc_version_str);
+    every other title means it as it stands.
+    """
+    for name in ("appxmanifest.xml", "AppxManifest.xml",
+                 "MicrosoftGame.config"):
+        try:
+            text = (Path(game_dir) / name).read_text(errors="ignore")
+        except OSError:
+            continue
+        match = _IDENTITY_VERSION.search(text)
+        if match:
+            return match.group(1)
+    return None
 
 
 def mc_version_str(game_dir: Path):
@@ -424,11 +705,12 @@ def mc_version_str(game_dir: Path):
                           man.read_text(errors="ignore"))
             if m:
                 p = m.group(3)
-                # Bedrock packs "<minor><patch>" into the Appx 3rd field, e.g.
-                # 2004 -> "20.4", 3005 -> "30.5", 0301 -> "3.1" — split it back
-                # so the result matches the release tags (e.g. 1.26.20.4).
+                # Bedrock packs "<minor><patch>" into the Appx 3rd field, the
+                # patch always on the last two digits: 2004 -> "20.4", 0301 ->
+                # "3.1", 12004 -> "120.4" -- split it back so the result
+                # matches Mojang's version numbers (1.26.20.4, 1.21.120.4).
                 if len(p) >= 3:
-                    return f"{m.group(1)}.{m.group(2)}.{int(p[:2])}.{int(p[2:])}"
+                    return f"{m.group(1)}.{m.group(2)}.{int(p[:-2])}.{int(p[-2:])}"
                 return f"{m.group(1)}.{m.group(2)}.{int(p)}"
     return None
 
@@ -440,10 +722,17 @@ def _vt(v):
         return (0,)
 
 
-def _auto_mc_version(s):
-    vs = list_mc_versions(False) or list_mc_versions(True)
-    if not vs:
-        die("No Minecraft version available (check your network).")
-    want = (s.get("mc_version") or "").strip()
-    return next((v for v in vs if v["tag"] == want
-                 or v["tag"].startswith(want + ".")), vs[0]) if want else vs[0]
+def _auto_selection(s):
+    """The (edition, version) to install when the caller named neither.
+
+    An unset or no-longer-listed version falls through to the newest build,
+    which is what install_game() does with it.
+    """
+    want = (s.get("mc_edition") or "").strip()
+    chosen = xodus.edition(want) if want else None
+    if chosen is None:
+        editions = list_editions(include_beta=False) or list_editions(True)
+        if not editions:
+            die("No Minecraft edition is available.")
+        chosen = editions[0]
+    return chosen, (s.get("mc_version") or "").strip() or None

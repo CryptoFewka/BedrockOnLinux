@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shutil
@@ -20,6 +19,7 @@ from .config import (
 )
 from .engine_lock import managed_engine_lock
 from .log import BolError
+from .util import sha256_file
 
 
 EXT_DGC = "ext-dgc"
@@ -38,11 +38,28 @@ REQUIRED_COMPONENTS = {
     "vkd3d_nv_dgc": VKD3D_NV_DGC_COMPONENT_VERSION,
 }
 
-# native5 through native12 keep the reviewed r11/r12 universal graphics payload. Hashing
-# whatever an archive declares would only prove internal consistency, so pin
-# the known DLL bytes as an independent trust anchor. Future engine revisions
-# must update the revision pin deliberately.
-REQUIRED_VARIANT_HASHES_BUILD_REV = "wow64-archs-native12"
+# native5 through native13 kept the reviewed r11/r12 universal graphics
+# payload; native14 rebuilds it with the occluded frame-latency fix, which
+# changes d3d12core.dll on both architectures and leaves d3d12.dll untouched.
+# Hashing whatever an archive declares would only prove internal consistency,
+# so pin the known DLL bytes as an independent trust anchor. Future engine
+# revisions must update the revision pin deliberately.
+# native15 and native16 differ from native14 only in Wine's ntdll (the
+# mapped-fd main-image loader, then path support for it), native17 differs
+# from native16 only in Wine's Wayland driver, native18 from native17 only in
+# xgameruntime's XSystem interface revisions, native19 from native18 only in
+# windows.storage's file save picker, native20 from native19 only in the
+# Wayland driver's seat version, native21 from native20 only in
+# xgameruntime's Gaming Services version check, and native22 from native21
+# only in kernelbase's GetProcessMemoryInfo, so the vkd3d payload — and
+# therefore every variant hash below — was unchanged; only the revision this
+# launcher accepts moved. native23 rebuilds the payload with the
+# frame-limiter busy-wait fix (#202): d3d12core.dll changes on both
+# architectures again and d3d12.dll stays byte for byte the same. native24
+# strips Wine's own modules and leaves the payload, already built stripped,
+# as it was. native25 only adds jscript's Intl object, native26 a jscript
+# call fix, native27 an ieframe fix.
+REQUIRED_VARIANT_HASHES_BUILD_REV = "wow64-archs-native27"
 REQUIRED_ENGINE_GLIBC_MAX = "2.31"
 REQUIRED_VKD3D_BASE_COMMIT = "3b10bd7a7ec6a7347e616cf8bea59333afec2255"
 REQUIRED_VKD3D_REVERT = "76c11d2e2b90b0a46dc894508e67e2aaacc2c04d"
@@ -119,13 +136,13 @@ REQUIRED_VARIANT_HASHES = {
             "d6f4e30131e5f05f9167f93c2277652b7d2299ef43a4f623990ee4fd8a34cc4c",
         ("files/lib/wine/vkd3d-proton/x86_64-windows/"
          "d3d12core.dll.bol-ext-dgc"):
-            "870d498f1762b99c18fc3fa02cb92bc35dfbbf121162fa49e06521d8d5ef54da",
+            "fb087ac16045927ffe2003ef210925b53d701add127927957fc0e8647c89b8aa",
         ("files/lib/wine/vkd3d-proton/i386-windows/"
          "d3d12.dll.bol-ext-dgc"):
             "aac73e3555cb3ca893b3ef11ab033e42a0ffa3139e3ac4ae8ded1667cd321190",
         ("files/lib/wine/vkd3d-proton/i386-windows/"
          "d3d12core.dll.bol-ext-dgc"):
-            "48ecfec79064ea81fcca378239da02051655588fff69005678b2483b7a2f0daa",
+            "ec67019917132762cda430bd0f12df2d352937bb98345b336f5a2f93bab9ddb0",
     },
     NV_DGC: {
         ("files/lib/wine/vkd3d-proton/x86_64-windows/"
@@ -133,13 +150,13 @@ REQUIRED_VARIANT_HASHES = {
             "d6f4e30131e5f05f9167f93c2277652b7d2299ef43a4f623990ee4fd8a34cc4c",
         ("files/lib/wine/vkd3d-proton/x86_64-windows/"
          "d3d12core.dll.bol-nv-dgc"):
-            "870d498f1762b99c18fc3fa02cb92bc35dfbbf121162fa49e06521d8d5ef54da",
+            "fb087ac16045927ffe2003ef210925b53d701add127927957fc0e8647c89b8aa",
         ("files/lib/wine/vkd3d-proton/i386-windows/"
          "d3d12.dll.bol-nv-dgc"):
             "aac73e3555cb3ca893b3ef11ab033e42a0ffa3139e3ac4ae8ded1667cd321190",
         ("files/lib/wine/vkd3d-proton/i386-windows/"
          "d3d12core.dll.bol-nv-dgc"):
-            "48ecfec79064ea81fcca378239da02051655588fff69005678b2483b7a2f0daa",
+            "ec67019917132762cda430bd0f12df2d352937bb98345b336f5a2f93bab9ddb0",
     },
 }
 
@@ -205,17 +222,6 @@ def _safe_manifest_file(root: Path, relative: str, variant: str,
     return resolved
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while True:
-            block = stream.read(1 << 20)
-            if not block:
-                break
-            digest.update(block)
-    return digest.hexdigest()
-
-
 def _valid_sha256(value) -> bool:
     if not isinstance(value, str) or len(value) != 64:
         return False
@@ -254,7 +260,68 @@ def _validated_distribution_files(
     return validated
 
 
+# What one process has already validated: the arguments of the call, to the
+# result and to what every file it vouched for looked like on disk.
+_VALIDATED: Dict[tuple, Tuple[ValidatedEngineManifest, tuple]] = {}
+
+
+def _manifest_signature(root: Path, manifest: ValidatedEngineManifest):
+    """What the files a validation read look like on disk, without reading.
+
+    Size, modification time, inode and mode of the manifest, of every file
+    it lists and of the runtime links: a file replaced, edited in place,
+    retargeted or made non-executable changes at least one of them.
+    """
+    relatives = set(manifest.critical_files)
+    for files in manifest.variants.values():
+        relatives.update(files)
+    relatives.update(REQUIRED_EXECUTABLE_FILE_PATHS)
+    relatives.update(REQUIRED_RUNTIME_LINK_TARGETS)
+    signature = []
+    for path in [manifest.path] + [
+            root.joinpath(*PurePosixPath(relative).parts)
+            for relative in sorted(relatives)]:
+        for status in (os.lstat, os.stat):
+            found = status(path)
+            signature.append((str(path), found.st_size, found.st_mtime_ns,
+                              found.st_ino, found.st_mode))
+    return tuple(signature)
+
+
 def validate_engine_manifest(
+        engine_root: Path, build_rev: str,
+        required_variant: Optional[str] = None,
+        enforce_pins: bool = False) -> ValidatedEngineManifest:
+    """Validate the engine manifest, once per process for unchanged files.
+
+    One PLAY asks three times: setup, the launch that follows it, and the
+    activation of the vkd3d payload. Each used to hash the Wine runtime and
+    all eight vkd3d DLLs again. An answer already given stands for as long
+    as every file it covered still has the size, time, inode and mode it had
+    then; anything else, a failure included, is validated in full.
+    """
+    root = Path(engine_root)
+    key = (str(root), build_rev,
+           None if required_variant is None
+           else _normalise_variant(required_variant), bool(enforce_pins))
+    known = _VALIDATED.get(key)
+    if known is not None:
+        try:
+            if _manifest_signature(root, known[0]) == known[1]:
+                return known[0]
+        except OSError:
+            pass
+        del _VALIDATED[key]
+    manifest = _validate_engine_manifest(
+        root, build_rev, required_variant, enforce_pins)
+    try:
+        _VALIDATED[key] = (manifest, _manifest_signature(root, manifest))
+    except OSError:
+        pass
+    return manifest
+
+
+def _validate_engine_manifest(
         engine_root: Path, build_rev: str,
         required_variant: Optional[str] = None,
         enforce_pins: bool = False) -> ValidatedEngineManifest:
@@ -386,7 +453,7 @@ def validate_engine_manifest(
                 relative)
         expected_hash = expected_hash.lower()
         source = _safe_manifest_file(root, relative, "critical_files", None)
-        actual_hash = _sha256(source)
+        actual_hash = sha256_file(source)
         if actual_hash != expected_hash:
             raise BolError(
                 "Engine manifest validation failed: SHA-256 mismatch for "
@@ -490,7 +557,7 @@ def validate_engine_manifest(
             expected_hash = expected_hash.lower()
             source = _safe_manifest_file(root, relative, variant,
                                          required_variant)
-            actual_hash = _sha256(source)
+            actual_hash = sha256_file(source)
             if actual_hash != expected_hash:
                 detail = "SHA-256 mismatch for %s" % relative
                 if variant == NV_DGC and required_variant == NV_DGC:
@@ -564,7 +631,7 @@ def _transactional_activate(
             stage_path = target.with_name(
                 target.name + ".bol-stage-" + transaction)
             _copy_file_synced(source, stage_path)
-            if _sha256(stage_path) != expected_hash:
+            if sha256_file(stage_path) != expected_hash:
                 raise OSError("staged SHA-256 mismatch for %s" % target)
             stages[target] = stage_path
 
@@ -582,7 +649,7 @@ def _transactional_activate(
         _fsync_directories(directories)
 
         for target, expected_hash in all_targets:
-            if not target.is_file() or _sha256(target) != expected_hash:
+            if not target.is_file() or sha256_file(target) != expected_hash:
                 raise OSError("post-activation SHA-256 mismatch for %s" % target)
     except Exception as exc:
         rollback_errors = []
@@ -639,7 +706,7 @@ def activate_vkd3d_variant(
             target = root.joinpath(*PurePosixPath(target_relative).parts)
             all_targets.append((target, expected_hash))
             try:
-                current_hash = _sha256(target) if target.is_file() else None
+                current_hash = sha256_file(target) if target.is_file() else None
             except OSError:
                 current_hash = None
             if current_hash != expected_hash:

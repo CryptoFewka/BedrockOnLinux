@@ -35,6 +35,62 @@ ACHIEVEMENTS_PATCH = (
 CONTEXT_CALLBACK_PATCH = (
     DELTA / "0004-combase-implement-context-callback.patch"
 )
+XSTORE_PATCH = (
+    DELTA / "0006-xgameruntime-stop-faking-xstore-answers.patch"
+)
+MAPPED_FD_PATCH = (
+    DELTA / "0007-ntdll-load-main-image-from-a-mapped-fd.patch"
+)
+PATH_MAP_PATCH = (
+    DELTA / "0008-ntdll-accept-a-path-in-the-image-map.patch"
+)
+XSYSTEM_PATCH = (
+    DELTA / "0009-xgameruntime-support-IXSystemImpl2-5-and-stub-"
+            "XSystemHandleTrack.patch"
+)
+SAVE_PICKER_PATCH = (
+    DELTA / "0010-windows.storage-implement-the-file-save-picker.patch"
+)
+WAYLAND_SEAT_PATCH = (
+    DELTA / "0011-winewayland-bind-wl_seat-no-newer-than-the-pointer-"
+            "listener.patch"
+)
+GAMING_SERVICES_PATCH = (
+    DELTA / "0012-xgameruntime-run-titles-that-target-a-newer-gaming-"
+            "services.patch"
+)
+PRIVATE_USAGE_PATCH = (
+    DELTA / "0013-kernelbase-report-PrivateUsage-from-"
+            "GetProcessMemoryInfo.patch"
+)
+FSYNC_PATCH = (
+    DELTA / "0014-ntdll-server-fall-back-to-fsync-without-ntsync.patch"
+)
+VM_COUNTERS_PATCH = (
+    DELTA / "0015-ntdll-reread-proc-self-status-through-a-kept-"
+            "descriptor.patch"
+)
+TIME_ZONE_PATCH = (
+    DELTA / "0016-ntdll-check-the-time-zone-at-most-once-a-second.patch"
+)
+GAME_EVENT_PATCH = (
+    DELTA / "0017-xgameruntime-record-the-title-s-XGameEventWrite-calls.patch"
+)
+INTL_PATCH = (
+    DELTA / "0018-jscript-add-the-Intl-object-Internet-Explorer-11-has.patch"
+)
+CALL_FLAGS_PATCH = (
+    DELTA
+    / "0019-jscript-call-not-get-when-METHOD-PROPERTYGET-carries-arguments.patch"
+)
+SHELL_BROWSER_PATCH = (
+    DELTA / "0020-ieframe-serve-SID_SShellBrowser-from-the-WebBrowser-control.patch"
+)
+# The follow-ups after 0013. They were first applied around the manifest so
+# that native22 kept verifying; native23 pins every file they change.
+LATE_PATCHES = (FSYNC_PATCH, VM_COUNTERS_PATCH, TIME_ZONE_PATCH,
+                GAME_EVENT_PATCH, INTL_PATCH, CALL_FLAGS_PATCH,
+                SHELL_BROWSER_PATCH)
 SOURCE_SUMS = DELTA / "SOURCE-SHA256SUMS"
 CHANGED_FILES = {
     "dlls/combase/combase.c",
@@ -42,6 +98,25 @@ CHANGED_FILES = {
     "dlls/combase/dcom.idl",
     "dlls/combase/marshal.c",
     "dlls/combase/stubmanager.c",
+    "dlls/ieframe/shellbrowser.c",
+    "dlls/ieframe/webbrowser.c",
+    "dlls/jscript/Makefile.in",
+    "dlls/jscript/dispex.c",
+    "dlls/jscript/global.c",
+    "dlls/jscript/intl.c",
+    "dlls/jscript/jscript.h",
+    "dlls/jscript/string.c",
+    "dlls/kernelbase/debug.c",
+    "dlls/ntdll/Makefile.in",
+    "dlls/ntdll/unix/fsync.c",
+    "dlls/ntdll/unix/fsync.h",
+    "dlls/ntdll/unix/loader.c",
+    "dlls/ntdll/unix/process.c",
+    "dlls/ntdll/unix/server.c",
+    "dlls/ntdll/unix/sync.c",
+    "dlls/ntdll/unix/system.c",
+    "dlls/ntdll/unix/unix_private.h",
+    "dlls/ntdll/unix/virtual.c",
     "dlls/ole32/dcom.idl",
     "dlls/windows.storage.applicationdata/Makefile.in",
     "dlls/windows.storage.applicationdata/main.c",
@@ -52,14 +127,20 @@ CHANGED_FILES = {
     "dlls/windows.storage/main.c",
     "dlls/windows.storage/pickers.c",
     "dlls/windows.storage/private.h",
+    "dlls/windows.storage/savepicker.c",
     "dlls/windows.storage/tests/storage.c",
     "dlls/windows.storage/vector.c",
+    "dlls/winewayland.drv/wayland.c",
     "dlls/xgameruntime/GDKComponent/System/User/XUser.c",
     "dlls/xgameruntime/GDKComponent/System/User/XUser.h",
     "dlls/xgameruntime/GDKComponent/System/User/DeviceAuth.c",
     "dlls/xgameruntime/GDKComponent/System/User/DeviceAuth.h",
     "dlls/xgameruntime/GDKComponent/System/User/Token.c",
     "dlls/xgameruntime/GDKComponent/System/User/Token.h",
+    "dlls/xgameruntime/GDKComponent/System/Threading/XAsync.c",
+    "dlls/xgameruntime/GDKComponent/System/Threading/XAsync.h",
+    "dlls/xgameruntime/GDKComponent/System/XStore.c",
+    "dlls/xgameruntime/GDKComponent/System/XGameEvent.c",
     "dlls/xgameruntime/GDKComponent/InitInternalGDKC.c",
     "dlls/xgameruntime/GDKComponent/System/XGame.c",
     "dlls/xgameruntime/GDKComponent/System/XSystem.c",
@@ -72,9 +153,22 @@ CHANGED_FILES = {
     "include/microsoft.ui.idl",
     "include/microsoft.windows.storage.pickers.idl",
     "include/objidlbase.idl",
+    "include/psapi.h",
+    "include/windows.storage.pickers.idl",
     "include/xgame.idl",
     "include/xgameerr.h",
+    "include/wine/server_protocol.h",
     "libs/uuid/uuid.c",
+    "server/Makefile.in",
+    "server/fsync.c",
+    "server/fsync.h",
+    "server/inproc_sync.c",
+    "server/main.c",
+    "server/process.c",
+    "server/protocol.def",
+    "server/request_handlers.h",
+    "server/request_trace.h",
+    "server/thread.c",
 }
 PINNED_SOURCE_FILES = CHANGED_FILES | {"dlls/winex11.drv/init.c"}
 
@@ -116,6 +210,46 @@ class WineGdkSourceDeltaTests(unittest.TestCase):
             self._constant("VENDORED_CLIENT_SURFACE_PATCH_SHA256"),
         )
         self.assertEqual(
+            hashlib.sha256(XSTORE_PATCH.read_bytes()).hexdigest(),
+            self._constant("VENDORED_XSTORE_PATCH_SHA256"),
+        )
+        self.assertEqual(
+            hashlib.sha256(MAPPED_FD_PATCH.read_bytes()).hexdigest(),
+            self._constant("VENDORED_MAPPED_FD_PATCH_SHA256"),
+        )
+        self.assertEqual(
+            hashlib.sha256(PATH_MAP_PATCH.read_bytes()).hexdigest(),
+            self._constant("VENDORED_PATH_MAP_PATCH_SHA256"),
+        )
+        self.assertEqual(
+            hashlib.sha256(XSYSTEM_PATCH.read_bytes()).hexdigest(),
+            self._constant("VENDORED_XSYSTEM_PATCH_SHA256"),
+        )
+        self.assertEqual(
+            hashlib.sha256(SAVE_PICKER_PATCH.read_bytes()).hexdigest(),
+            self._constant("VENDORED_SAVE_PICKER_PATCH_SHA256"),
+        )
+        self.assertEqual(
+            hashlib.sha256(WAYLAND_SEAT_PATCH.read_bytes()).hexdigest(),
+            self._constant("VENDORED_WAYLAND_SEAT_PATCH_SHA256"),
+        )
+        self.assertEqual(
+            hashlib.sha256(GAMING_SERVICES_PATCH.read_bytes()).hexdigest(),
+            self._constant("VENDORED_GAMING_SERVICES_PATCH_SHA256"),
+        )
+        self.assertEqual(
+            hashlib.sha256(PRIVATE_USAGE_PATCH.read_bytes()).hexdigest(),
+            self._constant("VENDORED_PRIVATE_USAGE_PATCH_SHA256"),
+        )
+        self.assertEqual(
+            hashlib.sha256(FSYNC_PATCH.read_bytes()).hexdigest(),
+            self._constant("VENDORED_FSYNC_PATCH_SHA256"),
+        )
+        self.assertEqual(
+            hashlib.sha256(GAME_EVENT_PATCH.read_bytes()).hexdigest(),
+            self._constant("VENDORED_GAME_EVENT_PATCH_SHA256"),
+        )
+        self.assertEqual(
             hashlib.sha256(SOURCE_SUMS.read_bytes()).hexdigest(),
             self._constant("SOURCE_SHA256SUMS_SHA256"),
         )
@@ -134,11 +268,20 @@ class WineGdkSourceDeltaTests(unittest.TestCase):
         followup = FOLLOWUP_PATCH.read_text()
         achievements = ACHIEVEMENTS_PATCH.read_text()
         context_callback = CONTEXT_CALLBACK_PATCH.read_text()
+        xstore = XSTORE_PATCH.read_text()
+        mapped_fd = (MAPPED_FD_PATCH.read_text() + PATH_MAP_PATCH.read_text()
+                     + XSYSTEM_PATCH.read_text()
+                     + SAVE_PICKER_PATCH.read_text()
+                     + WAYLAND_SEAT_PATCH.read_text()
+                     + GAMING_SERVICES_PATCH.read_text()
+                     + PRIVATE_USAGE_PATCH.read_text()
+                     + "".join(path.read_text() for path in LATE_PATCHES))
         self.assertTrue(text.startswith(f"From {WINEGDK_SOURCE_COMMIT} "))
         changed = {
             left for left, right in re.findall(
                 r"^diff --git a/(\S+) b/(\S+)$",
-                text + followup + achievements + context_callback,
+                text + followup + achievements + context_callback + xstore
+                + mapped_fd,
                 re.MULTILINE,
             )
             if left == right
@@ -329,6 +472,43 @@ class WineGdkSourceDeltaTests(unittest.TestCase):
             ),
         )
 
+        xstore_additions = "\n".join(
+            line[1:] for line in xstore.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        )
+        xstore_deletions = "\n".join(
+            line[1:] for line in xstore.splitlines()
+            if line.startswith("-") and not line.startswith("---")
+        )
+        # Neither store query may fabricate an answer any more: no async is
+        # begun, so the caller's block and its unknown task queue stay untouched.
+        self.assertEqual(xstore_additions.count("E_GAMESTORE_NETWORK_ERROR"), 4)
+        self.assertIn("no store service available, failing the", xstore_additions)
+        for fabricated in (
+            'XAsyncBegin( asyncBlock, NULL, store_QueryGameLicenseAsync',
+            'XAsyncBegin( asyncBlock, NULL, store_QueryAssociatedProductsAsync',
+            'XAsyncComplete( data->async, S_OK, 144 )',
+            'memset( data->buffer, 0, data->bufferSize )',
+            'p[64] = 1;  /* isActive = true */',
+        ):
+            self.assertIn(fabricated, xstore_deletions)
+        for begun in ("XAsyncBegin(", "XAsyncGetResult(", "XAsyncComplete("):
+            self.assertNotIn(begun, xstore_additions)
+        # A queue this DLL does not own may still be the native sidecar's.
+        for routed in (
+            "WineGDKGetNativeThreading",
+            "IXThreadingImpl_XTaskQueueDuplicateHandle",
+            "IXThreadingImpl_XTaskQueueSubmitDelayedCallback",
+            "IXThreadingImpl_XTaskQueueCloseHandle",
+            "stateImpl->queueIsNative = TRUE",
+            "belongs to neither task queue implementation",
+        ):
+            self.assertIn(routed, xstore_additions)
+        self.assertIn(
+            "is not a Wine XTaskQueue, using process queue",
+            xstore_deletions,
+        )
+
         context_additions = "\n".join(
             line[1:] for line in context_callback.splitlines()
             if line.startswith("+") and not line.startswith("+++")
@@ -368,6 +548,11 @@ class WineGdkSourceDeltaTests(unittest.TestCase):
         self.assertLess(
             text.index('apply "$VENDORED_ACHIEVEMENTS_PATCH"'),
             text.index('apply --check "$VENDORED_CONTEXT_CALLBACK_PATCH"'),
+        )
+        self.assertIn('apply --check "$VENDORED_XSTORE_PATCH"', text)
+        self.assertLess(
+            text.index('apply "$VENDORED_CLIENT_SURFACE_PATCH"'),
+            text.index('apply --check "$VENDORED_XSTORE_PATCH"'),
         )
         self.assertNotIn("VENDORED_PICKER_COMPLETION_PATCH", text)
 
@@ -409,6 +594,15 @@ class WineGdkSourceDeltaTests(unittest.TestCase):
             text.index('apply "$VENDORED_ACHIEVEMENTS_PATCH"'),
             text.index('apply --check "$VENDORED_CONTEXT_CALLBACK_PATCH"'),
         )
+        self.assertIn(
+            'readonly VENDORED_XSTORE_PATCH_SHA256='
+            f'"{hashlib.sha256(XSTORE_PATCH.read_bytes()).hexdigest()}"',
+            text,
+        )
+        self.assertLess(
+            text.index('apply "$VENDORED_CLIENT_SURFACE_PATCH"'),
+            text.index('apply --check "$VENDORED_XSTORE_PATCH"'),
+        )
         self.assertNotIn("VENDORED_PICKER_COMPLETION_PATCH", text)
 
     def test_builder_can_finalize_the_verified_prefix_after_install(self):
@@ -435,21 +629,19 @@ class WineGdkSourceDeltaTests(unittest.TestCase):
         build = BUILD_WORKFLOW.read_text()
         engine = ENGINE_WORKFLOW.read_text()
         release = RELEASE_WORKFLOW.read_text()
+        # One script names the release, from the commit, the manifest and
+        # the build recipe; no workflow spells the name out itself.
+        tag_script = (ROOT / "scripts/winegdk-release-tag.sh").read_text()
+        self.assertIn("pin WINEGDK_SOURCE_MANIFEST_SHA256", tag_script)
         self.assertIn(
-            'out="winegdk-prefix-${short}-${manifest_short}.tar.gz"',
-            build,
-        )
+            'echo "winegdk-${commit:0:12}-${manifest:0:12}'
+            '${recipe:+-$recipe}"', tag_script)
+        self.assertIn('tag="$(scripts/winegdk-release-tag.sh)"', build)
+        self.assertIn('out="winegdk-prefix-${tag#winegdk-}.tar.gz"', build)
+        self.assertIn("tag_name: ${{ env.PREFIX_TAG }}", build)
+        self.assertIn('gh release download "$tag"', engine)
         self.assertIn(
-            "tag_name: winegdk-${{ env.SHORT }}-${{ env.MANIFEST_SHORT }}",
-            build,
-        )
-        self.assertIn(
-            'gh release download "winegdk-${short}-${manifest_short}"',
-            engine,
-        )
-        self.assertIn(
-            '"winegdk-${wshort}-${wmshort}" '
-            '"winegdk-prefix-${wshort}-${wmshort}.tar.gz"',
+            'needs_build "$wtag" "winegdk-prefix-${wtag#winegdk-}.tar.gz"',
             release,
         )
         self.assertIn(
@@ -502,6 +694,97 @@ class WineGdkSourceDeltaTests(unittest.TestCase):
                 self.assertIn(f"! -e {path}", text)
                 self.assertIn(f"! -L {path}", text)
 
+    def test_the_container_builder_applies_every_vendored_patch(self):
+        """The container script is what CI actually runs.
+
+        Wiring a patch into the Bullseye script alone left CI exporting the
+        source without it, and the build died on the source-hash check with
+        nothing pointing at the omission.
+        """
+        text = CONTAINER_SCRIPT.read_text()
+        # 0001 and the r12 base are already inside the commit the container
+        # exports; every follow-up has to be applied on top of it by name.
+        for path in (
+            FOLLOWUP_PATCH,
+            ACHIEVEMENTS_PATCH,
+            CONTEXT_CALLBACK_PATCH,
+            CLIENT_SURFACE_PATCH,
+            XSTORE_PATCH,
+            MAPPED_FD_PATCH,
+            PATH_MAP_PATCH,
+            XSYSTEM_PATCH,
+        ):
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            with self.subTest(patch=path.name):
+                self.assertIn(path.name, text, f"{path.name} is never applied")
+                self.assertIn(digest, text, f"{path.name} is not pinned")
+
+    def test_no_workflow_quotes_a_container_script_containing_an_apostrophe(self):
+        """A quoted container script must not contain an apostrophe.
+
+        Workflows hand a whole shell script to `docker run` as one
+        single-quoted argument. An apostrophe inside it -- in a comment, even
+        -- closes that argument, so the container runs a truncated script and
+        the remainder is executed by the runner host instead. That is how an
+        `apt-get install` ended up on the runner, failing with "are you root?"
+        while the container had happily run everything before it.
+        """
+        opener = re.compile(r"^(\s*)bash .*-c '$")
+        for workflow in sorted((ROOT / ".github/workflows").glob("*.yml")):
+            lines = workflow.read_text().splitlines()
+            inside = None
+            for number, line in enumerate(lines, start=1):
+                if inside is None:
+                    match = opener.match(line)
+                    if match:
+                        inside = match.group(1)
+                    continue
+                if line.strip() == "'" :
+                    inside = None
+                    continue
+                with self.subTest(workflow=workflow.name, line=number):
+                    self.assertNotIn(
+                        "'", line,
+                        f"{workflow.name}:{number} would end the quoted "
+                        "script passed to the container")
+
+    def test_no_build_script_line_ends_in_a_doubled_backslash(self):
+        """A doubled continuation silently truncates a command's arguments.
+
+        Generating one of these turned `verify_sha256 \\` into a call with a
+        literal backslash and no arguments, which `bash -n` accepts happily --
+        the package job died on "$2: unbound variable" instead.
+        """
+        for script in (SCRIPT, CONTAINER_SCRIPT, PACKAGER):
+            for number, line in enumerate(
+                    script.read_text().splitlines(), start=1):
+                if line.rstrip().endswith("\\\\"):
+                    self.fail(f"{script.name}:{number} ends in '\\\\'")
+
+    def test_every_packager_pin_matches_the_file_it_names(self):
+        """Each verify_sha256 pin must be the digest of its own file.
+
+        Re-pinning one delta with a shell substitution once overwrote the
+        r12 README's pin with the native5 README's digest. Nothing caught it
+        until a CI package job refused the staged tree.
+        """
+        text = PACKAGER.read_text()
+        roots = {"r12_root": ROOT / "third_party/winegdk-r12",
+                 "native_root": DELTA}
+        pins = re.findall(
+            r'verify_sha256 "\$(\w+)/([^"]+)" \\\n\s*"([0-9a-f]{64})"',
+            text)
+        self.assertTrue(pins, "no verify_sha256 pins found")
+        for variable, relative, digest in pins:
+            root = roots.get(variable)
+            if root is None:
+                continue
+            path = root / relative
+            with self.subTest(file=f"{variable}/{relative}"):
+                self.assertTrue(path.is_file(), f"{path} is pinned but absent")
+                self.assertEqual(
+                    hashlib.sha256(path.read_bytes()).hexdigest(), digest)
+
     def test_packager_pins_current_native_source_provenance(self):
         text = PACKAGER.read_text()
         for path in (
@@ -512,6 +795,10 @@ class WineGdkSourceDeltaTests(unittest.TestCase):
             ACHIEVEMENTS_PATCH,
             CONTEXT_CALLBACK_PATCH,
             CLIENT_SURFACE_PATCH,
+            XSTORE_PATCH,
+            MAPPED_FD_PATCH,
+            PATH_MAP_PATCH,
+            XSYSTEM_PATCH,
         ):
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
             self.assertIn(digest, text, path.name)
@@ -543,6 +830,10 @@ class WineGdkSourceDeltaTests(unittest.TestCase):
             '"native5/0005-winex11-use-client-surface-origin.patch"',
             text,
         )
+        self.assertIn(
+            '"native5/0006-xgameruntime-stop-faking-xstore-answers.patch"',
+            text,
+        )
         self.assertNotIn("0005-windows.storage", text)
 
         arch_loop = text.index('for arch in "${ARCHES[@]}"; do',
@@ -554,6 +845,369 @@ class WineGdkSourceDeltaTests(unittest.TestCase):
         loop_end = text.index("\ndone", marker)
         self.assertLess(arch_loop, marker)
         self.assertLess(marker, loop_end)
+
+        xstore_marker = text.index(
+            '"no store service available, failing the"',
+            arch_loop,
+        )
+        self.assertLess(arch_loop, xstore_marker)
+        self.assertLess(xstore_marker, loop_end)
+
+
+    def test_xsystem_answers_every_interface_revision_the_game_asks_for(self):
+        """Each GDK library in 1.26.50 asks XSystem for its own interface ID.
+
+        libHttpClient.GDK.dll, PlayFabMultiplayerGDK.dll and the Xbox Live
+        services thunks new in 1.26.50 each query CLSID_XSystemImpl for a
+        different revision and call only vtable slot 4 on what they get. The
+        thunks do not survive E_NOINTERFACE: friends and Realms never came up
+        for a signed-in player (#266).
+        """
+        additions = "\n".join(
+            line[1:] for line in XSYSTEM_PATCH.read_text().splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        )
+        for data1 in ("0x1861cf2e", "0x6fd71f09", "0x67ce4bfc"):
+            self.assertIn(data1, additions)
+        for iid in ("IID_IXSystemImpl2", "IID_IXSystemImpl3",
+                    "IID_IXSystemImpl5"):
+            self.assertIn(f"IsEqualGUID( iid, &{iid} )", additions)
+        self.assertIn("return S_OK;", additions)
+        # The flattened vtable itself is untouched: slot 4 stays the sandbox
+        # query every one of those callers makes.
+        self.assertNotIn("x_system_vtbl", XSYSTEM_PATCH.read_text())
+
+    def test_the_wayland_seat_is_bound_no_newer_than_its_listener(self):
+        # #296: wl_seat 8 sends wl_pointer.axis_value120, which a listener
+        # built against Bullseye's libwayland has no slot for, and the first
+        # turn of the wheel aborted the game.
+        text = WAYLAND_SEAT_PATCH.read_text()
+        additions = "\n".join(
+            line[1:] for line in text.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        )
+        self.assertIn("#ifdef WL_POINTER_AXIS_VALUE120_SINCE_VERSION",
+                      additions)
+        self.assertIn("#define WAYLAND_SEAT_VERSION 8", additions)
+        self.assertIn("#define WAYLAND_SEAT_VERSION 7", additions)
+        self.assertIn("version < WAYLAND_SEAT_VERSION ?", additions)
+        self.assertIn("-                                         version < 8 ? "
+                      "version : 8);", text)
+
+    def test_a_newer_gaming_services_target_does_not_stop_the_title(self):
+        # #274: Preview 1.26.70 asks for Gaming Services 7849 and quit before
+        # its window, on some launches only: the switch that skips the check
+        # was read through uninitialised variables.
+        text = GAMING_SERVICES_PATCH.read_text()
+        additions = "\n".join(
+            line[1:] for line in text.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        )
+        removals = "\n".join(
+            line[1:] for line in text.splitlines()
+            if line.startswith("-") and not line.startswith("---")
+        )
+        self.assertIn("return E_GAMERUNTIME_VERSION_MISMATCH;", removals)
+        self.assertNotIn("E_GAMERUNTIME_VERSION_MISMATCH", additions)
+        self.assertIn("DWORD valueSize = sizeof(DWORD);", additions)
+        self.assertIn("DWORD value = 0;", additions)
+        self.assertIn("return result == ERROR_SUCCESS && value != 0;",
+                      additions)
+        self.assertNotIn("FAILED( result )", additions)
+
+    def test_private_usage_reaches_a_caller_that_asked_for_it(self):
+        # #292: Minecraft read stack leftovers as its own memory use and
+        # replaced other players' skins with default ones.
+        text = PRIVATE_USAGE_PATCH.read_text()
+        additions = "\n".join(
+            line[1:] for line in text.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        )
+        self.assertIn("VM_COUNTERS_EX vmc;", additions)
+        self.assertIn("if (count >= sizeof(PROCESS_MEMORY_COUNTERS_EX))",
+                      additions)
+        self.assertIn("->PrivateUsage = vmc.PrivateUsage;", additions)
+        self.assertIn("pmc->cb = sizeof(PROCESS_MEMORY_COUNTERS_EX);",
+                      additions)
+        # A caller with the short structure still gets the short size.
+        self.assertIn("else pmc->cb = sizeof(PROCESS_MEMORY_COUNTERS);",
+                      additions)
+        self.assertIn("} PROCESS_MEMORY_COUNTERS_EX;", additions)
+
+    def test_fsync_backs_ntsync_up_without_replacing_it(self):
+        # Wine 11 lost esync/fsync: without /dev/ntsync (mainline < 6.14)
+        # every wait was a wineserver round-trip. 0014 is Valve's futex_waitv
+        # backend for the inproc sync framework, used only when ntsync fails.
+        text = FSYNC_PATCH.read_text()
+        additions = "\n".join(
+            line[1:] for line in text.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        )
+        self.assertIn("b62913d8cab fsync: Introduce futex-based inproc sync "
+                      "backend.", text)
+        # The server still tries ntsync first and only then falls back.
+        server_open = additions.index(
+            'fd = open( "/dev/ntsync", O_CLOEXEC | O_RDONLY );')
+        fallback = additions.index(
+            "else if (do_fsync()) fd = FSYNC_USED_BY_SERVER;")
+        self.assertLess(server_open, fallback)
+        self.assertIn("do_fsync_cached = 0;", additions)
+        self.assertIn('getenv( "WINEFSYNC" )', additions)
+        self.assertIn("__NR_futex_waitv", additions)
+        # Proton's per-game switches are environment-only and off by default.
+        for name in ("WINE_FSYNC_SIMULATE_SCHED_QUANTUM",
+                     "WINE_FSYNC_YIELD_TO_WAITERS",
+                     "WINE_FSYNC_HELP_SIMULATED_PULSE"):
+            self.assertIn(f'fsync_env_flag( "{name}" )', additions)
+        self.assertNotIn("SteamGameId", additions)
+        # Valve's bundled header is not used; the system one stays.
+        self.assertNotIn("ntsync_tmp.h", additions)
+        # The protocol change ships with its regenerated outputs, which a
+        # plain configure && make does not rebuild.
+        self.assertIn("#define SERVER_PROTOCOL_VERSION 931", additions)
+        self.assertIn("DECL_HANDLER(fsync_free_shm_idx);", additions)
+        changed = set(re.findall(r"^diff --git a/(\S+) b/\1$", text,
+                                 re.MULTILINE))
+        self.assertIn("server/protocol.def", changed)
+        self.assertIn("include/wine/server_protocol.h", changed)
+        self.assertIn("server/request_handlers.h", changed)
+        self.assertIn("server/request_trace.h", changed)
+        # configure is not regenerated by the builders, so nothing may
+        # depend on a new configure check.
+        self.assertNotIn("configure.ac", changed)
+        self.assertNotIn("HAVE_LINUX_FUTEX_H", additions)
+        # glibc kept shm_open in librt until 2.34 and the engine is built
+        # against Debian 11's 2.31; configure only adds -lrt when
+        # clock_gettime needs it, so both links name it themselves.
+        self.assertIn("$(HWLOC_LIBS) -lrt", additions)
+        self.assertIn("$(INOTIFY_LIBS) $(PROCSTAT_LIBS) -lrt", additions)
+        # native23 pins every file 0014 changes in SOURCE-SHA256SUMS.
+        self.assertLessEqual(changed, PINNED_SOURCE_FILES,
+                             changed - PINNED_SOURCE_FILES)
+
+    def test_both_builders_require_the_fsync_fallback_in_the_server(self):
+        for script in (SCRIPT, CONTAINER_SCRIPT):
+            with self.subTest(script=script.name):
+                text = script.read_text()
+                self.assertIn('grep -qa "WINEFSYNC"', text)
+                self.assertIn('grep -qa "/dev/ntsync"', text)
+
+    def test_the_save_picker_is_what_every_export_activates(self):
+        # #167: RoActivateInstance of this class failed with
+        # REGDB_E_CLASSNOTREG, and every export stayed on its loading screen.
+        text = SAVE_PICKER_PATCH.read_text()
+        additions = "\n".join(
+            line[1:] for line in text.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        )
+        self.assertIn("runtimeclass FileSavePicker;", additions)
+        self.assertIn("RuntimeClass_Windows_Storage_Pickers_FileSavePicker",
+                      additions)
+        # The interface ID the game's own binary carries, not a guess at it.
+        self.assertIn("uuid(3286ffcb-617f-4cc5-af6a-b3fdf29ad145)", additions)
+        self.assertIn("0x3e68d4bd, 0x7135, 0x4d10", additions)
+        self.assertIn("GetSaveFileNameW( &dialog )", additions)
+        self.assertIn("OFN_OVERWRITEPROMPT", additions)
+        self.assertIn("dialog.lpstrDefExt = extension;", additions)
+        self.assertIn("OPEN_ALWAYS", additions)
+        self.assertIn("storage_file_statics_iid", additions)
+        # Declared once more so widl can compute the map's signature.
+        self.assertIn(
+            "interface Windows.Foundation.Collections.IVector<HSTRING>;",
+            additions)
+
+    @staticmethod
+    def _additions(path):
+        return "\n".join(
+            line[1:] for line in path.read_text().splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        )
+
+    def test_own_memory_counters_cost_one_read(self):
+        # Minecraft asks for its memory counters every frame: an open, stdio
+        # reads, hundreds of sscanf() and a close were 2.8% of its main thread.
+        additions = self._additions(VM_COUNTERS_PATCH)
+        self.assertIn("static LONG proc_self_status_fd = -1;", additions)
+        self.assertIn(
+            'open( "/proc/self/status", O_RDONLY | O_CLOEXEC )', additions)
+        self.assertIn("pread( fd, buffer, sizeof(buffer) - 1, 0 )", additions)
+        # Two threads racing to open it keep one descriptor, never leak one.
+        self.assertIn(
+            "InterlockedCompareExchange( &proc_self_status_fd, fd, -1 )",
+            additions)
+        self.assertNotIn("sscanf", additions)
+        for field in ("VmPeak:", "VmSize:", "VmHWM:", "VmRSS:", "RssAnon:",
+                      "VmSwap:"):
+            with self.subTest(field=field):
+                self.assertIn(f'"{field}"', additions)
+        # Another process's counters are still read afresh and closed.
+        self.assertIn('"/proc/%u/status", unix_pid', additions)
+        self.assertIn("close( fd );", additions)
+
+    def test_time_zone_is_checked_at_most_once_a_second(self):
+        # Four GetTimeZoneInformation calls per frame each made glibc stat
+        # /etc/localtime twice before finding the cached answer still valid.
+        text = TIME_ZONE_PATCH.read_text()
+        additions = self._additions(TIME_ZONE_PATCH)
+        self.assertIn("static time_t last_check = -1;", additions)
+        self.assertIn("now = time(NULL);", additions)
+        self.assertIn("if (now == last_check)", additions)
+        # The early return comes before any libc time zone call.
+        self.assertLess(text.index("if (now == last_check)"),
+                        text.index("tm = gmtime(&year_start);"))
+        # Both paths that leave a valid cache record the check.
+        self.assertEqual(additions.count("last_check = now;"), 2)
+
+    @staticmethod
+    def _changed_files(path):
+        return set(re.findall(r"^diff --git a/(\S+) b/\1$", path.read_text(),
+                              re.MULTILINE))
+
+    def test_jscript_has_the_intl_object_ie11_had(self):
+        # #351: the Microsoft account page Minecraft Education opens reads
+        # Intl while it renders; with none the sign-in stayed an empty card.
+        additions = self._additions(INTL_PATCH)
+        for name in ("NumberFormat", "DateTimeFormat", "Collator",
+                     "getCanonicalLocales", "supportedLocalesOf"):
+            self.assertIn(f'L"{name}"', additions)
+        self.assertIn("return init_intl(ctx);", additions)
+        self.assertIn("intl_compare_strings(ctx, NULL, vthis", additions)
+        self.assertIn("intl.c", additions)
+        for script in (SCRIPT, CONTAINER_SCRIPT):
+            with self.subTest(script=script.name):
+                self.assertEqual(
+                    hashlib.sha256(INTL_PATCH.read_bytes()).hexdigest(),
+                    re.search(r'^readonly VENDORED_INTL_PATCH_SHA256="([^"]+)"',
+                              script.read_text(), re.MULTILINE).group(1))
+        packager = PACKAGER.read_text()
+        self.assertIn(hashlib.sha256(INTL_PATCH.read_bytes()).hexdigest(),
+                      packager)
+        self.assertIn("grep -Fx getCanonicalLocales", packager)
+
+    def test_jscript_calls_when_method_or_get_carries_arguments(self):
+        # #351: the first document.createElement("div") of a page came back
+        # as the createElement function, Knockout threw, and the Office
+        # sign-in Education opens drew no form.
+        additions = self._additions(CALL_FLAGS_PATCH)
+        self.assertIn("pdp->cArgs > pdp->cNamedArgs", additions)
+        self.assertEqual(self._changed_files(CALL_FLAGS_PATCH),
+                         {"dlls/jscript/dispex.c"})
+        digest = hashlib.sha256(CALL_FLAGS_PATCH.read_bytes()).hexdigest()
+        for script in (SCRIPT, CONTAINER_SCRIPT):
+            with self.subTest(script=script.name):
+                self.assertEqual(
+                    digest,
+                    re.search(r'^readonly VENDORED_CALL_FLAGS_PATCH_SHA256="([^"]+)"',
+                              script.read_text(), re.MULTILINE).group(1))
+        self.assertIn(digest, PACKAGER.read_text())
+
+    def test_webbrowser_gives_oneauth_its_window(self):
+        # #351: OneAuth asks the WebBrowser control for SID_SShellBrowser and
+        # its window right after the e-mail address; both failed and sign-in
+        # ended on "Something went wrong [9zj22]".
+        additions = self._additions(SHELL_BROWSER_PATCH)
+        self.assertIn("IsEqualGUID(&SID_SShellBrowser, guidService)", additions)
+        self.assertIn("*phwnd = This->doc_host->frame_hwnd", additions)
+        self.assertEqual(self._changed_files(SHELL_BROWSER_PATCH),
+                         {"dlls/ieframe/shellbrowser.c",
+                          "dlls/ieframe/webbrowser.c"})
+        digest = hashlib.sha256(SHELL_BROWSER_PATCH.read_bytes()).hexdigest()
+        for script in (SCRIPT, CONTAINER_SCRIPT):
+            with self.subTest(script=script.name):
+                self.assertEqual(
+                    digest,
+                    re.search(r'^readonly VENDORED_SHELL_BROWSER_PATCH_SHA256="([^"]+)"',
+                              script.read_text(), re.MULTILINE).group(1))
+        self.assertIn(digest, PACKAGER.read_text())
+
+    def test_game_events_reach_the_launcher(self):
+        # #152: QueryApiImpl refused this class with E_NOTIMPL, XSAPI dropped
+        # every event the game wrote, and no achievement ever unlocked.
+        additions = self._additions(GAME_EVENT_PATCH)
+        self.assertIn(
+            "DEFINE_GUID(CLSID_XGameEventImpl, 0xbbfbdcc7, 0xbfe7, 0x409b, "
+            "0xa5, 0xca, 0xed, 0xf0, 0x54, 0x96, 0x0b, 0x4d);",
+            additions)
+        self.assertIn("IsEqualGUID( runtimeClassId, &CLSID_XGameEventImpl )",
+                      additions)
+        self.assertIn("*out = x_game_event_get();", additions)
+        self.assertIn("GDKComponent/System/XGameEvent.c", additions)
+        # The file bol/gameevents.py reads and forwards.
+        self.assertIn('L"BOL_GAME_EVENT_LOG"', additions)
+        self.assertIn('"BOL_GAME_EVENT_LOG"',
+                      (ROOT / "bol" / "gameevents.py").read_text())
+
+    def test_late_patches_are_pinned_and_applied_before_the_source_check(self):
+        """SOURCE-SHA256SUMS describes the tree every engine is built from.
+
+        0014 to 0017 were applied around the manifest while native22 was
+        current; native23 pins every file they change and moves
+        WINEGDK_SOURCE_MANIFEST_SHA256 with it, so no patch may land on top of
+        the verified tree any more.
+        """
+        late = sorted(
+            path for path in DELTA.glob("*.patch")
+            if path.name[:4] >= "0014"
+        )
+        self.assertEqual(late, sorted(LATE_PATCHES))
+        for path in late:
+            changed = self._changed_files(path)
+            with self.subTest(patch=path.name):
+                self.assertLessEqual(changed, PINNED_SOURCE_FILES,
+                                     changed - PINNED_SOURCE_FILES)
+        self.assertEqual(
+            self._changed_files(GAME_EVENT_PATCH) & PINNED_SOURCE_FILES,
+            {"dlls/xgameruntime/main.c", "dlls/xgameruntime/private.h",
+             "dlls/xgameruntime/Makefile.in",
+             "dlls/xgameruntime/GDKComponent/System/XGameEvent.c"},
+        )
+        check = 'sha256sum --strict -c "$SOURCE_SHA256SUMS"'
+        for script in (SCRIPT, CONTAINER_SCRIPT):
+            text = script.read_text()
+            verified = text.index(check)
+            for path in late:
+                with self.subTest(script=script.name, patch=path.name):
+                    name = re.search(
+                        r'^readonly (VENDORED_\w+_PATCH)="[^"]*/'
+                        + re.escape(path.name) + '"$',
+                        text, re.MULTILINE).group(1)
+                    self.assertLess(text.index(f'apply --check "${name}"'),
+                                    text.index(f'apply "${name}"'))
+                    self.assertLess(text.index(f'apply "${name}"'), verified)
+                    self.assertEqual(text.count(f'apply "${name}"'), 1)
+
+    def test_packager_requires_game_events_in_both_architectures(self):
+        text = PACKAGER.read_text()
+        arch_loop = text.index('for arch in "${ARCHES[@]}"; do',
+                               text.index("# The native engine must expose"))
+        marker = text.index(
+            'has_text "$xgdk" "short write of an event record"', arch_loop)
+        self.assertLess(marker, text.index("\ndone", arch_loop))
+        self.assertIn('WARN( "short write of an event record',
+                      self._additions(GAME_EVENT_PATCH))
+
+    def test_every_vendored_patch_is_applied_and_attested(self):
+        """A patch in third_party ships only if the builders apply it.
+
+        0009 was merged into third_party/winegdk-native5 with nothing applying
+        it, so it would have sat there while every engine was built without
+        it. Every patch file must be pinned and applied by both builders and
+        listed in the packager's provenance.
+        """
+        bullseye = SCRIPT.read_text()
+        container = CONTAINER_SCRIPT.read_text()
+        packager = PACKAGER.read_text()
+        for path in sorted(DELTA.glob("*.patch")):
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            with self.subTest(patch=path.name):
+                self.assertIn(path.name, bullseye)
+                self.assertIn(digest, bullseye)
+                self.assertIn(f"native5/{path.name}", packager)
+                self.assertIn(digest, packager)
+                # The container exports a commit that already contains 0001.
+                if not path.name.startswith("0001-"):
+                    self.assertIn(path.name, container)
+                    self.assertIn(digest, container)
 
 
 if __name__ == "__main__":

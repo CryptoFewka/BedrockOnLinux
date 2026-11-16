@@ -1,0 +1,168 @@
+# Xodus — legitimate Minecraft Bedrock acquisition
+
+Upstream: https://github.com/xodus-gaming/xodus (GPL-3.0)
+Pinned commit: `64d39eb87a56c7d0d7e7fde0b233654ac5477b0f`
+
+## Why this is here
+
+BedrockOnLinux used to install Minecraft by downloading a pre-extracted,
+DRM-stripped copy of the game from a third-party GitHub repository. That
+redistributes the game, and it let anyone install it without owning it.
+
+Xodus replaces that with the path Windows itself uses. It signs in to the
+user's own Microsoft account, asks Microsoft's licensing service for the
+title license (which carries the content key), then streams the MSIXVC
+package from the official Xbox CDN and decrypts it on the fly. The result is
+the same extracted game directory the launcher already knows how to drive —
+but the account has to actually own Minecraft.
+
+Only `xodus-cli` is used. `xodus-service`, and the separate `xodus-gaming/wine`
+and `xodus-gaming/Proton` trees, are not: BedrockOnLinux keeps its own WineGDK
+engine, which carries the native Xbox identity, XUser and online-login work
+that Xodus's stack does not have.
+
+## What the launcher calls
+
+| Command | Used for |
+|---|---|
+| `xodus-cli login` | One-time Microsoft sign-in (`InlineLogin.srf` in an embedded webview). |
+| `xodus-cli streaming <product-id> <dir>` | Download + decrypt the current store build into `<dir>`. Incremental: it compares local segment hashes and fetches only the delta. |
+| `xodus-cli download --dry-run <product-id>` | Resolve the store build number without downloading. |
+| `xodus-cli run <dir> <wine>` | Decrypt the `keep_encrypted` segments into anonymous memfds and hand them to Wine. |
+
+Product ids, resolved through DisplayCatalog:
+
+| Edition | Product id | ContentId |
+|---|---|---|
+| Minecraft for Windows | `9NBLGGH2JHXJ` | `7792d9ce-355a-493c-afbd-768f4a77c3b0` |
+| Minecraft Preview for Windows | `9P5X4QVLC2XR` | `98bd2335-9b01-4e4c-bd05-ccc01614078b` |
+| Minecraft Dungeons (`Microsoft.Lovika_8wekyb3d8bbwe`) | `9P8MK4NC0LJB` | `911f6225-c9c8-4641-a6db-29d4ccafc666` |
+| Minecraft Legends (`Microsoft.BadgerWin10_8wekyb3d8bbwe`) | `9N98Z825TNFW` | `f8afac2c-44cd-4302-afc3-b6dc979e6656` |
+
+Dungeons and Legends are not in the GdkLinks index, so the launcher installs
+them with `xodus-cli streaming <product-id>` into one folder,
+`games/<edition>/current/`, and reads the executable from the package's
+`MicrosoftGame.config`. `streaming` picks the first `.msixvc` the Store lists
+for the product (the `.msixvc.phf` beside it does not match), and asks for the
+licence once the remote XVD header is parsed, so an account that does not own
+the title is refused before any game data is downloaded. Minecraft Dungeons
+II (`9PM3J18QM4Q3`) is a pre-order with no package yet; Minecraft: Story Mode
+was delisted and only ever shipped as an Xbox console XVC.
+
+The Xbox CDN only serves the *current* build of a product id — there is no
+back catalogue. This is why the launcher offers Release and Preview rather
+than a list of Bedrock versions.
+
+## Build flags that matter
+
+`--features xodus/key-chain-file` is **required**, not optional. Without it
+Xodus stores its tokens through a D-Bus secret service, which does not exist
+in a Steam Deck Game Mode session or inside a Flatpak sandbox, and every
+command that needs device credentials fails outright. With it, tokens go to
+`$HOME/.xodus-keyring.ron` — and `$HOME` is the launcher's own directory
+rather than the user's: see `bol.xodus.home()`. In the Flatpak the real home
+is a tmpfs the sandbox discards, and a discarded keyring is not a sign-out but
+a *new* provisioned Microsoft device, ten of which exhaust the account's Store
+download pool (issue #198).
+
+`xodus-cli` is linked against **glibc 2.31**, the ceiling the game engine is
+built for (`REQUIRED_ENGINE_GLIBC_MAX` in `bol/vkd3d.py`), and
+`scripts/build-xodus-cli.sh` fails the build if it imports a newer glibc
+symbol. Up to `64d39eb87a56-p11` it was linked against the Debian trixie
+container's own glibc and asked for 2.39, so Debian 12, Ubuntu 22.04 and its
+derivatives and Fedora 39 could neither download nor start the game outside
+the Flatpak (issue #264). The container stays trixie, because nothing old
+enough packages WebKitGTK 4.1: `cargo-zigbuild` links instead, with zig
+supplying the C library of the version the target names
+(`x86_64-unknown-linux-gnu.2.31`). zig, its SHA-256 and the cargo-zigbuild
+version are pinned in `.github/workflows/build-xodus.yml`.
+
+`xodus-cli` links `wry`/`tao` unconditionally for the login webview, so
+`libwebkit2gtk-4.1` is a build *and* runtime dependency. The `xodus` crate
+runs `prost-build`, so `protoc` is needed at build time. It also depends on
+`dbus-secret-service-keyring-store` with `crypto-openssl` unconditionally on
+Linux — `key-chain-file` stops that store from being *used*, but it is still
+compiled, so `libssl-dev` is required to build even though the file keyring
+never touches it.
+
+## The patches carried here
+
+`third_party/xodus/patches/` holds what BedrockOnLinux fixes in Xodus itself.
+`scripts/build-xodus-cli.sh` applies them with `git am` after checking the
+pinned commit out, runs the tests they bring, and archives the *patched* tree
+as the GPL source tarball. Anything in there is meant to go upstream: each one
+is a self-contained commit with the test that fails without it.
+
+| Patch | What it fixes |
+|---|---|
+| `0001-msixvc-only-count-cache-bytes-that-are-on-disk.patch` | The download aborting on its own package cache (issue #217). `PrefixCacheFile` counts the bytes tokio *accepted*, and tokio reports a file write accepted as soon as it has queued it on a blocking thread, so a read through the second handle can outrun the write and find the file short — `Header(Io(Custom { kind: UnexpectedEof, error: "cache ended before cached_len" }))`, which kills the whole download. Measured over a 4 MiB body on an idle disk, the cache claimed up to 17 KiB more than the file held. |
+| `0002-licensing-accept-a-license-type-the-enum-does-not-name.patch` | The download dying on the licence Microsoft issued for it. `LicenseInfo/@Type` names the kind of entitlement a licence was granted for, `LicenseType` names four of them, and Microsoft also issues `Trial` — `called Result::unwrap() on an Err value: Custom("unknown variant \`Trial\`, expected one of \`Device\`, \`User\`, \`Full\`, \`KeyHolder\`")`, in the middle of the download. Nothing reads the type: the content key travels in the `SPLicenseBlock` beside it. Same account, same content id and same market answered `Trial` twice seconds apart here and a known type seven times twenty minutes later. |
+| `0003-licensing-report-a-license-that-cannot-be-read.patch` | Reading the licence out of a licences response — first key, base64, XML — was an index and two unwraps inside a running download, so anything unexpected from the licensing service was a panic in a library rather than a line the caller could print. It now ends the download the way a refused entitlement does. |
+| `0004-login-host-the-second-leg-of-a-sign-in-like-the-first.patch` | The sign-in window that loads for ever (issue #214). A token exchange that faults hands back an `inline_auth_url`, and `finalize_request` opened it with an **empty** `HeaderMap` — none of the nine `cxh-*`/`hostApp` headers that tell login.live.com it is talking to the token broker. Without them Microsoft serves the ordinary consumer interrupt ("Please wait", a disabled *OK*) instead of the CloudExperienceHost one, so the page never reaches `ppsecure/post.srf` — the only URL `create_session` fires `Finish` on — `ServerData` is never read back, and `xodus-cli login` sits there printing nothing and never exiting. |
+| `0005-licensing-ask-for-a-sign-in-instead-of-unwrapping-a-missing-token.patch` | The download dying on a keyring that holds some of the account and not the rest (issue #260). A license request reads four entries — this device's STS token and license, the account (`user-DA`) and its Passport STS token — and unwrapped every lookup, so a keyring missing one of them ended the download on `called Result::unwrap() on an Err value: NotFound`. Reproduced by deleting `user-DA` from a copy of a working keyring: the unpatched binary panics at `license.rs:17`, the patched one prints "not logged in: the signed-in Microsoft account is missing from the keyring (entry not found); sign in again", which the launcher already reads as a sign-in to offer. |
+| `0006-licensing-send-a-jwe-delegation-ticket-without-the-d-prefix.patch` | Every launch and download refused by the licensing service since 2026-10-12 (issue #322). The `delegationcompact` token Live issues for the licence request used to be an opaque ticket, sent as `d=<ticket>`; it is now a compact JWE (five segments, the second empty for `alg: dir`), and `licenses/content` answers `d=<jwe>` with `401 InvalidMsaTicketFormat`. The same request with the token sent as-is is answered `200` with the licence. A JOSE token now goes out unprefixed and an opaque ticket keeps its `d=`, so the fix holds whichever of the two Live issues. |
+| `0007-licensing-report-a-refused-license-request-with-its-status-and-reason.patch` | Why issue #322 had nothing to go on. A licensing refusal is a JSON error, not a licence, so reading it as one failed in serde and the launcher printed `request error: error decoding response body for url (https://licensing.mp.microsoft.com/v7.0/licenses/content)` — no status, no reason. The status is now checked first, and a refusal reads `the licensing service refused the request (HTTP 401): InvalidMsaTicketFormat: ...`, the inner error's code and message. |
+| `0008-login-finish-on-a-serverdata-short-of-an-unused-field.patch` | The sign-in that still sits on "Please wait" after the password, printing nothing (issue #366). The page hands its tokens back as `ServerData`, read as a `DAProperty` of seven required strings; one missing and the payload fell through to `HostBridgeMessage`, whose fields are all optional, so it parsed and was dropped without a word. `sDASessionKey` is never read and `sSTSInlineFlowToken` is already optional in the exchange, so both now default, and `K` is read as a string or a number. The handler also says on stderr which required fields a token bag lacks (names only), which host method the page invoked that is not answered, and every page that finishes loading (no query string) — so `store-login.log` shows where a sign-in stopped instead of being empty. |
+| `0009-tokens-sign-the-device-in-again-when-its-session-has-expired.patch` | Every launch and download panicking after about two months (issue #367): `not implemented: Exchange token supports only singular token right now Fault(Fault)`. The keyring keeps this device's Passport STS token under `device-tokens`, and it is issued for 60 days; `get_device_sts_token` handed it out without reading its `wsu:Expires`, and `ensure_device_credentials` signed the device in again only when the entry was missing, so once it lapsed every token exchange it signed got a SOAP Fault, and `exchange_device_token` had no arm for one. An expired device token now reads as expired, so the device is signed in again before the request; the account's own token (`user-tokens`, 90 days) does the same and asks for a sign-in. A Fault from the exchange is an error rather than a panic, and the license request answers it by dropping `device-tokens` (keeping `dev_license`, `user-DA` and `user-tokens`), signing the device in again and retrying once — what deleting that entry by hand did. |
+| `0010-tokens-renew-the-account-s-session-in-its-last-week.patch` | The same cliff for the account, thirty days later (issue #367). Sign-in stores the account's Passport session under `user-tokens`, and Live issues it for 90 days; with 0009 alone, the license request then says "not logged in: ... has expired; sign in again", a sign-in through the page some systems cannot get past (#366). While Live still takes the session it issues a new one without a sign-in: asked for `http://Passport.NET/tb` with this device's session, it answers with the session itself, keyed `http://Passport.NET/STS`, for another 90 days. The license request does that when the session ends within a week, stores the new one, and carries on with the old one if Live does not issue it. Tested against Live on a copy of a keyring whose account session was set to end in two days: the license was issued and the copy held a session ending 90 days later. |
+| `0011-licensing-sign-the-device-in-again-for-any-answer-that-is-not-a-ticket.patch` | 0009 retried only a SOAP Fault. Live answers a device token it does not recognise at all with an envelope the exchange cannot read (`missing field wsa:Action`, reproduced with an altered token on a copy of a keyring), and a secret that no longer decrypts the answer fails in the client; both ended on "could not exchange this device's Microsoft session", which a fresh device session cures the same way. Every failure of that exchange now gets the one retry except a request that got no answer, which is the network's: the launcher reports that one as a missing connection. |
+| `0012-msixvc-read-the-segment-metadata-once.patch` | A package that carries a segment table (`SegmentMetadata.bin`) had it read once per segment: the table was read through a `BufReader` as large as the whole 1.7 MiB blob, seeking to each path in turn, and a seek empties a tokio `BufReader`, so each of several thousand paths refilled it. The blob is now read once and parsed in memory, every offset checked against it. The Minecraft packages installed in November 2026 (1.26.52 to 1.26.70) carry no segment table and take the NTFS path of 0014, so this changes nothing measurable for them; it is for the packages that do. |
+| `0013-msixvc-decrypt-through-buffered-reads-and-writes.patch` | `run` decrypts the Minecraft executable (324 MB for 1.26.60) at every launch, and read and wrote it 4 KiB at a time through tokio files, each read and each write its own task on tokio's blocking pool: two thread hand-offs per page. Both sides now go through 4 MiB buffers; the reader stops at the file's last page, and the writer is flushed before the memfd is handed to Wine. |
+| `0014-msixvc-walk-the-NTFS-metadata-through-a-block-cache.patch` | Every launch walks the package's NTFS metadata to find its files (12 898 for 1.26.60), and every read of that walk, and the position query before each, was a task on tokio's blocking pool: 31 000 reads, 60 000 seeks, 0.8 s. A cache of 256 KiB blocks under the walk answers them from memory: the same files at the same offsets with the same hashes on six packages from 1.26.52 to 1.26.70, in 0.07 to 0.16 s. |
+
+A patched binary is not the upstream commit's binary, so the rev names the
+patches too: `<commit12>-p<n>`, where `n` is how many patch files there are.
+Publishing one takes two passes. Set `XODUS_REV` to match the patch count and
+clear `XODUS_ARCHIVE_SHA256` when the binary changes. Run
+`.github/workflows/build-xodus.yml` with `publish=false`, review the uploaded
+archive and pin its reported SHA-256 in `bol/config.py`. This candidate build
+allows a missing or different pin, but cannot publish it. Run it again with
+`publish=true` to reproduce and publish the pinned bytes. The application
+workflow verifies the published binary and WebKitGTK archives before packaging,
+and the release orchestrator builds Xodus when either archive needs publishing.
+Merging Xodus configuration, patch or build changes into main automatically
+starts the release orchestrator. It builds and publishes missing pinned
+archives, verifies the dependencies and publishes the launcher in one job
+graph. A failed build blocks application packaging. For a PR, CI can verify
+an attested fork release against the committed pins before the same bytes
+are published upstream. Application packaging still requires upstream assets.
+
+The first four patches sat on main for a week while users still downloaded
+the old binary and raced its package cache (issues #241 and #242).
+`ci.yml` checks that `XODUS_REV` names the patch set on the branch, and the
+application workflow also verifies that the matching archive is published.
+
+## The WebKitGTK runtime beside it
+
+`mod webview` is not behind a feature, so `libwebkit2gtk-4.1.so.0` has to load
+before `main()` — for `login`, but equally for `streaming` and for `run`, which
+starts every Store-installed game. A host without WebKitGTK therefore cannot
+sign in, download or play, and immutable images (SteamOS) cannot install one:
+issue #184.
+
+The bundle is trixie's WebKitGTK, so it needs trixie's glibc even though
+`xodus-cli` no longer does. On an older system the host's WebKitGTK is the
+way: `bol/webview.py` keeps it when the bundle cannot load there, and names
+the package to install when there is none.
+
+`scripts/build-xodus-webview.sh` packages that stack from the same pinned
+snapshot as the binary, and `bol/webview.py` uses it only where the host has
+none. Two things are worth knowing before touching either:
+
+- The helper processes (`WebKitWebProcess`, `WebKitNetworkProcess`) are spawned
+  from a directory compiled into the library. `WEBKIT_EXEC_PATH` overrides it
+  in developer builds only, and Debian's is not one, so the launcher rewrites
+  that literal in place — which is why `XODUS_WEBVIEW_EXEC_DIR` is a pin, and
+  why the replacement must be shorter than it.
+- Nothing else is patched. The bundle is stock Debian packages with a `$ORIGIN`
+  RUNPATH, listed in the `PACKAGES` file it carries, so it can be rebuilt and
+  compared byte for byte.
+
+## License
+
+Xodus is GPL-3.0; BedrockOnLinux is MIT. The launcher never links Xodus code —
+it executes `xodus-cli` as a separate program, which is mere aggregation. The
+published `xodus-cli-<rev>.tar.gz` carries `LICENSE.GPL-3.0` and a
+`SOURCE-COMMIT` file, and `.github/workflows/build-xodus.yml` publishes the
+matching source tarball alongside it so the GPL source requirement is met by
+the same release that ships the binary.
