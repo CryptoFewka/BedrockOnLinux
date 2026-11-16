@@ -1,0 +1,144 @@
+From 7a331c6c2c4c1b0021a62327a26d6c13765681d5 Mon Sep 17 00:00:00 2001
+From: Chris Fuka <chris.fuka@gmail.com>
+Date: Mon, 16 Nov 2026 09:26:49 -0600
+Subject: [PATCH] login: keep the sign-in window on Microsoft and take tokens
+ only from it
+
+The sign-in webview had no navigation handler, and its IPC handler acted
+on any message. Links on Microsoft's login page (help, privacy, terms)
+took the window to any site, with no address bar to show it, and the
+window.ipc bridge and the window.external script are present on every
+page. So a user could type credentials into a page that was no longer
+Microsoft's, and any page the window loaded could post a DAProperty that
+signs the device into an account the user did not choose
+(xodus-gaming/xodus#247).
+
+Navigation is now limited to https on the sign-in hosts: login.live.com,
+account.live.com and signup.live.com (password reset, two-step
+verification, a new account), login.microsoftonline.com,
+login.microsoft.com and account.microsoft.com, plus the about:blank and
+about:srcdoc frames the page makes for itself. Anything else is refused
+and named in store-login.log without its query. The IPC handler acts
+only on messages from https://login.live.com, which wry reports as the
+main frame's URL; the page that hands tokens back is always there.
+---
+ crates/xodus-cli/src/webview.rs | 88 +++++++++++++++++++++++++++++++++
+ 1 file changed, 88 insertions(+)
+
+diff --git a/crates/xodus-cli/src/webview.rs b/crates/xodus-cli/src/webview.rs
+index 0c72506..d6dc28b 100644
+--- a/crates/xodus-cli/src/webview.rs
++++ b/crates/xodus-cli/src/webview.rs
+@@ -357,7 +357,21 @@ fn create_session<T: SessionHandler>(
+             .with_user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64; MSAppHost/3.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.102 Safari/537.36 Edge/18.26100")
+             .with_headers(request.headers)
+             .with_initialization_script("window.external = {notify: window.ipc.postMessage }")
++            .with_navigation_handler(|url| {
++                let allowed = may_navigate(&url);
++                if !allowed {
++                    eprintln!("Sign-in window kept off {}", page_without_query(&url));
++                }
++                allowed
++            })
+             .with_ipc_handler(move |request| {
++                // The bridge exists on every page the window shows, so only
++                // Microsoft's sign-in page may hand tokens back through it.
++                let page = request.uri().to_string();
++                if !may_message(&page) {
++                    eprintln!("Ignoring a host message from {}", page_without_query(&page));
++                    return;
++                }
+                 let body = request.body();
+                 let payload = serde_json::from_str::<DAProperty>(body);
+                 if let Ok(data) = payload {
+@@ -437,6 +451,40 @@ fn unusable_token_bag(body: &str) -> Option<Vec<&'static str>> {
+     Some(if missing.is_empty() { vec!["fields of the expected type"] } else { missing })
+ }
+ 
++/// The page that hands tokens back to the host.
++const SIGN_IN_HOST: &str = "login.live.com";
++
++/// Where a sign-in may go: the page itself, password reset and two-step
++/// verification, and creating an account. Anything else, such as a help or
++/// privacy link, would leave the user typing into a window with no address
++/// bar that no longer shows Microsoft.
++const SIGN_IN_HOSTS: &[&str] = &[
++    "login.live.com",
++    "account.live.com",
++    "signup.live.com",
++    "login.microsoftonline.com",
++    "login.microsoft.com",
++    "account.microsoft.com",
++];
++
++fn https_host(url: &str) -> Option<String> {
++    let uri = page_without_query(url).parse::<wry::http::Uri>().ok()?;
++    if uri.scheme_str() != Some("https") {
++        return None;
++    }
++    Some(uri.host()?.to_ascii_lowercase())
++}
++
++fn may_navigate(url: &str) -> bool {
++    // Frames the sign-in page creates for itself.
++    matches!(url, "about:blank" | "about:srcdoc")
++        || https_host(url).is_some_and(|host| SIGN_IN_HOSTS.contains(&host.as_str()))
++}
++
++fn may_message(page: &str) -> bool {
++    https_host(page).as_deref() == Some(SIGN_IN_HOST)
++}
++
+ fn page_without_query(url: &str) -> &str {
+     url.split(['?', '#']).next().unwrap_or(url)
+ }
+@@ -452,6 +500,46 @@ fn remove_session<T: SessionHandler>(state: &mut RuntimeState<T>, session_id: Se
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn the_window_stays_on_microsoft_sign_in_pages() {
++        for url in [
++            "https://login.live.com/ppsecure/InlineLogin.srf?id=80604&mkt=en-US",
++            "https://login.live.com/ppsecure/post.srf#top",
++            "https://account.live.com/proofs/Verify",
++            "https://signup.live.com/signup",
++            "https://LOGIN.LIVE.COM/oauth20_authorize.srf",
++            "about:blank",
++        ] {
++            assert!(may_navigate(url), "{url}");
++        }
++        for url in [
++            "https://privacy.microsoft.com/privacystatement",
++            "https://go.microsoft.com/fwlink/?LinkID=521839",
++            "http://login.live.com/ppsecure/post.srf",
++            "https://login.live.com.evil.example/ppsecure/post.srf",
++            "https://login.live.com@evil.example/",
++            "javascript:alert(1)",
++            "file:///etc/passwd",
++            "",
++        ] {
++            assert!(!may_navigate(url), "{url}");
++        }
++    }
++
++    #[test]
++    fn only_the_sign_in_page_may_message_the_host() {
++        assert!(may_message("https://login.live.com/ppsecure/post.srf?x=1"));
++        for page in [
++            "https://account.live.com/proofs/Verify",
++            "http://login.live.com/ppsecure/post.srf",
++            "https://evil.example/",
++            "about:blank",
++            "",
++        ] {
++            assert!(!may_message(page), "{page}");
++        }
++    }
++
+     #[test]
+     fn a_page_is_logged_without_its_query() {
+         assert_eq!(
+-- 
+2.53.0
+

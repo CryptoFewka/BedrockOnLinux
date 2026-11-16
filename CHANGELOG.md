@@ -4,6 +4,16 @@
 
 ### Fixed
 
+- **The Store keyring keeps every change, and stays private whatever runs
+  Xodus.** Xodus saved its keyring only when it exited cleanly, so a crash
+  or a killed download lost a renewed session or a fresh sign-in, and a
+  game left running wrote its old copy back over a sign-in or sign-out made
+  meanwhile. Each change is now written on its own, atomically, under a
+  lock, and the file is created 0600 by Xodus itself. The Microsoft sign-in
+  window now stays on Microsoft's sign-in pages and takes tokens only from
+  login.live.com, and `XODUS_LOG=trace` no longer records decrypted token
+  exchanges (`XODUS_LOG_WIRE=1` does). Xodus `64d39eb87a56-p18`
+  (xodus-gaming/xodus#246, #247, #248).
 - **Three hardening gaps around the Store sign-in and the changelog.** A
   link in either changelog tab now opens only if it is http or https: the
   text comes off the network, and a `file:`, `smb:`, `ssh:` or `steam:` link

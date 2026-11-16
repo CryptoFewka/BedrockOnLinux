@@ -1,0 +1,52 @@
+From a26657802a4d3e0b4eaab5ad7bc4f57214e390b2 Mon Sep 17 00:00:00 2001
+From: Chris Fuka <chris.fuka@gmail.com>
+Date: Mon, 16 Nov 2026 09:32:27 -0600
+Subject: [PATCH] cli: log the wire only when asked
+
+xodus-cli and xodus-service built their HTTP client with
+connection_verbose(true), so reqwest logged every read and write after
+TLS decryption at trace level, and the tracing-log bridge sent it to
+stdout under XODUS_LOG=trace. That includes the RST2.srf bodies with the
+DA token and the device credentials, so a trace log attached to a bug
+report hands over the account's session (xodus-gaming/xodus#248).
+
+Wire logging is now off unless XODUS_LOG_WIRE=1 asks for it, so
+XODUS_LOG=trace is safe to share.
+---
+ crates/xodus-cli/src/main.rs               | 4 +++-
+ crates/xodus-service/src/simple_context.rs | 4 +++-
+ 2 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/crates/xodus-cli/src/main.rs b/crates/xodus-cli/src/main.rs
+index cf0db1d..12d6e5c 100644
+--- a/crates/xodus-cli/src/main.rs
++++ b/crates/xodus-cli/src/main.rs
+@@ -145,7 +145,9 @@ async fn main() -> ExitCode {
+     }
+     let client = reqwest::ClientBuilder::new()
+         .user_agent(format!("xodus-cli/{}", env!("CARGO_PKG_VERSION")))
+-        .connection_verbose(true)
++        // Wire logging writes decrypted request bodies, tokens included, at
++        // trace level. Keep it out of the logs people attach to issues.
++        .connection_verbose(std::env::var_os("XODUS_LOG_WIRE").is_some_and(|v| v == "1"))
+         .build()
+         .unwrap();
+     let args = CliArgs::parse();
+diff --git a/crates/xodus-service/src/simple_context.rs b/crates/xodus-service/src/simple_context.rs
+index 2900465..6539956 100644
+--- a/crates/xodus-service/src/simple_context.rs
++++ b/crates/xodus-service/src/simple_context.rs
+@@ -15,7 +15,9 @@ impl SimpleContext {
+     pub fn new(device_token: LegacyToken, tokens: Arc<TokenManager>) -> Self {
+         let client = reqwest::ClientBuilder::new()
+             .user_agent(format!("xodus-service/{}", env!("CARGO_PKG_VERSION")))
+-            .connection_verbose(true)
++            // Wire logging writes decrypted request bodies, tokens included, at
++            // trace level. Keep it out of the logs people attach to issues.
++            .connection_verbose(std::env::var_os("XODUS_LOG_WIRE").is_some_and(|v| v == "1"))
+             .build()
+             .unwrap();
+ 
+-- 
+2.53.0
+
